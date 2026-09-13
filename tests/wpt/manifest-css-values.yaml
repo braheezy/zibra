@@ -1,0 +1,13 @@
+# Token boundaries, escaped values, EOF recovery and specified serialization.
+# serialize-values also records unsupported property grammars; count assertions.
+tests:
+  - css/css-syntax/unclosed-url-at-eof.html
+  - css/css-syntax/serialize-consecutive-tokens.html
+  - css/css-variables/url-token-serialization.html
+  - css/cssom/serialize-values.html
+  - css/css-color/parsing/color-valid.html
+reftests:
+  - css/CSS2/syntax/escaped-ident-spaces-001.xht
+  - css/CSS2/syntax/escaped-ident-spaces-002.xht
+crashtests:
+  - css/css-syntax/crashtests/atrule-with-escape-character.html

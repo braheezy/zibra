@@ -1,0 +1,86 @@
+<!-- How to verify: expect green PASS and green samples. The sticky green box
+     stays inside the bordered scrollport when scrolled; Reset returns it to
+     its original position. Resize to exercise nested media rules. -->
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CSS calculations, nesting, animation and sticky</title>
+<style id="sheet">
+body { font:16px sans-serif; margin:24px; }
+.sample { height:24px; width:150px; margin:8px 0; background:green; }
+#colors { font-size:20px; background:rgb(calc(2 * 0) calc(6.4 * 1em / 1px) 0); }
+.parent, #unused {
+  .sample { width:150px; }
+  &.active > .sample { background:green; }
+  @media (min-width:600px) { .sample { width:200px; } }
+}
+#nested { background:red; }
+@keyframes grow { from {width:100px;background:green} to {width:200px;background:green} }
+#animated { animation:grow 2s linear -1s both paused; }
+#port { width:240px; height:150px; overflow:auto; border:2px solid black; }
+#content { width:400px; height:500px; }
+#spacer { height:100px; }
+#sticky { position:sticky; top:20px; left:10px; width:100px; height:40px; background:green; }
+</style></head><body>
+<h1 id="status">Checking CSS foundations</h1>
+<div id="colors" class="sample"></div>
+<div id="parent" class="parent active"><div id="nested" class="sample"></div></div>
+<div id="animated" class="sample"></div>
+<p>Scroll the box: green stays 20px from its top, within its content.</p>
+<div id="port"><div id="content"><div id="spacer"></div><div id="sticky"></div></div></div>
+<button id="reset">Reset scroll</button><p id="details"></p>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var results = [];
+  function equal(a,b) { if (a !== b) throw Error(String(a) + ' != ' + String(b)); }
+  function check(name, fn) { try { fn(); results.push({name:name,status:0}); } catch(e) { results.push({name:name,status:1,message:String(e)}); } }
+  var colors = document.getElementById('colors'), animated = document.getElementById('animated');
+  var port = document.getElementById('port'), sticky = document.getElementById('sticky');
+  check('computed color math follows the local font', function() {
+    equal(getComputedStyle(colors).backgroundColor, 'rgb(0, 128, 0)');
+    colors.style.fontSize = '10px';
+    equal(getComputedStyle(colors).backgroundColor, 'rgb(0, 64, 0)');
+    colors.style.fontSize = '20px';
+    equal(getComputedStyle(colors).backgroundColor, 'rgb(0, 128, 0)');
+    colors.style.color = 'hsl(none 50% 50%)';
+    equal(getComputedStyle(colors).color, 'hsl(none 50% 50%)');
+  });
+  check('nested selectors invalidate after a parent class edit', function() {
+    var parent = document.getElementById('parent'), nested = document.getElementById('nested');
+    equal(getComputedStyle(nested).backgroundColor, 'rgb(0, 128, 0)');
+    parent.classList.remove('active');
+    equal(getComputedStyle(nested).backgroundColor, 'rgb(255, 0, 0)');
+    parent.classList.add('active');
+    equal(getComputedStyle(nested).backgroundColor, 'rgb(0, 128, 0)');
+  });
+  check('paused negative delay and fill mode edits sample the same timeline', function() {
+    equal(parseFloat(getComputedStyle(animated).width), 150);
+    equal(animated.getBoundingClientRect().width, 150);
+    animated.style.animationDelay = '-3s';
+    equal(parseFloat(getComputedStyle(animated).width), 200);
+    animated.style.animationFillMode = 'none';
+    equal(parseFloat(getComputedStyle(animated).width), 150);
+    animated.style.animationFillMode = 'both';
+    equal(parseFloat(getComputedStyle(animated).width), 200);
+    animated.style.animationDelay = '-1s';
+  });
+  check('sticky geometry shares clamped element scroll state', function() {
+    equal(port.scrollHeight, 500); equal(port.scrollWidth, 400);
+    port.scrollTop = 200; port.scrollLeft = 80;
+    var outer = port.getBoundingClientRect(), inner = sticky.getBoundingClientRect();
+    equal(inner.top - outer.top, 22); equal(inner.left - outer.left, 12);
+    port.scrollTo({top:100000,left:100000});
+    equal(port.scrollTop, 350); equal(port.scrollLeft, 160);
+    port.scrollTo(80, 200);
+    var old = sticky.getBoundingClientRect();
+    sticky.style.top = '30px';
+    equal(sticky.getBoundingClientRect().top, old.top + 10);
+    sticky.style.top = '20px';
+  });
+  document.getElementById('reset').addEventListener('click', function() { port.scrollTo(0,0); });
+  var failed = results.filter(function(result) { return result.status !== 0; });
+  var status = document.getElementById('status');
+  status.textContent = failed.length ? 'FAIL: ' + failed[0].name : 'PASS: CSS foundations';
+  status.style.color = failed.length ? 'red' : 'green';
+  document.getElementById('details').textContent = failed.map(function(r) { return r.message; }).join('; ');
+  if (typeof completion_callback === 'function') completion_callback(results, {status:0});
+});
+</script></body></html>

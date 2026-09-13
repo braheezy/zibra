@@ -174,6 +174,7 @@ function shallowCloneNode(node) {
   ['id', 'class', 'name', 'value', 'type', 'href', 'style'].forEach(function(name) {
     var value = node.getAttribute && node.getAttribute(name); if (value !== null) clone.setAttribute(name, value);
   });
+  if (node.nodeType === Node.ELEMENT_NODE) __native.cssStyleClone(node.handle, clone.handle);
   return clone;
 }
 function cloneRangeNode(range, node, extract, fragment) {

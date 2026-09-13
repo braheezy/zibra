@@ -30,8 +30,10 @@ changing coverage. The complete primary-page inventory lives in the
 
 ## Commands
 
-Focused steps are `test-document`, `test-render`, `test-network`,
-`test-script`, and `test-browser`. Broader steps include:
+The pure CSS targets are `test-css-values`, `test-css-syntax`,
+`test-css-declarations` and `test-css-supports`. Other focused steps are
+`test-document`, `test-render`, `test-network`, `test-script`, and `test-browser`.
+Broader steps include:
 
 - `zig build verify` — portable aggregate;
 - `zig build test-pipeline` — exact box-model and nested-zoom

@@ -1,97 +1,38 @@
-//! Borrowing component-token scanner for computed values. Strings, comments,
-//! URLs and escaped identifiers remain atomic during variable/length rewriting.
+//! Computed-value operations over the shared borrowed CSS token stream.
+//! Strings and URL tokens remain opaque during variable/length rewriting.
 
 const std = @import("std");
 const syntax = @import("css_syntax.zig");
 
-pub const Token = struct {
-    kind: enum { other, ident, function, dimension },
-    start: usize,
-    end: usize,
-    number_end: usize = 0,
-};
+pub const Token = @import("css_tokenizer.zig").Token;
+pub const Iterator = @import("css_tokenizer.zig").Iterator;
 
-fn nameByte(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c >= 128;
+/// Match one decoded keyword token, ignoring edge trivia without joining names.
+pub fn isKeyword(input: []const u8, expected: []const u8) bool {
+    var iterator = Iterator{ .input = input };
+    var first = iterator.next() orelse return false;
+    while (first.isTrivia()) first = iterator.next() orelse return false;
+    if (first.kind != .ident or !syntax.identifierEquals(first.encodedValue(input), expected)) return false;
+    while (iterator.next()) |token| if (!token.isTrivia()) {
+        return false;
+    };
+    return true;
 }
 
-pub const Iterator = struct {
-    input: []const u8,
-    cursor: usize = 0,
-    atomic_urls: bool = true,
-
-    pub fn next(self: *Iterator) ?Token {
-        if (self.cursor >= self.input.len) return null;
-        const start = self.cursor;
-        const c = self.input[start];
-        if (syntax.consumeComment(self.input, &self.cursor)) return .{ .kind = .other, .start = start, .end = self.cursor };
-        if (c == '\'' or c == '"') {
-            self.cursor += 1;
-            while (self.cursor < self.input.len) {
-                if (self.input[self.cursor] == '\\') {
-                    _ = syntax.consumeEscape(self.input, &self.cursor);
-                } else {
-                    self.cursor += 1;
-                    if (self.input[self.cursor - 1] == c) break;
-                }
-            }
-            return .{ .kind = .other, .start = start, .end = self.cursor };
-        }
-        var number_end = start;
-        if (c == '+' or c == '-') number_end += 1;
-        var digits: usize = 0;
-        while (number_end < self.input.len and std.ascii.isDigit(self.input[number_end])) : (number_end += 1) digits += 1;
-        if (number_end < self.input.len and self.input[number_end] == '.') {
-            number_end += 1;
-            while (number_end < self.input.len and std.ascii.isDigit(self.input[number_end])) : (number_end += 1) digits += 1;
-        }
-        if (digits > 0) {
-            if (number_end < self.input.len and (self.input[number_end] == 'e' or self.input[number_end] == 'E')) {
-                var exponent = number_end + 1;
-                if (exponent < self.input.len and (self.input[exponent] == '+' or self.input[exponent] == '-')) exponent += 1;
-                const first = exponent;
-                while (exponent < self.input.len and std.ascii.isDigit(self.input[exponent])) : (exponent += 1) {}
-                if (exponent > first) number_end = exponent;
-            }
-            self.cursor = number_end;
-            self.consumeName();
-            return .{ .kind = if (self.cursor > number_end) .dimension else .other, .start = start, .end = self.cursor, .number_end = number_end };
-        }
-        if (nameByte(c) or c == '\\') {
-            self.consumeName();
-            if (self.cursor < self.input.len and self.input[self.cursor] == '(') {
-                self.cursor += 1;
-                if (self.atomic_urls and syntax.identifierEquals(self.input[start .. self.cursor - 1], "url")) {
-                    self.cursor = if (closeFunction(self.input, self.cursor)) |end| end + 1 else self.input.len;
-                    return .{ .kind = .other, .start = start, .end = self.cursor };
-                }
-                return .{ .kind = .function, .start = start, .end = self.cursor };
-            }
-            return .{ .kind = .ident, .start = start, .end = self.cursor };
-        }
-        self.cursor += 1;
-        return .{ .kind = .other, .start = start, .end = self.cursor };
-    }
-
-    fn consumeName(self: *Iterator) void {
-        while (self.cursor < self.input.len) {
-            if (nameByte(self.input[self.cursor])) self.cursor += 1 else if (self.input[self.cursor] == '\\') {
-                _ = syntax.consumeEscape(self.input, &self.cursor);
-            } else break;
-        }
-    }
-};
-
-/// `start` is immediately after the opening parenthesis.
+/// `start` is immediately after the opening parenthesis. URL tokens and
+/// strings are opaque; typed blocks cannot supply a function's closing token.
 pub fn closeFunction(input: []const u8, start: usize) ?usize {
-    // Matching parentheses must stay iterative even for nested URL-like input.
-    var tokens = Iterator{ .input = input, .cursor = start, .atomic_urls = false };
+    var iterator = Iterator{ .input = input, .cursor = start };
+    var stack: [syntax.max_component_depth]@import("css_tokenizer.zig").Kind = undefined;
     var depth: usize = 0;
-    while (tokens.next()) |token| {
-        const text = input[token.start..token.end];
-        if (token.kind == .function or std.mem.eql(u8, text, "(")) depth += 1;
-        if (std.mem.eql(u8, text, ")")) {
-            if (depth == 0) return token.start;
+    while (iterator.next()) |token| {
+        if (token.closer()) |closer| {
+            if (depth == stack.len) return null;
+            stack[depth] = closer;
+            depth += 1;
+        } else if (token.isClose()) {
+            if (depth == 0) return if (token.kind == .close_paren) token.start else null;
+            if (stack[depth - 1] != token.kind) return null;
             depth -= 1;
         }
     }
@@ -101,7 +42,7 @@ pub fn closeFunction(input: []const u8, start: usize) ?usize {
 pub fn hasVariable(input: []const u8) bool {
     var tokens = Iterator{ .input = input };
     while (tokens.next()) |token| {
-        if (token.kind == .function and syntax.identifierEquals(input[token.start .. token.end - 1], "var")) return true;
+        if (token.kind == .function and syntax.identifierEquals(token.encodedValue(input), "var")) return true;
     }
     return false;
 }

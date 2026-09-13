@@ -128,3 +128,48 @@ fn allocationTrial(trial_allocator: std.mem.Allocator) !void {
 test "Native stylesheet allocation failures release source provenance and selections" {
     try std.testing.checkAllAllocationFailures(allocator, allocationTrial, .{});
 }
+
+test "Native structural recovery closes media keyframes and rules at EOF" {
+    const source = "@media screen { p { color:green; @future { ignored: [a;{b:c;}]; } width:120px; }" ++
+        "@keyframes pulse { from { opacity:0.2 } to { opacity:0.8";
+    var sheet = try stylesheet.Sheet.init(allocator, source, .{});
+    defer sheet.deinit();
+    var selected = try sheet.select(allocator, .{});
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 1), selected.rules.len);
+    try std.testing.expectEqualStrings("120px", selected.rules[0].properties.get("width").?.value);
+    try std.testing.expectEqualStrings("green", selected.rules[0].properties.get("color").?.value);
+    try std.testing.expectEqual(@as(usize, 1), selected.keyframes.len);
+    try std.testing.expectEqual(@as(usize, 2), selected.keyframes[0].frames.len);
+    try std.testing.expectEqualStrings("0.8", selected.keyframes[0].frames[1].properties.get("opacity").?.value);
+}
+
+test "Native structural recovery keeps following rules outside invalid selectors" {
+    const source = "p:unsupported { @future { nested:ignored; } color:red; }" ++
+        "@unknown [a;{b:c}] (x;{y:z}) { p {color:red;} } p {color:green}";
+    var sheet = try stylesheet.Sheet.init(allocator, source, .{});
+    defer sheet.deinit();
+    var selected = try sheet.select(allocator, .{});
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 1), selected.rules.len);
+    try std.testing.expectEqualStrings("green", selected.rules[0].properties.get("color").?.value);
+}
+
+test "Native stylesheet applies selector admission before publishing a list" {
+    var source = std.ArrayList(u8).empty;
+    defer source.deinit(allocator);
+    for (0..257) |index| try source.appendSlice(allocator, if (index == 0) "p" else ",p");
+    try source.appendSlice(allocator, "{color:red} p{color:green}");
+    var sheet = try stylesheet.Sheet.init(allocator, source.items, .{});
+    defer sheet.deinit();
+    var selected = try sheet.select(allocator, .{});
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 1), selected.rules.len);
+    try std.testing.expectEqualStrings("green", selected.rules[0].properties.get("color").?.value);
+}
+
+test "selector escape decoding consumes CRLF as one CSS whitespace" {
+    const decoded = try parser.decodeIdentifier(allocator, "a\\62\r\nc");
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("abc", decoded);
+}

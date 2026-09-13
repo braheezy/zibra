@@ -172,11 +172,6 @@ test "style element text can be collected and parsed as CSS" {
         allocator.free(rules);
     }
 
-    std.mem.sort(CSSParser.CSSRule, rules, {}, struct {
-        fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
-            return a.cascadePriority() < b.cascadePriority();
-        }
-    }.lessThan);
     try document_parser.style(allocator, &root, rules);
     try std.testing.expectEqualStrings(
         "red",
@@ -1016,7 +1011,7 @@ test "generated pseudo boxes style privately and invalidate with their host" {
     try std.testing.expect(host.children_dirty);
 }
 
-test "selector sequences require every member and sum priorities" {
+test "selector sequences require every member and sum specificity" {
     const allocator = std.testing.allocator;
     const html =
         "<div>" ++
@@ -1058,10 +1053,10 @@ test "selector sequences require every member and sum priorities" {
         },
         else => return error.TestExpectedSelectorSequence,
     }
-    try std.testing.expectEqual(@as(u32, 10), rules[0].cascadePriority());
-    try std.testing.expectEqual(@as(u32, 11), rules[1].cascadePriority());
-    try std.testing.expectEqual(@as(u32, 21), rules[2].cascadePriority());
-    try std.testing.expectEqual(@as(u32, 20), rules[3].cascadePriority());
+    try std.testing.expectEqual(CSSParser.Specificity{ .classes = 1 }, rules[0].specificity());
+    try std.testing.expectEqual(CSSParser.Specificity{ .classes = 1, .types = 1 }, rules[1].specificity());
+    try std.testing.expectEqual(CSSParser.Specificity{ .classes = 2, .types = 1 }, rules[2].specificity());
+    try std.testing.expectEqual(CSSParser.Specificity{ .classes = 2 }, rules[3].specificity());
 
     try document_parser.style(allocator, &root, rules);
     const both = &root.element.children.items[0].element;
@@ -1114,8 +1109,8 @@ test "attribute selectors match presence exact and whitespace-token values" {
     }
 
     try std.testing.expectEqual(@as(usize, 4), rules.len);
-    try std.testing.expectEqual(@as(u32, 30), rules[0].cascadePriority());
-    try std.testing.expectEqual(@as(u32, 40), rules[1].cascadePriority());
+    try std.testing.expectEqual(CSSParser.Specificity{ .classes = 3 }, rules[0].specificity());
+    try std.testing.expectEqual(CSSParser.Specificity{ .classes = 4 }, rules[1].specificity());
     try document_parser.style(allocator, &root, rules);
 
     try std.testing.expectEqualStrings(
@@ -1211,7 +1206,7 @@ test "CSS comments ID selectors and background shorthand preserve cascade data" 
     }
 
     try std.testing.expectEqual(@as(usize, 3), rules.len);
-    try std.testing.expectEqual(@as(u32, 110), rules[2].cascadePriority());
+    try std.testing.expectEqual(CSSParser.Specificity{ .ids = 1, .classes = 1 }, rules[2].specificity());
     try document_parser.style(allocator, &root, rules);
 
     try std.testing.expectEqualStrings("10px", root.element.style.?.getPtr("font-size").?.get().*);
@@ -1224,12 +1219,12 @@ test "CSS comments ID selectors and background shorthand preserve cascade data" 
     try std.testing.expectEqualStrings("none", bar.style.?.getPtr("background-image").?.get().*);
     try std.testing.expectEqualStrings("auto", bar.style.?.getPtr("background-size").?.get().*);
     try std.testing.expectEqualStrings("repeat", bar.style.?.getPtr("background-repeat").?.get().*);
-    try std.testing.expectEqualStrings("0 0", bar.style.?.getPtr("background-position").?.get().*);
+    try std.testing.expectEqualStrings("0% 0%", bar.style.?.getPtr("background-position").?.get().*);
     try std.testing.expectEqualStrings("scroll", bar.style.?.getPtr("background-attachment").?.get().*);
     try std.testing.expectEqualStrings("white", bar.style.?.getPtr("color").?.get().*);
 
     const baz = &root.element.children.items[1].element;
-    try std.testing.expectEqualStrings("#FC0", baz.style.?.getPtr("background-color").?.get().*);
+    try std.testing.expectEqualStrings("rgb(255, 204, 0)", baz.style.?.getPtr("background-color").?.get().*);
     try std.testing.expectEqualStrings("black", baz.style.?.getPtr("color").?.get().*);
 }
 
@@ -1246,11 +1241,11 @@ test "background shorthand resets supported longhands in declaration order" {
     var declarations = try css_parser.body(allocator);
     defer declarations.deinit();
 
-    try std.testing.expectEqualStrings("#FC0", declarations.get("background-color").?.value);
-    try std.testing.expectEqualStrings("url(new.ppm)", declarations.get("background-image").?.value);
+    try std.testing.expectEqualStrings("rgb(255, 204, 0)", declarations.get("background-color").?.value);
+    try std.testing.expectEqualStrings("url(\"new.ppm\")", declarations.get("background-image").?.value);
     try std.testing.expectEqualStrings("cover", declarations.get("background-size").?.value);
     try std.testing.expectEqualStrings("repeat-x", declarations.get("background-repeat").?.value);
-    try std.testing.expectEqualStrings("1px 0", declarations.get("background-position").?.value);
+    try std.testing.expectEqualStrings("1px 0px", declarations.get("background-position").?.value);
     try std.testing.expectEqualStrings("fixed", declarations.get("background-attachment").?.value);
     try std.testing.expect(declarations.get("background-color").?.important);
     try std.testing.expect(declarations.get("background-image").?.important);
@@ -1353,8 +1348,7 @@ test ":focus-visible matches the installed focus heuristic and recomputes styles
         },
         else => return error.TestExpectedSelectorSequence,
     }
-    // button (1) + .widget (10) + :focus-visible (10)
-    try std.testing.expectEqual(@as(u32, 21), rules[1].cascadePriority());
+    try std.testing.expectEqual(CSSParser.Specificity{ .classes = 2, .types = 1 }, rules[1].specificity());
 
     try document_parser.style(allocator, &root, rules);
     const button = &root.element.children.items[0].element;
@@ -1425,9 +1419,9 @@ test ":hover matches elements and ancestor paths and recomputes styles" {
     }
 
     try std.testing.expectEqual(@as(usize, 3), rules.len);
-    try std.testing.expectEqual(@as(u32, 21), rules[0].cascadePriority());
-    try std.testing.expectEqual(@as(u32, 11), rules[1].cascadePriority());
-    try std.testing.expectEqual(@as(u32, 40), rules[2].cascadePriority());
+    try std.testing.expectEqual(CSSParser.Specificity{ .classes = 2, .types = 1 }, rules[0].specificity());
+    try std.testing.expectEqual(CSSParser.Specificity{ .classes = 1, .types = 1 }, rules[1].specificity());
+    try std.testing.expectEqual(CSSParser.Specificity{ .classes = 4 }, rules[2].specificity());
 
     try document_parser.style(allocator, &root, rules);
     const first_card = &root.element.children.items[0].element;
@@ -1507,8 +1501,7 @@ test "descendant selectors are flat and match ordered ancestor chains" {
         },
         else => return error.TestExpectedDescendantSelector,
     }
-    // main (1) + section.chapter (11) + article (1) + .target (10)
-    try std.testing.expectEqual(@as(u32, 23), rules[0].cascadePriority());
+    try std.testing.expectEqual(CSSParser.Specificity{ .classes = 2, .types = 3 }, rules[0].specificity());
 
     try document_parser.style(allocator, &root, rules);
     const target = &root.element.children.items[0]
@@ -1670,8 +1663,7 @@ test ":has selectors match strict descendants, cascade, and recompute" {
         },
         else => return error.TestExpectedDescendantSelector,
     }
-    // main (1) + div.card (11) + span.badge (11)
-    try std.testing.expectEqual(@as(u32, 23), rules[0].cascadePriority());
+    try std.testing.expectEqual(CSSParser.Specificity{ .classes = 2, .types = 3 }, rules[0].specificity());
 
     try document_parser.style(allocator, &root, rules);
     const matching_card = &root.element.children.items[0].element;
@@ -1723,12 +1715,12 @@ test "important declarations retain values, priority, and shorthand metadata" {
     const color = declarations.get("color").?;
     try std.testing.expectEqualStrings("red", color.value);
     try std.testing.expect(color.important);
-    try std.testing.expectEqual(@as(u32, 10_007), color.priority(7));
+    try std.testing.expectEqual(CSSParser.cascade.Level.important_author, color.key(.{}).level);
 
     const background = declarations.get("background-color").?;
     try std.testing.expectEqualStrings("white", background.value);
     try std.testing.expect(!background.important);
-    try std.testing.expectEqual(@as(u32, 7), background.priority(7));
+    try std.testing.expectEqual(CSSParser.cascade.Level.author, background.key(.{}).level);
 
     try std.testing.expectEqualStrings("italic", declarations.get("font-style").?.value);
     try std.testing.expectEqualStrings("bold", declarations.get("font-weight").?.value);
@@ -1982,7 +1974,7 @@ test "box model longhands survive style computation" {
     try std.testing.expectEqualStrings("3px", styles.getPtr("padding-bottom").?.get().*);
     try std.testing.expectEqualStrings("4px", styles.getPtr("border-left-width").?.get().*);
     try std.testing.expectEqualStrings("solid", styles.getPtr("border-right-style").?.get().*);
-    try std.testing.expectEqualStrings("#123456", styles.getPtr("border-top-color").?.get().*);
+    try std.testing.expectEqualStrings("rgb(18, 52, 86)", styles.getPtr("border-top-color").?.get().*);
 }
 
 test "float and clear survive style computation" {
@@ -2295,8 +2287,8 @@ test "computed animation starts typed keyframe tracks without restarting on rest
 
     try document_parser.styleWithKeyframes(allocator, &root, rules, keyframes.items);
     try std.testing.expectEqualStrings(
-        "2s infinite alternate demo",
-        root.element.style.?.getPtr("animation").?.get().*,
+        "demo",
+        root.element.style.?.getPtr("animation-name").?.get().*,
     );
     const state = root.element.css_animation.?;
     try std.testing.expect(state.contains("opacity"));

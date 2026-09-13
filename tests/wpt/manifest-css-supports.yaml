@@ -1,0 +1,54 @@
+# Shared feature queries through JavaScript, conditional rule activation, and computed helpers.
+tests:
+  - css/css-display/parsing/display-invalid.html
+  - css/css-position/parsing/position-invalid.html
+  - css/css-position/parsing/position-valid.html
+  - css/css-color/parsing/opacity-invalid.html
+  - css/css-fonts/parsing/font-style-invalid.html
+  - css/css-fonts/parsing/font-weight-invalid.html
+  - css/css-conditional/js/CSS-supports-L3.html
+  - css/css-conditional/js/CSS-supports-L4.html
+  - css/css-conditional/js/CSS-supports-selector-detecting-invalid-in-logical-combinations.html
+  - css/css-conditional/js/CSS-supports-CSSStyleDeclaration.html
+  - css/css-color/parsing/color-computed.html
+  - css/css-color/parsing/color-computed-named-color.html
+  - css/css-color/parsing/color-computed-hex-color.html
+  - css/css-color/parsing/color-computed-rgb.html
+  - css/css-color/parsing/color-computed-hsl.html
+reftests:
+  - css/css-conditional/at-supports-content-001.html
+  - css/css-conditional/at-supports-content-003.html
+  - css/css-conditional/at-supports-001.html
+  - css/css-conditional/at-supports-002.html
+  - css/css-conditional/at-supports-003.html
+  - css/css-conditional/at-supports-004.html
+  - css/css-conditional/at-supports-005.html
+  - css/css-conditional/at-supports-006.html
+  - css/css-conditional/at-supports-007.html
+  - css/css-conditional/at-supports-008.html
+  - css/css-conditional/at-supports-009.html
+  - css/css-conditional/at-supports-010.html
+  - css/css-conditional/at-supports-011.html
+  - css/css-conditional/at-supports-012.html
+  - css/css-conditional/at-supports-013.html
+  - css/css-conditional/at-supports-014.html
+  - css/css-conditional/at-supports-015.html
+  - css/css-conditional/at-supports-020.html
+  - css/css-conditional/at-supports-027.html
+  - css/css-conditional/at-supports-033.html
+  - css/css-conditional/at-supports-034.html
+  - css/css-conditional/at-supports-046.html
+  - css/css-conditional/at-supports-048.html
+  - css/css-conditional/at-supports-selector-001.html
+  - css/css-conditional/at-supports-selector-002.html
+  - css/css-conditional/at-supports-selector-003.html
+  - css/css-conditional/at-supports-selector-004.html
+  - css/css-conditional/at-supports-selector-detecting-invalid-in-logical-combinations.html
+  - css/css-variables/variable-supports-01.html
+  - css/css-variables/variable-supports-06.html
+  - css/css-variables/variable-supports-17.html
+  - css/css-variables/variable-supports-25.html
+  - css/css-variables/variable-supports-37.html
+  - css/css-variables/variable-supports-66.html
+crashtests:
+  - css/css-conditional/crashtests/supports-malformed.html

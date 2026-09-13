@@ -164,4 +164,10 @@ const cascade_cases = [_]Case{
     },
 };
 
-pub const cases = existing_cases ++ cascade_cases;
+const recovery_cases = [_]Case{
+    .{ .name = "css-recovery-style", .mode = .style, .fixture = "tests/manual/css-recovery.html", .golden = "tests/golden/pipeline/css-recovery.style.txt" },
+    .{ .name = "css-recovery-layout", .mode = .layout, .fixture = "tests/manual/css-recovery.html", .golden = "tests/golden/pipeline/css-recovery.layout.txt" },
+    .{ .name = "css-recovery-display-list", .mode = .display_list, .fixture = "tests/manual/css-recovery.html", .golden = "tests/golden/pipeline/css-recovery.display-list.txt" },
+};
+
+pub const cases = existing_cases ++ cascade_cases ++ recovery_cases;

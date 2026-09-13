@@ -1,0 +1,21 @@
+# Logical selector lists, specificity and mutation-driven matching.
+tests:
+  - dom/nodes/ParentNode-querySelectors-exclusive.html
+  - css/selectors/is-where-basic.html
+  - css/selectors/is-specificity.html
+  - css/selectors/is-nested.html
+  - css/selectors/is-where-not.html
+  - css/selectors/is-where-pseudo-classes.html
+  - css/selectors/not-complex.html
+  - css/selectors/not-specificity.html
+  - css/selectors/invalidation/not-001.html
+  - css/selectors/invalidation/not-002.html
+reftests:
+  - css/selectors/is-where-visited.html
+  - css/CSS2/cascade/specificity-003.xht
+  - css/selectors/invalidation/negated-is-never-matches-negated-first-of-type-when-ancestor-changes.html
+  - css/selectors/invalidation/negated-is-always-matches-negated-last-of-type-when-ancestor-changes.html
+crashtests:
+  - css/selectors/nth-child-spurious-brace-crash.html
+  - css/selectors/pseudo-where-crash.html
+  - css/selectors/is-where-error-crash.html

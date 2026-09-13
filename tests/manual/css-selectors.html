@@ -1,0 +1,61 @@
+<!-- How to verify: expect green PASS and two green bars of equal width.
+     Checks logical lists, specificity, sibling/ancestor mutations, and inline
+     edits through native queries and immediate geometry reads. -->
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Logical CSS selectors</title><style>
+body { margin:30px; font:18px sans-serif; }
+.card, #reference { width:160px; height:24px; margin:12px 0; background:green; }
+:where(#target) { width:99px; background:red; }
+:is(#absent, .card) { height:24px; }
+.card.card.card { height:99px; }
+#target { background:green; }
+.card.card.card.card.card.card.card.card.card.card.card { background:red; }
+:is(main.compact > .card):not(aside, .hidden) { width:80px; }
+:is(.blocked + .card) { width:120px; }
+</style></head><body>
+<h1 id="status">Checking logical selectors</h1>
+<main id="container"><aside id="toggle"></aside><div class="card" id="target"></div></main>
+<div id="reference"></div>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var target = document.getElementById('target'), container = document.getElementById('container');
+  var toggle = document.getElementById('toggle'), results = [];
+  function equal(a,b) { if (a !== b) throw Error(String(a) + ' != ' + String(b)); }
+  function check(name, run) {
+    try { run(); results.push({name:name, status:0}); }
+    catch (e) { results.push({name:name, status:1, message:String(e)}); }
+  }
+  check('logical queries preserve nesting complex branches and forgiving recovery', function() {
+    equal(document.querySelector(':is(:unknown, main > .card):not(.hidden, aside)'), target);
+    equal(document.querySelector(':where()'), null);
+    equal(document.querySelector(':is(, :unknown, .card,)'), target);
+    equal(document.querySelector(':not(:is(main > .card))#target'), null);
+    var invalid = false;
+    try { document.querySelector(':not(.card, :unknown)'); } catch (e) { invalid = e.name === 'SyntaxError'; }
+    equal(invalid, true);
+  });
+  check('where has zero specificity and is uses its most specific branch', function() {
+    equal(target.getBoundingClientRect().width, 160);
+    equal(target.getBoundingClientRect().height, 24);
+    equal(getComputedStyle(target).backgroundColor, 'rgb(0, 128, 0)');
+  });
+  check('ancestor changes inside logical selectors immediately update geometry', function() {
+    container.className = 'compact'; equal(target.getBoundingClientRect().width, 80);
+    container.className = ''; equal(target.getBoundingClientRect().width, 160);
+  });
+  check('sibling changes inside logical selectors immediately update geometry', function() {
+    toggle.className = 'blocked'; equal(target.getBoundingClientRect().width, 120);
+    equal(document.querySelector('.card:not(.blocked ~ .card)'), null);
+    toggle.className = ''; equal(target.getBoundingClientRect().width, 160);
+  });
+  check('inline edits retain attachment precedence then restore stylesheet winners', function() {
+    target.style.width = '100px'; equal(target.getBoundingClientRect().width, 100);
+    target.style.removeProperty('width'); equal(target.getBoundingClientRect().width, 160);
+  });
+  var failures = results.filter(function(result) { return result.status !== 0; });
+  var status = document.getElementById('status');
+  status.textContent = failures.length ? 'FAIL: ' + failures[0].message : 'PASS: logical selectors and cascade';
+  status.style.color = failures.length ? 'red' : 'green';
+  if (typeof completion_callback === 'function') completion_callback(results, {status:0});
+});
+</script></body></html>

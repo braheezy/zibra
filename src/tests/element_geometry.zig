@@ -56,6 +56,76 @@ fn setStyle(node: *parser.Node, value: []const u8) !void {
     @import("../document/dom.zig").dirtyStyleForElement(&node.element);
 }
 
+test "sticky element scrolling shares paint hit geometry and containing limits" {
+    var page = try Page.init("<main style='display:block'><div style='display:block;position:relative;width:100px;height:200px;overflow:hidden;border:2px solid'><div style='display:block;height:500px'><div style='display:block;height:100px'></div><div style='display:block;height:300px'><div style='display:block;height:100px'></div><div style='display:block;position:sticky;top:50px;height:100px;background:green'></div></div></div></div></main>");
+    defer page.deinit();
+    try page.render();
+    const scroller = &page.root.element.children.items[0];
+    try std.testing.expect(!scroller.element.scrollBy(10));
+    const contents = &scroller.element.children.items[0];
+    const container = &contents.element.children.items[1];
+    const sticky = &container.element.children.items[1];
+    var port = try page.rects(scroller, 0, false);
+    defer port.deinit(allocator);
+    for ([_]i32{ 100, 200, 300 }, [_]f64{ 100, 50, 0 }) |scroll, expected| {
+        try std.testing.expect(scroller.element.scrollTo(0, scroll));
+        parser.markPaintForElement(&scroller.element);
+        _ = page.document.?.updateSticky(0);
+        try std.testing.expect(!page.document.?.layoutNeeded());
+        var rects = try page.rects(sticky, 0, false);
+        defer rects.deinit(allocator);
+        try std.testing.expectEqual(port.items[0].y + 2 + expected, rects.items[0].y);
+        const commands = try page.engine.paintDocument(page.document.?);
+        defer DisplayItem.freeList(allocator, commands);
+        const hit = DisplayItem.hitTest(commands, @intFromFloat(rects.items[0].x + 5), @intFromFloat(rects.items[0].y + 5), 1).?;
+        try std.testing.expectEqual(sticky, hit.source.node.?);
+    }
+    try setStyle(sticky, "display:block;position:static;top:50px;height:100px;background:green");
+    try page.render();
+    var restored = try page.rects(sticky, 0, false);
+    defer restored.deinit(allocator);
+    try std.testing.expectEqual(port.items[0].y + 2 - 100, restored.items[0].y);
+}
+
+test "sticky viewport scrolling preserves normal flow and resets after resize" {
+    var page = try Page.init("<main style='display:block;height:1000px'><div style='display:block;height:600px'><div style='display:block;height:150px'></div><div style='display:block;position:sticky;top:10px;height:50px'></div><div style='display:block;height:20px'></div></div></main>");
+    defer page.deinit();
+    try page.render();
+    const container = &page.root.element.children.items[0];
+    const sticky = &container.element.children.items[1];
+    const after = &container.element.children.items[2];
+    var original = try page.rects(after, 0, true);
+    defer original.deinit(allocator);
+    try std.testing.expect(page.document.?.updateSticky(200));
+    var stuck = try page.rects(sticky, 200, false);
+    defer stuck.deinit(allocator);
+    try std.testing.expectEqual(@as(f64, 10), stuck.items[0].y);
+    var unchanged = try page.rects(after, 0, true);
+    defer unchanged.deinit(allocator);
+    try std.testing.expectEqualSlices(Rect, original.items, unchanged.items);
+    try std.testing.expect(!page.document.?.layoutNeeded());
+    try std.testing.expect(page.document.?.updateSticky(0));
+    var restored = try page.rects(sticky, 0, false);
+    defer restored.deinit(allocator);
+    try std.testing.expectEqual(original.items[0].y - 50, restored.items[0].y);
+}
+
+test "sticky horizontal block uses its nearest scrollport and zoomed inset" {
+    var page = try Page.init("<main style='display:block'><div style='display:block;overflow:auto;width:200px;height:100px;zoom:2'><div style='display:block;width:500px;height:100px'><div style='display:block;position:sticky;left:10%;margin-left:150px;width:50px;height:50px;background:green'></div></div></div></main>");
+    defer page.deinit();
+    try page.render();
+    const port = &page.root.element.children.items[0];
+    const sticky = &port.element.children.items[0].element.children.items[0];
+    try std.testing.expectEqual(@as(i32, 600), port.element.maxScrollX());
+    try std.testing.expect(port.element.scrollTo(400, 0));
+    _ = page.document.?.updateSticky(0);
+    var outer = try page.rects(port, 0, false);
+    defer outer.deinit(allocator);
+    var rects = try page.rects(sticky, 0, false);
+    defer rects.deinit(allocator);
+    try std.testing.expectEqual(outer.items[0].x + 40, rects.items[0].x);
+}
+
 fn editorClip(items: []const DisplayItem, node: *parser.Node) ?Rect {
     for (items) |item| switch (item) {
         .blend => |group| {

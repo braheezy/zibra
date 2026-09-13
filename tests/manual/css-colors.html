@@ -1,0 +1,61 @@
+<!-- How to verify: expect green PASS and two matching green bars. Checks live
+     resolved colors, currentcolor inheritance, named colors, variables and
+     retained readback after mutation; the bars exercise the native paint path. -->
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CSS resolved colors</title><style>
+body { margin:30px; font:18px sans-serif; }
+#palette, #target, #reference { width:180px; height:24px; }
+#palette { color:red; background:currentcolor; margin:12px 0; }
+#target { color:currentcolor; background:inherit; }
+#reference { background:green; }
+</style></head><body>
+<h1 id="status">Checking CSS colors</h1>
+<div id="palette"><div id="target"></div></div>
+<div id="reference"></div>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var target = document.getElementById('target'), palette = document.getElementById('palette');
+  var computed = getComputedStyle(target), results = [];
+  function equal(a,b) { if (a !== b) throw Error(String(a) + ' != ' + String(b)); }
+  function check(name, run) {
+    try { run(); results.push({name:name, status:0}); }
+    catch (e) { results.push({name:name, status:1, message:String(e)}); }
+  }
+  check('foreground currentcolor inherits and held computed views stay live', function() {
+    equal(computed.color, 'rgb(255, 0, 0)');
+    palette.style.color = 'green'; equal(computed.color, 'rgb(0, 128, 0)');
+  });
+  check('inherited currentcolor resolves on the receiving element', function() {
+    target.style.color = 'blue'; equal(computed.backgroundColor, 'rgb(0, 0, 255)');
+    equal(computed.borderLeftColor, computed.color);
+    equal(computed['background-color'], computed.backgroundColor);
+    equal(computed.getPropertyValue('BACKGROUND-COLOR'), computed.backgroundColor);
+  });
+  check('named colors serialize as RGB without changing authored keywords', function() {
+    target.style.color = 'RebeccaPurple'; var retained = computed.color;
+    equal(target.style.color, 'rebeccapurple'); equal(retained, 'rgb(102, 51, 153)');
+    target.style.color = 'aliceblue'; equal(computed.color, 'rgb(240, 248, 255)');
+    equal(retained, 'rgb(102, 51, 153)');
+  });
+  check('alpha is retained for readback and transparent resolves to transparent black', function() {
+    target.style.color = 'rgb(1 2 3 / .12345)'; equal(computed.color, 'rgba(1, 2, 3, 0.12345)');
+    target.style.color = 'transparent'; equal(computed.color, 'rgba(0, 0, 0, 0)');
+    equal(computed.backgroundColor, computed.color);
+  });
+  check('variables use color grammar while custom property readback stays untyped', function() {
+    palette.style.setProperty('--Tone', 'teal'); target.style.color = 'var(--Tone)';
+    equal(computed.color, 'rgb(0, 128, 128)'); equal(computed.getPropertyValue('--Tone'), 'teal');
+    palette.style.setProperty('--Tone', 'not-a-color'); equal(computed.color, 'rgb(0, 128, 0)');
+  });
+  check('final synchronous color mutation reaches the matching green bars', function() {
+    target.style.color = 'currentcolor';
+    equal(computed.color, 'rgb(0, 128, 0)'); equal(computed.backgroundColor, computed.color);
+    equal(target.getBoundingClientRect().width, document.getElementById('reference').getBoundingClientRect().width);
+  });
+  var failures = results.filter(function(result) { return result.status !== 0; });
+  var status = document.getElementById('status');
+  status.textContent = failures.length ? 'FAIL: ' + failures[0].message : 'PASS: resolved CSS colors';
+  status.style.color = failures.length ? 'red' : 'green';
+  if (typeof completion_callback === 'function') completion_callback(results, {status:0});
+});
+</script></body></html>

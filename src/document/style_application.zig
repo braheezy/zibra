@@ -5,6 +5,7 @@
 //! style-pass algorithm, but never owns a Node or layout object.
 
 const std = @import("std");
+const cascade = @import("css_cascade.zig");
 const presentational_hints = @import("presentational_hints.zig");
 const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
 const CSSParser = @import("css_parser.zig").CSSParser;
@@ -180,6 +181,7 @@ pub fn Application(
             keyframes: []const CSSParser.KeyframesRule,
             name: []const u8,
         ) ?*const CSSParser.KeyframesRule {
+            if (@import("css_tokenizer.zig").identifierEquals(name, "none")) return null;
             var index = keyframes.len;
             while (index > 0) {
                 index -= 1;
@@ -263,7 +265,7 @@ pub fn Application(
                 var expanded = CSSParser.DeclarationMap.init(values_allocator);
                 defer expanded.deinit();
                 try CSSParser.putDeclaration(&expanded, declaration.pending_shorthand orelse property, value);
-                value = (expanded.get(property) orelse return null).value;
+                value = try values_allocator.dupe(u8, (expanded.get(property) orelse return null).value);
                 if (!CSSParser.isValidLonghandValue(property, value)) return null;
             }
             if (value_tokens.hasRem(value)) {
@@ -271,7 +273,7 @@ pub fn Application(
                 const root_size = if (ancestors.len == 0)
                     css_length.parsePixel(styles.getPtr("font-size").?.get().*) orelse 16
                 else
-                    try rootFontSize(styles.allocator, ancestors, styles.getPtr("animation").?);
+                    try rootFontSize(styles.allocator, ancestors, styles.getPtr("animation-name").?);
                 value = (try value_tokens.resolveRem(values_allocator, value, root_size)) orelse value;
             }
             if (css_length.isMath(value) and (std.mem.eql(u8, property, "width") or std.mem.eql(u8, property, "height"))) {
@@ -279,16 +281,17 @@ pub fn Application(
                 const size = css_length.resolve(value, .{ .font_size = font_size }) orelse return null;
                 value = try std.fmt.allocPrint(values_allocator, "{d:.6}px", .{size});
             }
-            return value;
-        }
-
-        fn cssAnimationTracksPresent(element: *const Element, state: CssAnimationState) bool {
-            if (state.finished) return true;
-            const animations = element.animations orelse return false;
-            for (css_animation_properties) |property| {
-                if (state.contains(property) and !animations.contains(property)) return false;
+            if (std.mem.eql(u8, property, "background-color")) {
+                const colors = @import("color.zig");
+                const styles = &element.style.?;
+                if (std.ascii.eqlIgnoreCase(value, "currentcolor")) value = styles.getPtr("color").?.get().*;
+                if (colors.hasCalculation(value)) {
+                    try styles.getPtr("animation-name").?.tryAddDependency(styles.getPtr("font-size").?, styles.allocator);
+                    const computed = colors.parseWithContext(value, .{ .font_size = css_length.parsePixel(styles.getPtr("font-size").?.get().*) orelse 16 }) orelse return null;
+                    value = try computed.serialize(values_allocator);
+                }
             }
-            return true;
+            return value;
         }
 
         pub fn removeCssAnimationTracks(element: *Element) void {
@@ -308,7 +311,6 @@ pub fn Application(
                     if (state.contains(property)) _ = animations.remove(property);
                 }
             }
-            element.css_animation.?.restart_pending = false;
             element.css_animation.?.finished = true;
         }
 
@@ -316,36 +318,42 @@ pub fn Application(
             allocator: std.mem.Allocator,
             element: *Element,
             ancestors: []const *Node,
-            raw_animation: []const u8,
+            values_list: [8][]const u8,
             keyframes: []const CSSParser.KeyframesRule,
-        ) !void {
-            const spec = css_animation.parse(raw_animation) orelse {
+            important_mask: u8,
+        ) !bool {
+            const had_animation = element.css_animation != null;
+            const spec = css_animation.fromValues(values_list) orelse {
                 removeCssAnimationTracks(element);
-                return;
+                return had_animation;
             };
             const rule = keyframesNamed(keyframes, spec.name) orelse {
                 removeCssAnimationTracks(element);
-                return;
+                return had_animation;
             };
-            const start = rule.frameAt(0) orelse {
-                removeCssAnimationTracks(element);
-                return;
-            };
-            const end = rule.frameAt(1) orelse {
-                removeCssAnimationTracks(element);
-                return;
-            };
+            const start = rule.frameAt(0);
+            const end = rule.frameAt(1);
 
             var values = std.heap.ArenaAllocator.init(allocator);
             defer values.deinit();
-            var signature = std.hash.Wyhash.hash(0, std.mem.trim(u8, raw_animation, " \t\r\n"));
+            const name_hash = std.hash.Wyhash.hash(0, spec.name);
+            var signature = std.hash.Wyhash.hash(name_hash, values_list[1]);
             var tracks = [_]?Animation{ null, null, null, null, null };
             var property_mask: u8 = 0;
             for (css_animation_properties, 0..) |property, index| {
-                const start_declaration = start.properties.get(property) orelse continue;
-                const end_declaration = end.properties.get(property) orelse continue;
-                const start_value = (try computedKeyframeValue(values.allocator(), element, ancestors, property, start_declaration)) orelse continue;
-                const end_value = (try computedKeyframeValue(values.allocator(), element, ancestors, property, end_declaration)) orelse continue;
+                if ((important_mask & cssAnimationPropertyBit(property)) != 0) continue;
+                const start_declaration = if (start) |frame| frame.properties.get(property) else null;
+                const end_declaration = if (end) |frame| frame.properties.get(property) else null;
+                if (start_declaration == null and end_declaration == null) continue;
+                const underlying = element.style.?.getPtr(property).?.get().*;
+                const start_value = if (start_declaration) |declaration|
+                    if (!declaration.important) (try computedKeyframeValue(values.allocator(), element, ancestors, property, declaration)) orelse continue else underlying
+                else
+                    underlying;
+                const end_value = if (end_declaration) |declaration|
+                    if (!declaration.important) (try computedKeyframeValue(values.allocator(), element, ancestors, property, declaration)) orelse continue else underlying
+                else
+                    underlying;
                 signature = std.hash.Wyhash.hash(signature, property);
                 signature = std.hash.Wyhash.hash(signature, start_value);
                 signature = std.hash.Wyhash.hash(signature, end_value);
@@ -359,26 +367,28 @@ pub fn Application(
             }
             if (property_mask == 0) {
                 removeCssAnimationTracks(element);
-                return;
+                return had_animation;
             }
             if (element.css_animation) |state| {
-                if (state.signature == signature and cssAnimationTracksPresent(element, state)) return;
+                if (state.signature == signature and std.meta.eql(state.timing, css_animation.Timing.fromSpec(spec))) return false;
             }
 
             if (element.animations == null) {
                 element.animations = std.StringHashMap(Animation).init(allocator);
             }
             try element.animations.?.ensureUnusedCapacity(css_animation_properties.len);
+            const elapsed = if (element.css_animation) |state| if (state.name_hash == name_hash) state.elapsed_frames else 0 else 0;
             removeCssAnimationTracks(element);
-            for (css_animation_properties, 0..) |property, index| {
-                if (tracks[index]) |track| element.animations.?.putAssumeCapacity(property, track);
-            }
             element.css_animation = .{
                 .signature = signature,
+                .name_hash = name_hash,
                 .property_mask = property_mask,
-                .iterations = spec.iterations,
-                .direction = spec.direction,
+                .timing = css_animation.Timing.fromSpec(spec),
+                .templates = tracks,
+                .elapsed_frames = elapsed,
             };
+            element.css_animation.?.publish(&element.animations.?);
+            return true;
         }
 
         fn resolveFontFamilyKeyword(value: []const u8, inherited_value: []const u8) []const u8 {
@@ -469,6 +479,11 @@ pub fn Application(
                 return;
             }
 
+            if (node.* == .element) {
+                node.element.selector_dependencies = .{};
+                for (rules) |rule| node.element.selector_dependencies = node.element.selector_dependencies.merge(rule.selector.dependencies());
+            }
+
             var has_cache = CSSParser.HasMatchCache.init(allocator);
             defer has_cache.deinit();
             for (rules) |rule| try rule.selector.populateHasMatches(&has_cache, node);
@@ -491,20 +506,15 @@ pub fn Application(
 
         fn applyCascadedDeclaration(
             values: *std.StringHashMap([]const u8),
-            priorities: *std.StringHashMap(u32),
+            priorities: *std.StringHashMap(cascade.Key),
             pending_shorthands: *std.StringHashMap([]const u8),
             property: []const u8,
             declaration: CSSParser.Declaration,
-            base_priority: u32,
+            key: cascade.Key,
         ) !void {
-            const priority = declaration.priority(base_priority);
-            if (priorities.get(property)) |existing_priority| {
-                // Later declarations win ties; callers preserve stylesheet source
-                // order among equal-specificity rules.
-                if (priority < existing_priority) return;
-            }
+            if (!key.wins(priorities.get(property))) return;
             try values.put(property, declaration.value);
-            try priorities.put(property, priority);
+            try priorities.put(property, key);
             if (declaration.pending_shorthand) |shorthand| {
                 try pending_shorthands.put(property, shorthand);
             } else _ = pending_shorthands.remove(property);
@@ -709,7 +719,7 @@ pub fn Application(
                         errdefer markStyleMapWithoutOwnerFn(style_map);
                         var new_style = std.StringHashMap([]const u8).init(allocator);
                         defer new_style.deinit();
-                        var cascade_priorities = std.StringHashMap(u32).init(allocator);
+                        var cascade_priorities = std.StringHashMap(cascade.Key).init(allocator);
                         defer cascade_priorities.deinit();
                         var pending_shorthands = std.StringHashMap([]const u8).init(allocator);
                         defer pending_shorthands.deinit();
@@ -751,19 +761,19 @@ pub fn Application(
                             &pending_shorthands,
                             hint.key_ptr.*,
                             .{ .value = hint.value_ptr.* },
-                            CSSParser.PRESENTATIONAL_HINT_PRIORITY,
+                            .{ .level = .hint },
                         );
 
                         // Second, apply styles from CSS rules (can override inherited values)
-                        for (rules) |rule| {
+                        for (rules, 0..) |rule, rule_index| {
                             if (ruleAppliesToNode(rule, node) and
                                 rule.selector.matchesWithContext(node, ancestor_chain, match_context))
                             {
+                                const context = rule.cascadeContext(rule_index);
                                 var it = rule.properties.iterator();
                                 while (it.next()) |entry| {
                                     if (std.mem.eql(u8, entry.key_ptr.*, "background-image") and
-                                        entry.value_ptr.priority(rule.declarationPriorityBase(entry.value_ptr.important)) >=
-                                            (cascade_priorities.get("background-image") orelse 0))
+                                        entry.value_ptr.key(context).wins(cascade_priorities.get("background-image")))
                                     {
                                         background_source_url = rule.source_url;
                                         background_referrer_policy = if (rule.source_url != null) rule.referrer_policy else null;
@@ -774,7 +784,7 @@ pub fn Application(
                                         &pending_shorthands,
                                         entry.key_ptr.*,
                                         entry.value_ptr.*,
-                                        rule.declarationPriorityBase(entry.value_ptr.important),
+                                        entry.value_ptr.key(context),
                                     );
                                 }
                             }
@@ -782,31 +792,23 @@ pub fn Application(
 
                         // Third, apply style-attribute declarations with inline
                         // specificity. Author !important still beats normal inline.
-                        if (e.attributes) |attrs| {
-                            if (attrs.get("style")) |style_attr| {
-                                const css_parser = try CSSParser.init(allocator, style_attr, false);
-                                defer css_parser.deinit(allocator);
-                                var parsed_styles = try css_parser.body(allocator);
-                                defer parsed_styles.deinit();
-
-                                var it = parsed_styles.iterator();
-                                while (it.next()) |entry| {
-                                    if (std.mem.eql(u8, entry.key_ptr.*, "background-image") and
-                                        entry.value_ptr.priority(CSSParser.AUTHOR_ORIGIN_PRIORITY + CSSParser.INLINE_STYLE_PRIORITY) >=
-                                            (cascade_priorities.get("background-image") orelse 0))
-                                    {
-                                        background_source_url = null;
-                                        background_referrer_policy = null;
-                                    }
-                                    try applyCascadedDeclaration(
-                                        &new_style,
-                                        &cascade_priorities,
-                                        &pending_shorthands,
-                                        entry.key_ptr.*,
-                                        entry.value_ptr.*,
-                                        CSSParser.AUTHOR_ORIGIN_PRIORITY + CSSParser.INLINE_STYLE_PRIORITY,
-                                    );
+                        if (try e.inlineStyle(allocator)) |parsed_styles| {
+                            var it = parsed_styles.entries.iterator();
+                            while (it.next()) |entry| {
+                                if (std.mem.eql(u8, entry.key_ptr.*, "background-image") and
+                                    entry.value_ptr.key(.{ .inline_style = true }).wins(cascade_priorities.get("background-image")))
+                                {
+                                    background_source_url = null;
+                                    background_referrer_policy = null;
                                 }
+                                try applyCascadedDeclaration(
+                                    &new_style,
+                                    &cascade_priorities,
+                                    &pending_shorthands,
+                                    entry.key_ptr.*,
+                                    entry.value_ptr.*,
+                                    entry.value_ptr.key(.{ .inline_style = true }),
+                                );
                             }
                         }
 
@@ -849,7 +851,7 @@ pub fn Application(
                                     valid = valid and CSSParser.isValidLonghandValue(entry.key_ptr.*, entry.value_ptr.value);
                                 }
                                 const resolved = expanded.get(prop.name);
-                                try new_style.put(prop.name, if (valid and resolved != null) resolved.?.value else "unset");
+                                try new_style.put(prop.name, if (valid and resolved != null) try retainComputedValue(e, allocator, resolved.?.value, prop.default_value) else "unset");
                             } else try new_style.put(prop.name, "unset");
                         }
 
@@ -873,6 +875,8 @@ pub fn Application(
                             const authored = new_style.get(prop.name) orelse continue;
                             const keyword = std.mem.trim(u8, authored, " \t\r\n");
                             const wants_inherited = std.ascii.eqlIgnoreCase(keyword, "inherit") or
+                                (std.mem.eql(u8, prop.name, "color") and
+                                    std.ascii.eqlIgnoreCase(keyword, "currentcolor")) or
                                 (std.ascii.eqlIgnoreCase(keyword, "unset") and
                                     isInheritedProperty(prop.name));
                             if (wants_inherited) {
@@ -1003,6 +1007,35 @@ pub fn Application(
                             }
                         }
 
+                        // Resolve color calculations before inheritance or paint can
+                        // observe them. Specified declarations retain their math;
+                        // computed strings belong to this Element generation.
+                        for (CSS_PROPERTIES) |prop| {
+                            if (prop.serialization != .color) continue;
+                            const authored = new_style.get(prop.name).?;
+                            const colors = @import("color.zig");
+                            if (!colors.hasCalculation(authored)) continue;
+                            const field = style_map.getPtr(prop.name).?;
+                            try field.tryAddDependency(style_map.getPtr("font-size").?, allocator);
+                            const computed = colors.parseWithContext(authored, .{
+                                .font_size = css_length.parsePixel(new_style.get("font-size").?) orelse 16,
+                            }) orelse continue;
+                            try new_style.put(prop.name, try retainComputed(e, allocator, try computed.serialize(allocator)));
+                        }
+
+                        for ([_][]const u8{ "animation-duration", "animation-delay", "animation-iteration-count" }) |name| {
+                            const authored = new_style.get(name).?;
+                            const initial = css_properties.get(name).?.default_value;
+                            if (std.mem.eql(u8, authored, initial)) continue;
+                            if (@import("color.zig").hasRelativeUnits(authored))
+                                try style_map.getPtr(name).?.tryAddDependency(style_map.getPtr("font-size").?, allocator);
+                            const value = try css_animation.serializeComputed(allocator, name, authored, .{ .font_size = css_length.parsePixel(new_style.get("font-size").?) orelse 16 });
+                            if (std.mem.eql(u8, value, initial)) {
+                                allocator.free(value);
+                                try new_style.put(name, initial);
+                            } else try new_style.put(name, try retainComputed(e, allocator, value));
+                        }
+
                         // Length and percentage line-heights compute to an absolute
                         // value at the element's font size. Unitless numbers remain
                         // unitless so descendants inherit the multiplier and apply it
@@ -1049,13 +1082,22 @@ pub fn Application(
                                 field.set(try retainComputedValue(e, allocator, value, prop.default_value));
                             }
                         }
-                        try syncCssAnimation(
-                            allocator,
-                            e,
-                            ancestor_chain,
-                            new_style.get("animation") orelse "none",
-                            keyframes,
-                        );
+                        var animation_values: [8][]const u8 = undefined;
+                        for (css_animation.names, 0..) |name, index| animation_values[index] = new_style.get(name).?;
+                        var important_mask: u8 = 0;
+                        for (css_animation_properties) |property| {
+                            if (cascade_priorities.get(property)) |key| {
+                                if (key.level == .important_author or key.level == .important_user_agent) important_mask |= cssAnimationPropertyBit(property);
+                            }
+                        }
+                        const previous_mask = if (e.css_animation) |state| state.property_mask else 0;
+                        if (try syncCssAnimation(allocator, e, ancestor_chain, animation_values, keyframes, important_mask)) {
+                            const next_mask = if (e.css_animation) |state| state.property_mask else 0;
+                            if (((previous_mask | next_mask) & (cssAnimationPropertyBit("width") | cssAnimationPropertyBit("height"))) != 0)
+                                markLayoutForNodeFn(node)
+                            else
+                                markPaintForNodeFn(node);
+                        }
                     }
 
                     // Finally, recursively process all children with this element's computed style

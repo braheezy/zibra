@@ -106,16 +106,15 @@ pub fn resolveElement(
     // distinction here so layout/hit testing share the same clip decision.
     result.clips_overflow = std.ascii.eqlIgnoreCase(overflow, "hidden") or
         std.ascii.eqlIgnoreCase(overflow, "clip") or
-        (std.ascii.eqlIgnoreCase(overflow, "scroll") and value.scroll_container);
+        ((std.ascii.eqlIgnoreCase(overflow, "scroll") or std.ascii.eqlIgnoreCase(overflow, "auto")) and value.scroll_container);
 
     var animated_translation: ?dom.Translation = null;
     if (value.animations) |animations| {
         if (animations.get("transform")) |animation| {
-            const css_track_will_continue = if (value.css_animation) |state|
-                !state.finished and state.contains("transform")
+            result.transform_animation_active = if (value.css_animation) |state|
+                if (state.contains("transform")) state.isRunning() else !animation.isComplete()
             else
-                false;
-            result.transform_animation_active = !animation.isComplete() or css_track_will_continue;
+                !animation.isComplete();
             animated_translation = switch (animation) {
                 .transform => |track| track.getValue(),
                 .numeric, .pixel, .color => null,
@@ -289,16 +288,17 @@ pub fn wrapScrolledSuffix(
     allocator: std.mem.Allocator,
     commands: *std.ArrayList(DisplayItem),
     content_start: usize,
+    scroll_x: i32,
     scroll_y: i32,
     identity: ?*anyopaque,
     source: ?display_list.DisplayItemSource,
 ) std.mem.Allocator.Error!void {
-    if (scroll_y <= 0 or content_start >= commands.items.len) return;
+    if ((scroll_x <= 0 and scroll_y <= 0) or content_start >= commands.items.len) return;
     const children = try allocator.alloc(DisplayItem, commands.items.len - content_start);
     @memcpy(children, commands.items[content_start..]);
     commands.shrinkRetainingCapacity(content_start);
     commands.appendAssumeCapacity(.{ .transform = .{
-        .translate_x = 0,
+        .translate_x = -scroll_x,
         .translate_y = -scroll_y,
         .children = children,
         .node = identity,
@@ -501,7 +501,7 @@ test "scroll wrapping leaves the background stationary" {
         .y2 = 10,
         .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
     } });
-    try wrapScrolledSuffix(std.testing.allocator, &commands, 1, 12, null, null);
+    try wrapScrolledSuffix(std.testing.allocator, &commands, 1, 0, 12, null, null);
     try std.testing.expect(commands.items[0] == .rect);
     try std.testing.expect(commands.items[1] == .transform);
     try std.testing.expectEqual(@as(i32, -12), commands.items[1].transform.translate_y);

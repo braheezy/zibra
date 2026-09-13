@@ -13,8 +13,9 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
 
 ## Ownership rules
 
-- Parser-created text, lowercase names, undecoded attributes, CSS names, and
-  property values generally borrow document or stylesheet buffers. A Frame's
+- Parser-created text, lowercase HTML names and undecoded attributes generally
+  borrow document buffers. Compiled CSS declarations own their names and values.
+  A Frame's
   `html_source.Store` owns initial and parser-inserted HTML chunks through DOM
   retirement; never resize a chunk once a Node borrows it. Element
   decoded strings, images, canvas pointers, animations, and detached subtree
@@ -74,16 +75,34 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
 - Detached retained subtrees keep style maps but dirty every field and clear
   layout back-pointers. Reattachment registers inherited dependencies against
   the new parent.
-- Attribute/inline-style changes that affect relational selectors dirty the
-  changed Element and ancestors before the next style pass.
+- Attribute/inline-style and dynamic-state changes use the styled tree root
+  relationship summary to invalidate affected selector dependents. Preserve
+  this scalar policy across a style pass; see the architecture contract.
 
 ## CSS rules
 
+- `css_math.zig` evaluates bounded typed calculations with explicit unit and
+  percentage contexts. Lengths and colors share it; layout-dependent units
+  must not be guessed during declaration admission.
+- `css_nesting.zig` lowers nested selectors into bounded owned temporary
+  source. The shared selector compiler owns the resulting AST. Preserve parent
+  list specificity and declaration/rule source order during lowering.
+- `css_animation.zig` owns animation grammar and pure timeline phases;
+  `animation.zig` stores scalar templates and samples. Inactive delays and
+  completed fills must not overwrite the underlying computed style.
+- `css_supports.zig` shares declaration grammar with CSSOM and stylesheets.
+  Keep `CSS.supports` and `@supports` on that evaluator; selector queries use
+  strict recursive admission even where ordinary logical lists are forgiving.
+  Queries retain no source or DOM state. Allocation failure must abort staged
+  stylesheet publication, not become an unsupported feature under `not`.
 - Stylesheet selector lists are unforgiving and expand into independent rule
-  owners; retain each member's specificity and source order. Do not shallow-copy
-  declaration maps when sharing borrowed value strings.
-- Declaration values borrow the parsed source. Preserve quotes, escapes,
-  comments, and parenthesis depth while scanning; stop only at top-level
+  owners. Keep rules in source order; `css_cascade.zig` compares independent
+  precedence keys during styling. Do not sort by specificity or shallow-copy
+  owning declaration maps. Logical-list and matching contracts live in the
+  [document architecture](../../docs/architecture/document-and-rendering.md).
+- Compiled declaration maps own normalized names/values and must be deep-cloned.
+  Structural ranges and keyframe names still borrow source. Preserve quotes, escapes,
+  comments, and typed block/function depth while scanning; stop only at top-level
   separators.
 - Shorthand expansion happens in source order and preserves declaration-local
   `!important`. Add precedence tests in both shorthand/longhand directions.
@@ -120,6 +139,12 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   only after cascade and owned by the Element.
 - `background_image.zig`, `object_fit.zig`, `length.zig`, `easing.zig`, and
   related helpers stay pure of Browser/network/native state.
+- `css_position.zig` shares single-layer axis grammar and serialization with
+  background paint. Resolve using the caller's font, zoom and actual image
+  dimensions; image position percentages may have a negative basis.
+- `color.zig` shares named sRGB values and currentcolor resolution between
+  native paint and resolved CSSOM readback. Keep background/border currentcolor
+  symbolic through inheritance; the color property depends on its parent.
 
 ## Parser structure
 
@@ -158,12 +183,17 @@ The document pipeline is split by ownership and algorithm boundaries:
 - `html_serialization.zig` is a generic leaf that traverses the live DOM,
   escapes attributes, and applies void-element rules without owning nodes or
   source buffers.
-- `css_syntax.zig` is a pure source-buffer scanner for CSS comments, escapes,
-  strings, and structural delimiters; `css_properties.zig` is the shared
-  static registry of computed longhand names and defaults.
+- `css_syntax.zig` is a pure bounded scanner for CSS comments, escapes,
+  strings, URLs and balanced component delimiters. `css_rule_syntax.zig` owns
+  borrowed rule/declaration ranges and recovery; it has no DOM/property/media
+  dependencies. Keep unknown at-rule and EOF handling here, not in new semantic
+  handlers. `css_properties.zig` is the static computed-longhand registry.
 - `css_declarations.zig` owns property validation, shorthand expansion and
-  declaration precedence. Keep one property grammar shared by stylesheet and
-  inline-style parsing.
+  declaration precedence. Its sink interface serves both stylesheet maps and
+  `css_declaration_block.zig`, the independently owned ordered inline block.
+  Stage CSSOM edits before Element publication; preserve pending substitutions
+  through cloning instead of reparsing serialized text. Raw style writes must
+  use attribute map mutation APIs so their revision invalidates the block.
 - `css_stylesheet.zig` owns inspection's source and provenance snapshots.
   Selections use the native parser and borrow those snapshots. Retire selected
   rules/keyframes before replacing their source; this is not live CSSOM identity.
@@ -173,11 +203,14 @@ The document pipeline is split by ownership and algorithm boundaries:
 - `presentational_hints.zig` translates supported HTML presentation attributes
   into temporary low-priority author declarations. Intern winners before its
   arena ends; keep stylesheet cascade origin separate from source ownership.
-- `css_value_tokens.zig` scans borrowed value tokens and rewrites rem
-  dimensions without touching strings/URLs. `custom_properties.zig` owns
+- `css_tokenizer.zig` owns allocation-free CSS tokenization and source decoding.
+  `css_values.zig` validates/normalizes component values into caller storage;
+  `css_value_tokens.zig` rewrites rem dimensions without touching strings/URLs. `custom_properties.zig` owns
   immutable computed variable environments and bounded substitution/cycle
   resolution. `css_flex.zig` and `grid_tracks.zig` own the supported sizing
   grammar; they do not traverse DOM or register dependencies.
+- `css_cascade.zig` owns scalar precedence keys; `css_anb.zig` owns shared
+  token-based nth-formula admission and matching. Neither owns DOM data.
 - `pseudo.zig` owns the shared before/after identity used by DOM storage,
   selector matching, and style application; it owns neither Nodes nor styles.
 - `animation.zig` owns pure CSS transition/keyframe value objects stored by
@@ -213,7 +246,10 @@ from the DOM/style invariants they maintain.
 
 ## Verification
 
-Run `zig build test-document` while iterating. Run `zig build test-pipeline`
+Run `zig build test-css-values` for isolated tokenization/normalization,
+`zig build test-css-syntax` for isolated structural parsing and
+`zig build test-css-declarations` for ordered blocks/property grammar, then
+`zig build test-document` for semantic and ownership changes. Run `zig build test-pipeline`
 for exact style/layout/display output and `zig build test-dump-dom` for parser
 serialization. Before handoff run `zig build verify`; use native macOS
 screenshots only for final pixel behavior. Add/update a primary fixture in the

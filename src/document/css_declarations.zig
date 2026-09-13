@@ -1,22 +1,24 @@
 //! Shared declaration validation, shorthand expansion, and block precedence.
-//! Syntax frontends supply names, values and priority; this module owns only
-//! map storage, while strings remain static or borrowed from the caller.
+//! Emits values owned by each sink's value allocator. Stylesheets and
+//! inline CSSOM share the same property grammar and priority interpretation.
 
 const std = @import("std");
 const css_length = @import("length.zig");
 const css_color = @import("color.zig");
 const background_image = @import("background_image.zig");
 const css_syntax = @import("css_syntax.zig");
+const rule_syntax = @import("css_rule_syntax.zig");
 const css_properties = @import("css_properties.zig");
 const value_tokens = @import("css_value_tokens.zig");
+const css_values = @import("css_values.zig");
 const custom_properties = @import("custom_properties.zig");
 const css_flex = @import("css_flex.zig");
 const grid_tracks = @import("grid_tracks.zig");
 
-pub const IMPORTANT_PRIORITY: u32 = 10_000;
+const cascade = @import("css_cascade.zig");
 
-/// One parsed property value. The value borrows the stylesheet or inline-style
-/// buffer; `important` is declaration-local cascade metadata.
+/// One parsed property value borrowing its compiled declaration owner.
+/// `important` is declaration-local cascade metadata.
 pub const Declaration = struct {
     value: []const u8,
     important: bool = false,
@@ -24,16 +26,65 @@ pub const Declaration = struct {
     /// but cannot be expanded until the winning custom environment is known.
     pending_shorthand: ?[]const u8 = null,
 
-    pub fn priority(self: Declaration, base_priority: u32) u32 {
-        return base_priority + if (self.important) IMPORTANT_PRIORITY else 0;
+    pub fn key(self: Declaration, context: cascade.Context) cascade.Key {
+        return cascade.Key.from(context, self.important);
     }
 };
 
-/// Owns the hash table only. Keys/values borrow the caller's source or
-/// normalized-string owner; static shorthand names/defaults need no storage.
-pub const Map = std.StringHashMap(Declaration);
+/// Movable owner for compiled declarations and normalized strings. No stored
+/// allocator points at the movable arena. Clone deeply before sharing rules.
+pub const Map = struct {
+    const Table = std.StringHashMap(Declaration);
+    table: Table,
+    arena: std.heap.ArenaAllocator,
 
-/// Remove CSS whitespace and complete comments from the ends of one borrowed
+    pub fn init(allocator: std.mem.Allocator) Map {
+        return .{ .table = Table.init(allocator), .arena = std.heap.ArenaAllocator.init(allocator) };
+    }
+    pub fn deinit(self: *Map) void {
+        self.table.deinit();
+        self.arena.deinit();
+    }
+    pub fn valueAllocator(self: *Map) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+    pub fn get(self: Map, name: []const u8) ?Declaration {
+        return self.table.get(name);
+    }
+    pub fn contains(self: Map, name: []const u8) bool {
+        return self.table.contains(name);
+    }
+    pub fn count(self: Map) u32 {
+        return self.table.count();
+    }
+    pub fn iterator(self: *const Map) Table.Iterator {
+        return self.table.iterator();
+    }
+    pub fn remove(self: *Map, name: []const u8) bool {
+        return self.table.remove(name);
+    }
+    /// Sink strings must already belong to this map's value allocator or static storage.
+    pub fn put(self: *Map, name: []const u8, value: Declaration) !void {
+        try self.table.put(name, value);
+    }
+    pub fn clone(self: *const Map) !Map {
+        return self.cloneWithAllocator(self.table.allocator);
+    }
+    pub fn cloneWithAllocator(self: *const Map, allocator: std.mem.Allocator) !Map {
+        var result = Map.init(allocator);
+        errdefer result.deinit();
+        const arena = result.valueAllocator();
+        var it = self.iterator();
+        while (it.next()) |entry| try result.put(try arena.dupe(u8, entry.key_ptr.*), .{
+            .value = try arena.dupe(u8, entry.value_ptr.value),
+            .important = entry.value_ptr.important,
+            .pending_shorthand = if (entry.value_ptr.pending_shorthand) |name| try arena.dupe(u8, name) else null,
+        });
+        return result;
+    }
+};
+
+/// Remove CSS whitespace and comments (including EOF comments) from a borrowed
 /// value. Interior comments remain in source storage, but the common trailing
 /// declaration-comment form becomes the exact authored token slice.
 pub fn trimValueTrivia(input: []const u8) []const u8 {
@@ -41,12 +92,7 @@ pub fn trimValueTrivia(input: []const u8) []const u8 {
     var end: usize = 0;
     var tokens = value_tokens.Iterator{ .input = input };
     while (tokens.next()) |token| {
-        const raw = input[token.start..token.end];
-        if (raw.len == 1 and css_syntax.isWhitespace(raw[0])) continue;
-        // Scan comments forward as whole tokens: a second /* inside one
-        // comment does not start a nested comment. Strings, URLs and escaped
-        // whitespace remain atomic and cannot masquerade as edge trivia.
-        if (raw.len >= 4 and std.mem.startsWith(u8, raw, "/*") and std.mem.endsWith(u8, raw, "*/")) continue;
+        if (token.isTrivia()) continue;
         if (start == null) start = token.start;
         end = token.end;
     }
@@ -206,32 +252,37 @@ fn parseFontShorthand(declaration_value: []const u8) ?FontShorthand {
     return null;
 }
 
-fn parseDeclarationValue(raw_value: []const u8) ?Declaration {
-    const bang = std.mem.lastIndexOfScalar(u8, raw_value, '!') orelse {
-        return .{ .value = raw_value };
-    };
-    const suffix = std.mem.trim(u8, raw_value[bang + 1 ..], " \t\r\n");
-    if (!std.ascii.eqlIgnoreCase(suffix, "important")) {
-        return .{ .value = raw_value };
-    }
-
-    const value_without_priority = std.mem.trimEnd(u8, raw_value[0..bang], " \t\r\n");
-    if (value_without_priority.len == 0) return null;
-    return .{ .value = value_without_priority, .important = true };
+/// Parse declaration-local priority using component boundaries. A top-level
+/// bang is only valid as the final !important suffix; nested/string/URL bangs
+/// remain value data. Returned strings borrow input, including empty custom values.
+pub fn parseDeclarationValue(raw_value: []const u8) ?Declaration {
+    const end = css_syntax.scanToTopLevel(raw_value, 0, "!;})]");
+    if (end.exhausted) return null;
+    if (end.delimiter == null) return .{ .value = trimValueTrivia(raw_value) };
+    if (end.delimiter != '!') return null;
+    var cursor = end.end + 1;
+    css_syntax.skipWhitespaceAndComments(raw_value, &cursor);
+    const name = css_syntax.consumeIdentifier(raw_value, &cursor) orelse return null;
+    if (!css_syntax.identifierEquals(name, "important")) return null;
+    css_syntax.skipWhitespaceAndComments(raw_value, &cursor);
+    if (cursor != raw_value.len) return null;
+    return .{ .value = trimValueTrivia(raw_value[0..end.end]), .important = true };
 }
 
-/// Return the canonical static property spelling for a supported CSS name.
-/// CSS property identifiers are ASCII-case-insensitive and may contain CSS
-/// escapes, but unsupported names intentionally have no effect in Zibra.
-fn canonicalPropertyName(raw_property: []const u8) ?[]const u8 {
-    if (custom_properties.isName(raw_property)) return raw_property;
-    for (css_properties.computed) |property| {
-        if (css_syntax.identifierEquals(raw_property, property.name)) return property.name;
+/// A CSSOM setter takes one value and a separate priority, never a declaration
+/// list or embedded !important. Property grammar is checked by putParsed.
+pub fn validSetterValue(value: []const u8) bool {
+    const end = css_syntax.scanToTopLevel(value, 0, "!;})]");
+    return !end.exhausted and end.delimiter == null;
+}
+
+/// Compile structural declarations into a sink exposing get/put/valueAllocator.
+/// Both native cascade maps and ordered CSSOM blocks use this grammar. On OOM
+/// discard the staged sink; a shorthand may have emitted only some longhands.
+pub fn parseInto(sink: anytype, declarations: *rule_syntax.DeclarationIterator) !void {
+    while (declarations.next()) |declaration| {
+        try putRaw(sink, declaration.name.slice(declarations.input), declaration.value.slice(declarations.input));
     }
-    for (css_properties.shorthands) |candidate| {
-        if (css_syntax.identifierEquals(raw_property, candidate.name)) return candidate.name;
-    }
-    return null;
 }
 
 fn isCssWideKeyword(raw_value: []const u8) bool {
@@ -321,11 +372,7 @@ fn isBorderColor(raw_value: []const u8) bool {
 }
 
 fn validBackgroundPosition(raw_value: []const u8) bool {
-    var tokens: [4][]const u8 = undefined;
-    const count = splitValueTokens(raw_value, &tokens) orelse return false;
-    if (count > 2) return false;
-    for (tokens[0..count]) |token| if (!isBackgroundPosition(token)) return false;
-    return true;
+    return @import("css_position.zig").parse(raw_value) != null;
 }
 
 /// Accept the bounded generated-content grammar supported by this browser.
@@ -355,6 +402,31 @@ fn isQuotedContentString(raw_value: []const u8) bool {
 /// until a focused feature owns their used-value grammar.
 pub fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     if (isCssWideKeyword(raw_value)) return true;
+    // These values select real formatting/paint behavior. Rejecting arbitrary
+    // tokens here keeps declarations, CSSOM edits and feature queries aligned.
+    if (std.mem.eql(u8, property, "display")) return keywordIn(raw_value, &.{
+        "none",  "inline",          "block",              "inline-block",       "flex",      "grid",       "list-item",
+        "table", "table-row-group", "table-header-group", "table-footer-group", "table-row", "table-cell",
+    });
+    if (std.mem.eql(u8, property, "position")) return keywordIn(raw_value, &.{ "static", "relative", "absolute", "fixed", "sticky" });
+    if (std.mem.eql(u8, property, "float")) return keywordIn(raw_value, &.{ "none", "left", "right" });
+    if (std.mem.eql(u8, property, "clear")) return keywordIn(raw_value, &.{ "none", "left", "right", "both" });
+    if (std.mem.eql(u8, property, "overflow")) return keywordIn(raw_value, &.{ "visible", "hidden", "scroll", "auto" });
+    if (std.mem.eql(u8, property, "visibility")) return keywordIn(raw_value, &.{ "visible", "hidden" });
+    // The UA stylesheet uses legacy HTML alignment values to position block
+    // children too; ordinary CSS text-align only positions inline content.
+    if (std.mem.eql(u8, property, "text-align")) return keywordIn(raw_value, &.{ "start", "end", "left", "right", "center", "-zibra-left", "-zibra-right", "-zibra-center" });
+    if (std.mem.eql(u8, property, "font-weight")) return isFontWeight(raw_value);
+    if (std.mem.eql(u8, property, "font-style")) return keywordIn(raw_value, &.{ "normal", "italic", "oblique" });
+    if (std.mem.eql(u8, property, "font-variant")) return keywordIn(raw_value, &.{ "normal", "small-caps" });
+    if (std.mem.eql(u8, property, "font-stretch")) return isFontStretch(raw_value);
+    if (std.mem.eql(u8, property, "object-fit")) return @import("object_fit.zig").parse(raw_value) != null;
+    if (std.mem.eql(u8, property, "border-radius")) return isNonnegativeLength(raw_value);
+    if (std.mem.eql(u8, property, "opacity")) {
+        const number = std.fmt.parseFloat(f64, raw_value) catch return false;
+        return std.math.isFinite(number);
+    }
+    if (std.mem.startsWith(u8, property, "animation-")) return @import("css_animation.zig").validLonghand(property, raw_value);
     if (std.mem.eql(u8, property, "flex-grow") or std.mem.eql(u8, property, "flex-shrink")) return css_flex.factor(raw_value) != null;
     if (std.mem.eql(u8, property, "flex-basis")) return css_flex.basis(raw_value);
     if (std.mem.eql(u8, property, "order")) {
@@ -445,13 +517,16 @@ fn keywordIn(value_text: []const u8, choices: []const []const u8) bool {
     return false;
 }
 
-fn putLonghand(map: *Map, property: []const u8, declaration: Declaration) !void {
+fn putLonghand(map: anytype, property: []const u8, declaration: Declaration) !void {
     if (map.get(property)) |existing| {
         // Within one declaration block, an earlier important longhand cannot
         // be reset by a later normal longhand or shorthand expansion.
         if (existing.important and !declaration.important) return;
     }
-    try map.put(property, declaration);
+    var normalized = declaration;
+    if (declaration.pending_shorthand == null and !custom_properties.isName(property))
+        normalized.value = try css_values.primitive(map.valueAllocator(), property, declaration.value);
+    try map.put(property, normalized);
 }
 
 const BoxSide = enum { top, right, bottom, left };
@@ -477,7 +552,7 @@ fn splitShorthand(raw_value: []const u8, tokens: *[4][]const u8) ?usize {
 }
 
 fn expandBoxShorthand(
-    map: *Map,
+    map: anytype,
     prefix: []const u8,
     raw_value: []const u8,
     declaration: Declaration,
@@ -551,7 +626,7 @@ fn borderSideProperty(kind: []const u8, side: BoxSide) []const u8 {
 }
 
 fn expandBorderWidthOrStyle(
-    map: *Map,
+    map: anytype,
     kind: []const u8,
     raw_value: []const u8,
     declaration: Declaration,
@@ -581,7 +656,7 @@ fn expandBorderWidthOrStyle(
 }
 
 fn expandBorderColor(
-    map: *Map,
+    map: anytype,
     raw_value: []const u8,
     declaration: Declaration,
 ) !bool {
@@ -605,7 +680,7 @@ fn expandBorderColor(
 }
 
 fn expandBorder(
-    map: *Map,
+    map: anytype,
     property: []const u8,
     raw_value: []const u8,
     declaration: Declaration,
@@ -638,11 +713,11 @@ fn expandBorder(
     else
         .left;
     const sides = [_]BoxSide{ .top, .right, .bottom, .left };
-    for (sides) |candidate| {
-        if (side) |selected| if (candidate != selected) continue;
-        try putLonghand(map, borderSideProperty("width", candidate), .{ .value = width, .important = declaration.important });
-        try putLonghand(map, borderSideProperty("style", candidate), .{ .value = style, .important = declaration.important });
-        try putLonghand(map, borderSideProperty("color", candidate), .{ .value = color, .important = declaration.important });
+    for ([_][]const u8{ "width", "style", "color" }, [_][]const u8{ width, style, color }) |kind, value| {
+        for (sides) |candidate| {
+            if (side) |selected| if (candidate != selected) continue;
+            try putLonghand(map, borderSideProperty(kind, candidate), .{ .value = value, .important = declaration.important });
+        }
     }
     return true;
 }
@@ -660,37 +735,15 @@ const BackgroundTokenIterator = struct {
         }
 
         const start = self.pos;
-        var depth: usize = 0;
-        var quote: ?u8 = null;
-        var escaped = false;
-        while (self.pos < self.input.len) {
-            const char = self.input[self.pos];
-            if (quote) |delimiter| {
-                if (escaped) {
-                    escaped = false;
-                } else if (char == '\\') {
-                    escaped = true;
-                } else if (char == delimiter) {
-                    quote = null;
-                }
-            } else if (char == '/' and self.pos + 1 < self.input.len and self.input[self.pos + 1] == '*') {
-                if (depth == 0) break;
-                _ = css_syntax.consumeComment(self.input, &self.pos);
-                continue;
-            } else if (char == '\\') {
-                if (!css_syntax.consumeEscape(self.input, &self.pos)) self.pos += 1;
-                continue;
-            } else switch (char) {
-                '\'', '"' => quote = char,
-                '(' => depth += 1,
-                ')' => if (depth > 0) {
-                    depth -= 1;
-                },
-                '/' => if (depth == 0) break,
-                else => if (depth == 0 and std.ascii.isWhitespace(char)) break,
+        var iterator = value_tokens.Iterator{ .input = self.input, .cursor = start };
+        while (iterator.next()) |token| {
+            if (token.isTrivia() or (token.kind == .delim and token.delim == '/')) {
+                self.pos = token.start;
+                return self.input[start..self.pos];
             }
-            self.pos += 1;
+            if (token.kind == .function) iterator.cursor = if (value_tokens.closeFunction(self.input, token.end)) |close| close + 1 else self.input.len;
         }
+        self.pos = self.input.len;
         return self.input[start..self.pos];
     }
 };
@@ -709,23 +762,19 @@ fn isBackgroundAttachment(token: []const u8) bool {
 }
 
 fn isBackgroundPosition(token: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(token, "left") or
-        std.ascii.eqlIgnoreCase(token, "center") or
-        std.ascii.eqlIgnoreCase(token, "right") or
-        std.ascii.eqlIgnoreCase(token, "top") or
-        std.ascii.eqlIgnoreCase(token, "bottom") or
-        std.mem.eql(u8, token, "0"))
-    {
-        return true;
-    }
-    return css_length.parse(token) != null;
+    return @import("css_position.zig").parse(token) != null;
+}
+
+fn componentSpan(input: []const u8, first: []const u8, last: []const u8) []const u8 {
+    const start = @intFromPtr(first.ptr) - @intFromPtr(input.ptr);
+    const end = @intFromPtr(last.ptr) - @intFromPtr(input.ptr) + last.len;
+    return input[start..end];
 }
 
 /// Expand the single-layer subset that the renderer can consume. Every value
-/// retains a borrowed slice of the declaration source, matching other parsed
-/// declarations; omitted components reset to their CSS initial values.
+/// retains a slice of the sink-owned normalized value; omitted components reset to their CSS initial values.
 fn expandBackground(
-    map: *Map,
+    map: anytype,
     raw_value: []const u8,
     declaration: Declaration,
 ) !bool {
@@ -734,29 +783,25 @@ fn expandBackground(
     var size: []const u8 = "auto";
     var repeat: []const u8 = "repeat";
     var attachment: []const u8 = "scroll";
-    var position: []const u8 = "0 0";
+    var position: []const u8 = "0% 0%";
+    var components: [12][]const u8 = undefined;
+    var count: usize = 0;
     var iterator = BackgroundTokenIterator{ .input = raw_value };
-    var after_slash = false;
-    var size_start: ?usize = null;
+    while (iterator.next()) |token| {
+        if (count == components.len) return false;
+        components[count] = token;
+        count += 1;
+    }
+    if (count == 0) return false;
     var saw_color = false;
     var saw_image = false;
     var saw_repeat = false;
     var saw_attachment = false;
-    var position_count: usize = 0;
-    var position_start: ?usize = null;
-    var position_end: usize = 0;
-
-    while (iterator.next()) |token| {
-        if (std.mem.eql(u8, token, "/")) {
-            if (after_slash) return false;
-            after_slash = true;
-            continue;
-        }
-        if (after_slash) {
-            if (size_start == null) size_start = @intFromPtr(token.ptr) - @intFromPtr(raw_value.ptr);
-            continue;
-        }
-        if (css_color.parse(token) != null) {
+    var saw_position = false;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const token = components[i];
+        if (isBorderColor(token)) {
             if (saw_color) return false;
             saw_color = true;
             color = token;
@@ -773,22 +818,25 @@ fn expandBackground(
             saw_attachment = true;
             attachment = token;
         } else if (isBackgroundPosition(token)) {
-            if (position_count == 2) return false;
-            position_count += 1;
-            const token_start = @intFromPtr(token.ptr) - @intFromPtr(raw_value.ptr);
-            if (position_start == null) position_start = token_start;
-            position_end = token_start + token.len;
+            if (saw_position) return false;
+            saw_position = true;
+            const start = i;
+            while (i + 1 < count and isBackgroundPosition(components[i + 1])) i += 1;
+            position = componentSpan(raw_value, components[start], components[i]);
+            if (!validBackgroundPosition(position)) return false;
+            if (i + 1 < count and std.mem.eql(u8, components[i + 1], "/")) {
+                i += 2;
+                if (i == count or background_image.parseSize(components[i]) == null) return false;
+                size = components[i];
+                if (i + 1 < count) {
+                    const pair = componentSpan(raw_value, components[i], components[i + 1]);
+                    if (background_image.parseSize(pair) != null) {
+                        size = pair;
+                        i += 1;
+                    }
+                }
+            }
         } else return false;
-    }
-
-    if (position_start) |start| position = raw_value[start..position_end];
-
-    if (size_start) |start| {
-        const candidate = std.mem.trim(u8, raw_value[start..], " \t\r\n");
-        if (background_image.parseSize(candidate) == null) return false;
-        size = candidate;
-    } else if (after_slash) {
-        return false;
     }
 
     try putLonghand(map, "background-color", .{ .value = color, .important = declaration.important });
@@ -800,28 +848,33 @@ fn expandBackground(
     return true;
 }
 
-/// Apply one source-spelled declaration using the legacy priority suffix
-/// scanner. Unsupported/invalid values have no effect. Keys and values borrow
-/// caller storage or static strings; allocation failure may leave partial
-/// shorthand entries, so transactional callers must discard the staged map.
-pub fn putRaw(map: *Map, raw_property: []const u8, raw_value: []const u8) !void {
-    const property = canonicalPropertyName(raw_property) orelse return;
-    const declaration = parseDeclarationValue(raw_value) orelse return;
+/// Trim edge trivia and apply one source-spelled declaration, including its
+/// priority suffix. Strings are normalized into the sink's own value storage.
+/// Invalid values have no effect. On allocation failure discard the staged sink;
+/// a shorthand may already have emitted some longhands.
+pub fn putRaw(map: anytype, raw_property: []const u8, raw_value: []const u8) !void {
+    var names = value_tokens.Iterator{ .input = raw_property };
+    const name = names.next() orelse return;
+    if (name.kind != .ident or name.end != raw_property.len) return;
+    const decoded = try css_values.tokenizer.decode(map.valueAllocator(), raw_property, false);
+    const property = canonicalDecodedPropertyName(decoded) orelse return;
+    const declaration = parseDeclarationValue(trimValueTrivia(raw_value)) orelse return;
     try putCanonical(map, property, declaration);
 }
 
 /// Apply a syntax frontend's decoded property and value with explicit priority.
 /// `value` must exclude the frontend's priority suffix; this function never
-/// scans for `!important`. Decoded custom names must fit Zibra's current var()
-/// identifier subset. Strings borrow caller storage or static entries through
-/// map retirement. Unsupported/invalid values have no effect; allocation
-/// failure may leave a partially expanded shorthand in the staged map.
-pub fn putParsed(map: *Map, decoded_property: []const u8, value: []const u8, important: bool) !void {
+/// scans for `!important`. Custom names are decoded, case-sensitive code points.
+/// Strings are normalized into the sink's value storage. Invalid values have no
+/// effect; allocation failure requires discarding the staged sink.
+pub fn putParsed(map: anytype, decoded_property: []const u8, value: []const u8, important: bool) !void {
     const property = canonicalDecodedPropertyName(decoded_property) orelse return;
     try putCanonical(map, property, .{ .value = trimValueTrivia(value), .important = important });
 }
 
-fn canonicalDecodedPropertyName(decoded_property: []const u8) ?[]const u8 {
+/// CSSOM names are literal strings, with ASCII folding for supported standard
+/// names. Custom names remain case-sensitive borrows of the caller's input.
+pub fn canonicalDecodedPropertyName(decoded_property: []const u8) ?[]const u8 {
     if (custom_properties.isName(decoded_property)) return decoded_property;
     for (css_properties.computed) |property| {
         if (std.ascii.eqlIgnoreCase(decoded_property, property.name)) return property.name;
@@ -832,12 +885,25 @@ fn canonicalDecodedPropertyName(decoded_property: []const u8) ?[]const u8 {
     return null;
 }
 
-fn putCanonical(map: *Map, property: []const u8, declaration: Declaration) !void {
+fn putCanonical(map: anytype, property: []const u8, raw_declaration: Declaration) !void {
+    const is_custom = custom_properties.isName(property);
+    const pending = value_tokens.hasVariable(raw_declaration.value);
+    if (!pending and (std.mem.eql(u8, property, "z-index") or std.mem.eql(u8, property, "order"))) {
+        var iterator = value_tokens.Iterator{ .input = raw_declaration.value };
+        while (iterator.next()) |token| if (token.kind == .number and token.number_type != .integer) {
+            return;
+        };
+    }
+    const normalized = (try css_values.normalize(map.valueAllocator(), raw_declaration.value, .{
+        .preserve = is_custom or pending,
+        .fold_identifiers = !std.mem.eql(u8, property, "font-family") and !std.mem.eql(u8, property, "font") and
+            !std.mem.startsWith(u8, property, "animation") and !std.mem.eql(u8, property, "content"),
+    })) orelse return;
+    const declaration = Declaration{ .value = normalized, .important = raw_declaration.important };
     if (custom_properties.isName(property)) {
-        try putLonghand(map, property, declaration);
+        try putLonghand(map, try map.valueAllocator().dupe(u8, property), declaration);
         return;
     }
-    const pending = value_tokens.hasVariable(declaration.value);
     if (pending or isCssWideKeyword(declaration.value)) {
         for (css_properties.shorthands) |shorthand| {
             if (!std.mem.eql(u8, property, shorthand.name)) continue;
@@ -854,6 +920,12 @@ fn putCanonical(map: *Map, property: []const u8, declaration: Declaration) !void
             try putLonghand(map, property, declaration);
             return;
         }
+    }
+    if (std.mem.eql(u8, property, "animation")) {
+        const animations = @import("css_animation.zig");
+        const spec = animations.parse(declaration.value) orelse return;
+        for (animations.names, spec.values) |name, value| try putLonghand(map, name, .{ .value = value, .important = declaration.important });
+        return;
     }
     if (std.mem.eql(u8, property, "flex")) {
         const flex = css_flex.parse(declaration.value) orelse return;
@@ -999,7 +1071,7 @@ test "parsed declarations use explicit priority without interpreting retained ba
     try std.testing.expectEqualStrings("", map.get("--empty").?.value);
     try std.testing.expect(map.get("--empty").?.important);
     try putParsed(&map, "CONTENT", "'!important'", true);
-    try std.testing.expectEqualStrings("'!important'", map.get("content").?.value);
+    try std.testing.expectEqualStrings("\"!important\"", map.get("content").?.value);
     try std.testing.expect(map.get("content").?.important);
     try putParsed(&map, "color", "red !important", false);
     try std.testing.expect(!map.contains("color"));

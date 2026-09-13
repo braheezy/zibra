@@ -13,6 +13,7 @@ const canvas_module = @import("canvas.zig");
 const animation_module = @import("animation.zig");
 const html_serialization = @import("html_serialization.zig");
 const style_application = @import("style_application.zig");
+const DeclarationBlock = @import("css_declaration_block.zig");
 const pseudo = @import("pseudo.zig");
 
 pub const CssColor = animation_module.CssColor;
@@ -229,12 +230,30 @@ pub const Text = struct {
     }
 };
 
+/// Conservative selector relationships installed on the styled tree root.
+/// Scalars belong to that rule generation and retain no selectors or Nodes.
+pub const SelectorDependencies = packed struct {
+    descendants: bool = false,
+    siblings: bool = false,
+    has: bool = false,
+
+    pub fn merge(self: SelectorDependencies, other: SelectorDependencies) SelectorDependencies {
+        return .{ .descendants = self.descendants or other.descendants, .siblings = self.siblings or other.siblings, .has = self.has or other.has };
+    }
+};
+
 pub const Element = struct {
+    /// Only the styled tree root carries the aggregate rule dependencies.
+    selector_dependencies: SelectorDependencies = .{},
     tag: []const u8,
     /// Attribute-list order is observable through DOM views. Replacements
     /// keep their slot; removals must use orderedRemove, never swapRemove.
     /// Keys/values still borrow source or this Element's owned_strings.
     attributes: ?@import("attributes.zig").Map = null,
+    /// Independently owned specified declarations. Raw attribute edits are
+    /// detected by revision; a CSSOM commit retains the actual parsed block.
+    inline_declarations: ?*DeclarationBlock = null,
+    inline_style_revision: u64 = 0,
     style: ?StyleMap = null,
     custom_properties: ?*@import("custom_properties.zig").Environment = null,
     /// One stable publisher for the entire immutable variable environment.
@@ -294,9 +313,13 @@ pub const Element = struct {
     // It owns no URL or session storage.
     is_visited: bool = false,
     // Persistent element-local scroll state. Layout refreshes the geometry,
-    // while input changes only scroll_y and requests a repaint.
+    // while input changes only offsets and requests a repaint.
     scroll_container: bool = false,
+    scroll_interactive: bool = false,
+    scroll_x: i32 = 0,
     scroll_y: i32 = 0,
+    scroll_client_width: i32 = 0,
+    scroll_content_width: i32 = 0,
     scroll_client_height: i32 = 0,
     scroll_content_height: i32 = 0,
     // Classic script execution is terminal for this Element: true means the
@@ -417,6 +440,17 @@ pub const Element = struct {
         name: []const u8,
         value: []const u8,
     ) !void {
+        try self.putOwnedAttribute(allocator, name, value);
+    }
+
+    /// Copy a normalized name and value, staging both containers before commit.
+    /// Caller supplies HTML normalization/XML validation and mutation hooks.
+    pub fn putOwnedAttribute(
+        self: *Element,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        value: []const u8,
+    ) !void {
         const owned_name = try allocator.dupe(u8, name);
         errdefer allocator.free(owned_name);
         const owned_value = try allocator.dupe(u8, value);
@@ -431,6 +465,36 @@ pub const Element = struct {
         self.owned_strings.?.appendAssumeCapacity(owned_name);
         self.owned_strings.?.appendAssumeCapacity(owned_value);
         self.attributes.?.putAssumeCapacity(owned_name, owned_value);
+    }
+
+    /// Borrow the current native inline block through the synchronous style or
+    /// JS operation. Build a replacement before retiring the preceding owner.
+    pub fn inlineStyle(self: *Element, allocator: std.mem.Allocator) !?*const DeclarationBlock {
+        const source = if (self.attributes) |attrs| attrs.get("style") else null;
+        if (source == null) {
+            if (self.inline_declarations) |old| old.destroy();
+            self.inline_declarations = null;
+            return null;
+        }
+        const revision = self.attributes.?.style_revision;
+        if (self.inline_declarations != null and self.inline_style_revision == revision) return self.inline_declarations;
+        const replacement = try DeclarationBlock.create(allocator, source.?);
+        if (self.inline_declarations) |old| old.destroy();
+        self.inline_declarations = replacement;
+        self.inline_style_revision = revision;
+        return replacement;
+    }
+
+    /// Transfer a staged block only on success. Attribute text/storage is staged
+    /// first; after publication no fallible work remains. Caller dirties style
+    /// and requests rendering at the existing synchronous mutation boundary.
+    pub fn replaceInlineStyle(self: *Element, allocator: std.mem.Allocator, replacement: *DeclarationBlock) !void {
+        const source = try replacement.serialize(allocator);
+        defer allocator.free(source);
+        try self.putOwnedAttribute(allocator, "style", source);
+        if (self.inline_declarations) |old| old.destroy();
+        self.inline_declarations = replacement;
+        self.inline_style_revision = self.attributes.?.style_revision;
     }
 
     /// HTML element and attribute names are ASCII case-insensitive. Borrow an
@@ -520,6 +584,7 @@ pub const Element = struct {
     }
 
     pub fn deinit(self: *Element, allocator: std.mem.Allocator) void {
+        if (self.inline_declarations) |block| block.destroy();
         if (self.svg_image_source) |source| allocator.free(source);
         if (self.svg_animation) |*state| state.deinit();
         for (self.children.items) |*child| {
@@ -706,13 +771,18 @@ pub const Element = struct {
     ) void {
         if (!enabled) {
             self.scroll_container = false;
+            self.scroll_interactive = false;
+            self.scroll_x = 0;
             self.scroll_y = 0;
+            self.scroll_client_width = 0;
+            self.scroll_content_width = 0;
             self.scroll_client_height = 0;
             self.scroll_content_height = 0;
             return;
         }
 
         self.scroll_container = true;
+        self.scroll_interactive = true;
         self.scroll_client_height = @max(0, client_height);
         self.scroll_content_height = @max(0, content_height);
         self.scroll_y = @min(@max(0, self.scroll_y), self.maxScrollY());
@@ -723,10 +793,32 @@ pub const Element = struct {
         return self.scroll_content_height - self.scroll_client_height;
     }
 
+    pub fn setHorizontalScrollGeometry(self: *Element, client: i32, content: i32) void {
+        self.scroll_client_width = @max(0, client);
+        self.scroll_content_width = @max(self.scroll_client_width, content);
+        self.scroll_x = std.math.clamp(self.scroll_x, 0, self.maxScrollX());
+    }
+
+    pub fn maxScrollX(self: *const Element) i32 {
+        if (!self.scroll_container) return 0;
+        return @max(0, self.scroll_content_width -| self.scroll_client_width);
+    }
+
+    /// Move an LTR scroll box to clamped layout-pixel offsets. The caller
+    /// refreshes sticky descendants and requests paint on the document worker.
+    pub fn scrollTo(self: *Element, x: i32, y: i32) bool {
+        const next_x = std.math.clamp(x, 0, self.maxScrollX());
+        const next_y = std.math.clamp(y, 0, self.maxScrollY());
+        if (self.scroll_x == next_x and self.scroll_y == next_y) return false;
+        self.scroll_x = next_x;
+        self.scroll_y = next_y;
+        return true;
+    }
+
     /// Move within this element's current scroll range. Returns false at a
     /// boundary so keyboard input can bubble to an enclosing scroll box.
     pub fn scrollBy(self: *Element, delta: i32) bool {
-        if (!self.scroll_container or delta == 0) return false;
+        if (!self.scroll_container or !self.scroll_interactive or delta == 0) return false;
         const maximum = self.maxScrollY();
         const candidate = @as(i64, self.scroll_y) + @as(i64, delta);
         const next: i32 = @intCast(std.math.clamp(candidate, 0, @as(i64, maximum)));
@@ -1170,25 +1262,49 @@ pub fn markPaintForElement(element: *Element) void {
     if (element.parent) |parent| markPaintForNode(parent);
 }
 
+/// Invalidate selector-relevant state using the installed rule generation.
+/// Simple rules preserve clean sibling subtrees. Relational combinations may
+/// conservatively invalidate the full tree until per-selector dependencies exist.
 pub fn dirtyStyleForElement(e: *Element) void {
-    if (e.style) |*style_map| markStyleMapWithoutOwner(style_map);
-    if (e.generated_before) |generated| dirtyStyleSubtree(generated);
-    if (e.generated_after) |generated| dirtyStyleSubtree(generated);
-    markAncestorStyleSummaries(e.parent);
-
-    // Relational selectors make an element's attributes/style relevant to
-    // every ancestor. Conservatively dirty that chain; this remains O(depth)
-    // and avoids rescanning or restyling unrelated subtrees.
+    var tree_root = e;
     var ancestor = e.parent;
     while (ancestor) |node| {
-        switch (node.*) {
-            .text => break,
-            .element => |*element| {
-                if (element.style) |*style_map| markStyleMapWithoutOwner(style_map);
-                ancestor = element.parent;
-            },
-        }
+        if (node.* != .element) break;
+        tree_root = &node.element;
+        ancestor = tree_root.parent;
     }
+    const dependencies = tree_root.selector_dependencies;
+    if (dependencies.has and (dependencies.descendants or dependencies.siblings)) {
+        dirtyElementSubtree(tree_root);
+    } else if (dependencies.siblings and e.parent != null) {
+        dirtyStyleSubtree(e.parent.?);
+    } else if (dependencies.descendants) {
+        dirtyElementSubtree(e);
+    } else {
+        if (e.style) |*style_map| markStyleMapWithoutOwner(style_map);
+        if (e.generated_before) |generated| dirtyStyleSubtree(generated);
+        if (e.generated_after) |generated| dirtyStyleSubtree(generated);
+    }
+    markAncestorStyleSummaries(e.parent);
+
+    // A strict-descendant :has() can change each ancestor's own style even
+    // when no rule depends on relationships from that ancestor to other nodes.
+    ancestor = e.parent;
+    while (ancestor) |node| {
+        if (node.* != .element) break;
+        const element = &node.element;
+        if (element.style) |*style_map| markStyleMapWithoutOwner(style_map);
+        ancestor = element.parent;
+    }
+}
+
+fn dirtyElementSubtree(element: *Element) void {
+    if (element.style) |*style_map| markStyleMapWithoutOwner(style_map);
+    for (element.children.items) |*child| dirtyStyleSubtree(child);
+    if (element.generated_before) |generated| dirtyStyleSubtree(generated);
+    if (element.generated_after) |generated| dirtyStyleSubtree(generated);
+    element.has_dirty_style_descendants = element.children.items.len != 0 or
+        element.generated_before != null or element.generated_after != null;
 }
 
 /// Mark an entire retained subtree for recomputation after it is detached.
@@ -1199,14 +1315,7 @@ pub fn dirtyStyleSubtree(node: *Node) void {
         .text => |*text| {
             if (text.style) |*style_map| markStyleMapWithoutOwner(style_map);
         },
-        .element => |*element| {
-            if (element.style) |*style_map| markStyleMapWithoutOwner(style_map);
-            for (element.children.items) |*child| dirtyStyleSubtree(child);
-            if (element.generated_before) |generated| dirtyStyleSubtree(generated);
-            if (element.generated_after) |generated| dirtyStyleSubtree(generated);
-            element.has_dirty_style_descendants = element.children.items.len != 0 or
-                element.generated_before != null or element.generated_after != null;
-        },
+        .element => |*element| dirtyElementSubtree(element),
     }
 }
 
@@ -1403,4 +1512,26 @@ test "HTML attributes normalize CR newlines" {
     var element = try Element.init(std.testing.allocator, "div title=\"a\rb\"", null);
     defer element.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("a\nb", element.attributes.?.get("title").?);
+}
+
+fn inlineStyleReplacementTrial(allocator: std.mem.Allocator) !void {
+    var element = try Element.init(std.testing.allocator, "div", null);
+    defer element.deinit(std.testing.allocator);
+    try element.putOwnedAttribute(std.testing.allocator, "style", "margin:var(--space); width:20px");
+    const original = (try element.inlineStyle(std.testing.allocator)).?;
+    const replacement = try original.clone(allocator);
+    var transferred = false;
+    defer if (!transferred) replacement.destroy();
+    _ = try replacement.setProperty("margin-left", "4px", "");
+    element.replaceInlineStyle(allocator, replacement) catch |err| {
+        try std.testing.expect(original == element.inline_declarations.?);
+        try std.testing.expectEqualStrings("margin:var(--space); width:20px", element.attributes.?.get("style").?);
+        return err;
+    };
+    transferred = true;
+    try std.testing.expectEqualStrings("4px", element.inline_declarations.?.get("margin-left").?.value);
+}
+
+test "inline CSSOM publication preserves the previous attribute and owner on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, inlineStyleReplacementTrial, .{});
 }

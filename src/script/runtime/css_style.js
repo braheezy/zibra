@@ -1,98 +1,64 @@
-// Realm-local live inline-style view. The DOM attribute remains authoritative;
-// all mutations use the wrapper's attribute setter/invalidation boundary.
-function cssPropertyName(name) {
-  name = String(name);
-  return name.slice(0, 2) === '--' ? name : name.toLowerCase();
-}
-
-function inlineStyleDeclarations(source) {
-  var declarations = [], start = 0, colon = -1, bang = -1, depth = 0, quote = '', comment = false;
-  function push(end) {
-    if (colon >= start) {
-      var name = source.slice(start, colon).replace(/\/\*[\s\S]*?\*\//g, ' ').trim();
-      var value = source.slice(colon + 1, end).trim();
-      var important = bang > colon && /^!\s*important\s*$/i.test(source.slice(bang, end));
-      if (important) value = source.slice(colon + 1, bang).trim();
-      if (name) declarations.push({ name: cssPropertyName(name), value: value, priority: important ? 'important' : '' });
-    }
-    start = end + 1; colon = -1; bang = -1;
-  }
-  for (var i = 0; i < source.length; i++) {
-    var c = source.charAt(i), next = source.charAt(i + 1);
-    if (comment) { if (c === '*' && next === '/') { comment = false; i++; } continue; }
-    if (c === '\\') { i++; continue; }
-    if (quote) { if (c === quote) quote = ''; continue; }
-    if (c === '/' && next === '*') { comment = true; i++; continue; }
-    if (c === '"' || c === "'") { quote = c; continue; }
-    if (c === '(' || c === '[' || c === '{') depth++;
-    else if (c === ')' || c === ']' || c === '}') depth = Math.max(0, depth - 1);
-    else if (depth === 0 && c === ':' && colon < 0) colon = i;
-    else if (depth === 0 && c === '!') bang = i;
-    else if (depth === 0 && c === ';') push(i);
-  }
-  push(source.length);
-  return declarations;
-}
-
+// Realm-local live view over the Element's native ordered declaration owner.
+// String conversion stays here; grammar, priority, storage and mutation are native.
+var inlineStylePropertyNames = __native.cssPropertyNames();
+var computedStylePropertyNames = __native.cssPropertyNames(false);
+Object.defineProperty(globalThis, 'CSS', {
+  value: {
+    supports(property) {
+      // Kiesel currently permits construction of concise methods.
+      if (new.target) throw new TypeError('CSS.supports is not a constructor');
+      if (arguments.length === 0) throw new TypeError('CSS.supports requires an argument');
+      function cssString(value) {
+        if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol to a CSS string');
+        return String(value);
+      }
+      var first = cssString(property);
+      return arguments.length >= 2 ? __native.cssSupports(first, cssString(arguments[1])) : __native.cssSupports(first);
+    },
+    [Symbol.toStringTag]: 'CSS'
+  }, writable: true, configurable: true
+});
+Object.defineProperty(CSS, Symbol.toStringTag, { writable: false, enumerable: false });
 function createInlineStyleDeclaration(owner) {
   var style = {};
-  function declarations() { return inlineStyleDeclarations(owner.getAttribute('style') || ''); }
-  function selected(name) {
-    name = cssPropertyName(name);
-    var all = declarations(), result = null;
-    for (var i = 0; i < all.length; i++) {
-      if (all[i].name === name && (!result || result.priority !== 'important' || all[i].priority === 'important')) result = all[i];
-    }
-    return result;
-  }
-  function write(all) {
-    var source = '';
-    for (var i = 0; i < all.length; i++) source += all[i].name + ': ' + all[i].value + (all[i].priority ? ' !important' : '') + '; ';
-    owner.setAttribute('style', source.trim());
-  }
   Object.defineProperty(style, 'cssText', {
-    get: function() { return owner.getAttribute('style') || ''; },
-    set: function(value) { owner.setAttribute('style', value == null ? '' : String(value)); },
+    get: function() { return __native.cssStyleQuery(owner.handle, 'text'); },
+    set: function(value) { __native.cssStyleMutate(owner.handle, 'text', value == null ? '' : String(value)); },
     enumerable: true
   });
-  Object.defineProperty(style, 'length', { get: function() { return declarations().length; } });
-  style.item = function(index) { var entry = declarations()[index]; return entry ? entry.name : ''; };
-  style.getPropertyValue = function(name) { var entry = selected(name); return entry ? entry.value : ''; };
-  style.getPropertyPriority = function(name) { var entry = selected(name); return entry ? entry.priority : ''; };
+  Object.defineProperty(style, 'length', { get: function() { return __native.cssStyleQuery(owner.handle, 'length'); } });
+  style[Symbol.iterator] = Array.prototype[Symbol.iterator];
+  style.item = function(index) { return __native.cssStyleQuery(owner.handle, 'item', Number(index) >>> 0); };
+  style.getPropertyValue = function(name) { return __native.cssStyleQuery(owner.handle, 'value', String(name)); };
+  style.getPropertyPriority = function(name) { return __native.cssStyleQuery(owner.handle, 'priority', String(name)); };
   style.removeProperty = function(name) {
-    name = cssPropertyName(name);
-    var previous = style.getPropertyValue(name), all = declarations();
-    write(all.filter(function(entry) { return entry.name !== name; }));
+    name = String(name);
+    var previous = style.getPropertyValue(name);
+    __native.cssStyleMutate(owner.handle, 'remove', name);
     return previous;
   };
   style.setProperty = function(name, value, priority) {
-    name = cssPropertyName(name);
-    value = value == null ? '' : String(value);
-    priority = priority == null ? '' : String(priority).toLowerCase();
-    if (!name || /[\s:;]/.test(name)) return;
-    if (value === '') { style.removeProperty(name); return; }
-    if (priority !== '' && priority !== 'important') return;
-    var all = declarations().filter(function(entry) { return entry.name !== name; });
-    all.push({ name: name, value: value, priority: priority });
-    write(all);
+    __native.cssStyleMutate(owner.handle, 'set', String(name), value == null ? '' : String(value), priority == null ? '' : String(priority));
   };
-  var properties = ['color', 'backgroundColor', 'background', 'display', 'font', 'fontSize', 'fontFamily',
-    'fontWeight', 'fontStyle', 'lineHeight', 'width', 'height', 'minWidth', 'maxWidth', 'minHeight', 'maxHeight',
-    'margin', 'marginTop', 'marginRight', 'marginBottom', 'marginLeft', 'padding', 'paddingTop', 'paddingRight',
-    'paddingBottom', 'paddingLeft', 'border', 'borderTop', 'borderRight', 'borderBottom', 'borderLeft',
-    'borderWidth', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
-    'borderStyle', 'borderColor', 'boxSizing', 'position', 'top', 'right', 'bottom', 'left',
-    'opacity', 'visibility', 'overflow', 'transform', 'zoom', 'flex', 'flexBasis', 'flexGrow', 'flexShrink',
-    'flexDirection', 'flexWrap', 'gap', 'rowGap', 'columnGap', 'alignItems', 'justifyContent',
-    'gridTemplateColumns', 'gridTemplateRows', 'cssFloat'];
-  for (var i = 0; i < properties.length; i++) {
-    (function(property) {
-      var name = property === 'cssFloat' ? 'float' : property.replace(/[A-Z]/g, function(c) { return '-' + c.toLowerCase(); });
-      Object.defineProperty(style, property, {
-        get: function() { return style.getPropertyValue(name); },
-        set: function(value) { style.setProperty(name, value); }, enumerable: true
-      });
-    })(properties[i]);
+  function accessor(property, name) {
+    Object.defineProperty(style, property, {
+      get: function() { return style.getPropertyValue(name); },
+      set: function(value) { style.setProperty(name, value); }, enumerable: true
+    });
   }
-  return style;
+  for (var i = 0; i < inlineStylePropertyNames.length; i++) {
+    var name = inlineStylePropertyNames[i];
+    accessor(name, name);
+    var camel = name.replace(/-([a-z])/g, function(_, c) { return c.toUpperCase(); });
+    if (camel !== name) accessor(camel, name);
+  }
+  accessor('cssFloat', 'float');
+  return new Proxy(style, {
+    get: function(target, name, receiver) {
+      if (typeof name === 'string' && /^(0|[1-9][0-9]*)$/.test(name)) {
+        return Number(name) < style.length ? style.item(Number(name)) : undefined;
+      }
+      return Reflect.get(target, name, receiver);
+    }
+  });
 }

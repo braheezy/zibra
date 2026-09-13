@@ -114,19 +114,10 @@ pub const Page = struct {
         };
     }
 
-    fn sortRules(self: *Page) void {
-        std.mem.sort(CSSParser.CSSRule, self.rules.items, {}, struct {
-            fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
-                return a.cascadePriority() < b.cascadePriority();
-            }
-        }.lessThan);
-    }
-
     fn finish(self: *Page) !void {
         const selection = try self.selectSheets(self.media, null, null);
         self.rules = selection.rules;
         self.keyframes = selection.keyframes;
-        self.sortRules();
         try self.restyle();
     }
 
@@ -204,7 +195,6 @@ pub const Page = struct {
         var previous = SelectedRules{ .allocator = self.allocator, .rules = self.rules, .keyframes = self.keyframes };
         self.rules = selection.rules;
         self.keyframes = selection.keyframes;
-        self.sortRules();
         previous.deinit();
     }
 

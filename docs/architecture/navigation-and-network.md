@@ -219,7 +219,8 @@ fragment actions do not resend retained POST metadata.
 ## Stylesheet and dynamic-resource generations
 
 A Frame's stylesheet texts, parsed rules, and named keyframes are one owner
-generation. Rules and declaration slices borrow those texts. Stage and validate
+generation. Structural ranges and keyframe names borrow those texts; compiled
+declaration maps independently own their normalized names/values. Stage and validate
 the complete replacement before retiring the old generation.
 
 Media-environment changes rebuild all retained author sheets on the serialized

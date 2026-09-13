@@ -2047,7 +2047,7 @@ function makeDetachedDocument(root, contentType) {
       }
       if (simpleMatches.length) return makeNodeList(simpleMatches);
     }
-    try { matches = root.querySelectorAll(text); } catch (error) { matches = null; }
+    matches = root.querySelectorAll(text);
     // Element.querySelectorAll already returns wrapped Node objects. Reusing
     // that list is important: treating its Node objects as native numeric
     // handles would create wrappers whose handle is another wrapper.
@@ -2493,21 +2493,21 @@ function computedStyleObject(node) {
     }
     return nativeValue;
   };
-  var properties = [
-    ['whiteSpace', 'white-space'], ['zIndex', 'z-index'], ['position', 'position'],
-    ['display', 'display'], ['color', 'color'], ['backgroundColor', 'background-color'],
-    ['width', 'width'], ['height', 'height'], ['fontSize', 'font-size'],
-    ['overflow', 'overflow'], ['visibility', 'visibility'], ['opacity', 'opacity'],
-    ['transform', 'transform'], ['textTransform', 'text-transform'], ['cursor', 'cursor']
-  ];
-  for (var i = 0; i < properties.length; i++) {
-    (function (camel, cssName) {
-      Object.defineProperty(style, camel, {
-        get: function() { return style.getPropertyValue(cssName); },
-        enumerable: true
-      });
-    })(properties[i][0], properties[i][1]);
+  function accessor(name, cssName) {
+    Object.defineProperty(style, name, {
+      get: function() { return style.getPropertyValue(cssName); },
+      enumerable: true
+    });
   }
+  for (var i = 0; i < computedStylePropertyNames.length; i++) {
+    var name = computedStylePropertyNames[i];
+    accessor(name, name);
+    var camel = name.replace(/-([a-z])/g, function(_, c) { return c.toUpperCase(); });
+    if (camel !== name) accessor(camel, name);
+  }
+  // Detached-document compatibility properties have no native longhand yet.
+  if (!Object.prototype.hasOwnProperty.call(style, 'textTransform')) accessor('textTransform', 'text-transform');
+  accessor('cssFloat', 'float');
   return style;
 }
 

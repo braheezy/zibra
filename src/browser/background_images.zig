@@ -17,6 +17,7 @@ const Url = url_module.Url;
 
 pub const UsedImage = struct {
     element: *parser.Element,
+    /// CSS-encoded contents borrowing the Element computed value.
     source: []const u8,
 };
 
@@ -31,7 +32,8 @@ fn computedSource(element: *parser.Element) ?[]const u8 {
     if (computedValue(element, "display")) |display| {
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, display, " \t\r\n"), "none")) return null;
     }
-    return background.parseUrl(computedValue(element, "background-image") orelse return null);
+    const source = background.parseUrl(computedValue(element, "background-image") orelse return null) orelse return null;
+    return if (source.len == 0) null else source;
 }
 
 /// Collect only URLs selected by final computed style. A declaration on an
@@ -87,7 +89,9 @@ fn loadOne(
     defer if (sheet_url) |url| url.free(allocator);
     const referrer_url: *const Url = if (sheet_url) |*url| url else page_url;
 
-    var image_url = referrer_url.*.resolve(allocator, source) catch |err| {
+    const decoded = try @import("../document/css_tokenizer.zig").decode(allocator, source, true);
+    defer allocator.free(decoded);
+    var image_url = referrer_url.*.resolve(allocator, decoded) catch |err| {
         if (err == error.OutOfMemory) return err;
         std.log.warn("Failed to resolve CSS background image {s}: {}", .{ source, err });
         return result;

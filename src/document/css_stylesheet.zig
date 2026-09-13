@@ -46,8 +46,8 @@ pub const Sheet = struct {
     }
 
     /// Reparses source for the supplied media environment. The result owns its
-    /// rule/keyframe containers and provenance copies; declaration strings
-    /// borrow this Sheet. Failure publishes nothing and releases partial owners.
+    /// rules, declaration strings and provenance copies; keyframe names borrow
+    /// this Sheet. Failure publishes nothing and releases partial owners.
     pub fn select(self: Sheet, allocator: std.mem.Allocator, media: MediaEnvironment) !Selection {
         const css = try parser.initWithMedia(allocator, self.text, media);
         defer css.deinit(allocator);
@@ -70,8 +70,8 @@ pub const Sheet = struct {
     }
 };
 
-/// Move-only executable containers. Their declaration strings borrow the
-/// originating Sheet; retire the Selection before that Sheet.
+/// Move-only executable containers with owned selectors/declarations. Keyframe
+/// names borrow the originating Sheet; retire the Selection before that Sheet.
 pub const Selection = struct {
     allocator: std.mem.Allocator,
     rules: []parser.CSSRule,

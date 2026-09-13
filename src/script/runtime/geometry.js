@@ -119,4 +119,28 @@
       }, enumerable: true, configurable: true
     });
   });
+  function scrollHandle(element) {
+    if (!DOM_NODE_BRAND.has(element) || element.nodeType !== 1) throw new TypeError('Scrolling requires an Element');
+    return element.handle;
+  }
+  ['scrollLeft', 'scrollTop', 'scrollWidth', 'scrollHeight'].forEach(function(name, index) {
+    var descriptor = {
+      get: function() { return __native.elementScroll(scrollHandle(this))[index]; },
+      enumerable: true, configurable: true
+    };
+    if (index < 2) descriptor.set = function(value) {
+      __native.elementScroll(scrollHandle(this), index === 0 ? +value : undefined, index === 1 ? +value : undefined, false);
+    };
+    Object.defineProperty(Node.prototype, name, descriptor);
+  });
+  function scroll(element, x, y, relative) {
+    var handle = scrollHandle(element);
+    if (x && typeof x === 'object') {
+      y = x.top;
+      x = x.left;
+    }
+    __native.elementScroll(handle, x === undefined ? undefined : +x, y === undefined ? undefined : +y, relative);
+  }
+  Node.prototype.scroll = Node.prototype.scrollTo = function(x, y) { scroll(this, x, y, false); };
+  Node.prototype.scrollBy = function(x, y) { scroll(this, x, y, true); };
 })();

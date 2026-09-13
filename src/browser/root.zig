@@ -2950,14 +2950,6 @@ pub const Browser = struct {
                 &all_keyframes,
             );
 
-            // Sort rules by cascade priority (more specific selectors override less specific)
-            // Stable sort preserves file order for rules with equal priority
-            std.mem.sort(CSSParser.CSSRule, all_rules.items, {}, struct {
-                fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
-                    return a.cascadePriority() < b.cascadePriority();
-                }
-            }.lessThan);
-
             // Clean up the old generation before transferring the staged one.
             for (frame.rules.items) |*rule| {
                 if (rule.owned) {
@@ -3383,12 +3375,6 @@ pub const Browser = struct {
             &all_rules,
             &all_keyframes,
         );
-
-        std.mem.sort(CSSParser.CSSRule, all_rules.items, {}, struct {
-            fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
-                return a.cascadePriority() < b.cascadePriority();
-            }
-        }.lessThan);
 
         // resetFrameForNavigation left these lists empty but retained their
         // buffers. Replace both generations together so rules never outlive
@@ -3872,12 +3858,6 @@ pub const Browser = struct {
             &all_keyframes,
         );
 
-        std.mem.sort(CSSParser.CSSRule, all_rules.items, {}, struct {
-            fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
-                return a.cascadePriority() < b.cascadePriority();
-            }
-        }.lessThan);
-
         frame.rules.deinit(self.allocator);
         for (frame.keyframes.items) |*rule| rule.deinit(self.allocator);
         frame.keyframes.deinit(self.allocator);
@@ -4221,12 +4201,6 @@ pub const Browser = struct {
             &new_rules,
             &new_keyframes,
         );
-
-        std.mem.sort(CSSParser.CSSRule, new_rules.items, {}, struct {
-            fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
-                return a.cascadePriority() < b.cascadePriority();
-            }
-        }.lessThan);
 
         // Rules borrow the old CSS buffers, so destroy them before freeing the
         // buffers and then atomically install the staged generation.
@@ -4762,12 +4736,6 @@ pub const Browser = struct {
             parsed_rules_owned = false;
         }
 
-        std.mem.sort(CSSParser.CSSRule, new_rules.items, {}, struct {
-            fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
-                return a.cascadePriority() < b.cascadePriority();
-            }
-        }.lessThan);
-
         for (frame.rules.items) |*rule| {
             if (rule.owned) rule.deinit(self.allocator);
         }
@@ -4845,8 +4813,9 @@ pub const Browser = struct {
                 did_layout = true;
             }
         }
-        // Repaint if layout ran or paint was requested
-        if (did_layout or force_paint) {
+        const sticky_changed = frame.updateSticky();
+        // Repaint if layout ran or a scrolling-dependent wrapper changed.
+        if (did_layout or force_paint or sticky_changed) {
             // Refresh only dirty layout-object paint caches. The returned
             // frame list is a tiny retained root reference, not a deep copy
             // of the complete page.

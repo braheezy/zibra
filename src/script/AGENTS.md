@@ -23,10 +23,17 @@ queued work and shutdown are documented in
 - `runtime/bootstrap.js` defines the page-visible DOM, traversal, event, timer,
   canvas, XHR, cookie, and messaging shims over `__native`; Zig loads it with
   `@embedFile` before evaluating page code.
-- `runtime/css_style.js` supplies cached live inline-style declarations over
-  the Node wrapper's attribute APIs. It preserves unrelated declarations and
-  custom-property case; native computed-style readback flushes pending ancestor
-  style work and copies values before returning to Kiesel.
+- `runtime/css_style.js` supplies cached inline-style views and argument
+  conversion. `css_style_bindings.zig` queries/mutates the Element's native
+  ordered block through synchronous handle borrows. Preserve staged publication,
+  pending shorthand state, attribute revisions, and SVG invalidation; clone the
+  block when cloning a Node. Native computed-style readback flushes pending
+  ancestor style work and copies values before returning to Kiesel. Its
+  longhand accessors come from the property registry; color primitives resolve
+  with the native color owner while inline views keep specified keywords.
+  The same domain exposes the Realm's `CSS.supports` namespace function.
+  JavaScript handles overload selection/string conversion; native feature
+  queries share `@supports` evaluation and must not mutate or flush the DOM.
 - `runtime/html_fragments.js` owns inner/outerHTML and adjacent-HTML wrapper
   semantics over the native fragment parser and existing mutation APIs.
   Preserve removed wrappers and refresh logical child/range views only after
@@ -52,6 +59,9 @@ queued work and shutdown are documented in
   generation-scoped browser callback. Wrap returned handles through the
   canonical Node cache; never export a native pointer, derive geometry from
   authored style strings, or retain a native result buffer in JavaScript.
+  Scroll getters/setters use the same generation-checked callback and copied
+  numeric requests; the browser flushes layout before clamping and refreshes
+  sticky visual offsets before returning. No scroll operation evaluates script.
 - `dom_handles.zig` owns the two-way Node pointer/numeric identity maps for one
   window generation.
 - `runtime/range.js` owns live Range state, boundary validation/comparison,
@@ -81,6 +91,10 @@ queued work and shutdown are documented in
   parses and starts typed DOM transitions.
 
 ## Local contracts
+
+- Native document and subtree queries share the bounded selector-list parser.
+  Preserve whole-list errors, document order, unique results and full-tree
+  ancestry for logical arguments. Query wrappers must propagate syntax errors.
 
 - Preserve Kiesel's traced allocation, GC-root, and `JsLock` assumptions. A
   native callback entered with the lock held uses lock-aware helpers; do not

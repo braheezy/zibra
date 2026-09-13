@@ -2,22 +2,25 @@
 //!
 //! This module owns only source-buffer scanning. All returned ranges borrow
 //! the stylesheet input; property grammar and computed-style ownership remain
-//! with their respective callers. Comments are treated as whitespace, and
-//! delimiters inside strings, escapes, or parenthesized functions are never
+//! with their respective callers. Comments are retained token trivia, and
+//! delimiters inside strings, escapes, or balanced blocks/functions are never
 //! reported as structural separators.
 
 const std = @import("std");
+const tokenizer = @import("css_tokenizer.zig");
 
 pub const TopLevelMatch = struct {
     /// Source index immediately before `delimiter`, or input length.
     end: usize,
     /// The unconsumed top-level delimiter, if one was found.
     delimiter: ?u8,
+    /// The remaining input was quarantined after exceeding max_component_depth.
+    exhausted: bool = false,
 };
 
 /// Return whether `byte` is CSS whitespace in the supported source subset.
 pub fn isWhitespace(byte: u8) bool {
-    return std.ascii.isWhitespace(byte) or byte == '\x0c';
+    return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r' or byte == '\x0c';
 }
 
 /// Return whether `byte` is an ASCII hexadecimal digit.
@@ -73,169 +76,57 @@ pub fn consumeEscape(input: []const u8, cursor: *usize) bool {
         cursor.* += 1;
         digits += 1;
     }
-    if (cursor.* < input.len and isWhitespace(input[cursor.*])) cursor.* += 1;
+    if (cursor.* < input.len and isWhitespace(input[cursor.*])) {
+        if (input[cursor.*] == '\r' and cursor.* + 1 < input.len and input[cursor.* + 1] == '\n') cursor.* += 1;
+        cursor.* += 1;
+    }
     return true;
 }
 
-/// Scan until a delimiter that occurs at the top level. Comments, strings,
-/// escapes, and parenthesized function values are skipped as a unit. The
-/// matching delimiter is not consumed.
-pub fn scanToTopLevel(input: []const u8, start: usize, delimiters: []const u8) TopLevelMatch {
-    var cursor = start;
-    var parentheses: usize = 0;
-    var quote: ?u8 = null;
-    while (cursor < input.len) {
-        const byte = input[cursor];
-        if (quote) |delimiter| {
-            if (byte == '\\') {
-                if (!consumeEscape(input, &cursor)) {
-                    cursor += 1;
-                }
-                continue;
-            }
-            cursor += 1;
-            if (byte == delimiter) quote = null;
-            continue;
-        }
+/// Maximum simultaneously open component blocks/functions. This bounds stack
+/// use independently of input size; over-limit input is quarantined to EOF.
+pub const max_component_depth = 64;
 
-        if (byte == '/' and cursor + 1 < input.len and input[cursor + 1] == '*') {
-            _ = consumeComment(input, &cursor);
-            continue;
-        }
-        if (byte == '\\') {
-            if (!consumeEscape(input, &cursor)) cursor += 1;
-            continue;
-        }
-        switch (byte) {
-            '\'', '"' => {
-                quote = byte;
-                cursor += 1;
-            },
-            '(' => {
-                parentheses += 1;
-                cursor += 1;
-            },
-            ')' => {
-                if (parentheses > 0) parentheses -= 1;
-                cursor += 1;
-            },
-            else => {
-                if (parentheses == 0 and std.mem.indexOfScalar(u8, delimiters, byte) != null) {
-                    return .{ .end = cursor, .delimiter = byte };
-                }
-                cursor += 1;
-            },
-        }
+/// Scan balanced (), [] and {} components, ignoring separators in strings,
+/// comments and escapes. A delimiter is returned only at depth zero, without
+/// consuming it. On excessive nesting, return EOF with exhausted set: callers
+/// must discard the incomplete construct, not publish its truncated contents.
+pub fn scanToTopLevel(input: []const u8, start: usize, delimiters: []const u8) TopLevelMatch {
+    var iterator = tokenizer.Iterator{ .input = input, .cursor = start };
+    var stack: [max_component_depth]tokenizer.Kind = undefined;
+    var depth: usize = 0;
+    while (iterator.next()) |token| {
+        const raw = token.raw(input);
+        if (depth == 0 and raw.len == 1 and std.mem.indexOfScalar(u8, delimiters, raw[0]) != null)
+            return .{ .end = token.start, .delimiter = raw[0] };
+        if (token.closer()) |closer| {
+            if (depth == stack.len) return .{ .end = input.len, .delimiter = null, .exhausted = true };
+            stack[depth] = closer;
+            depth += 1;
+        } else if (depth > 0 and token.kind == stack[depth - 1]) depth -= 1;
     }
     return .{ .end = input.len, .delimiter = null };
 }
 
-/// Find the brace that closes a CSS block beginning at `open`. Braces inside
-/// quoted strings, comments, escapes, and functions are not structural.
+/// Find an explicit closing brace. EOF recovery is a caller's grammar choice;
+/// structural rule parsing may accept an unfinished block where this returns null.
 pub fn findMatchingBrace(input: []const u8, open: usize) ?usize {
     if (open >= input.len or input[open] != '{') return null;
-    var cursor = open;
-    var depth: usize = 0;
-    var parentheses: usize = 0;
-    var quote: ?u8 = null;
-    while (cursor < input.len) {
-        const byte = input[cursor];
-        if (quote) |delimiter| {
-            if (byte == '\\') {
-                if (!consumeEscape(input, &cursor)) cursor += 1;
-                continue;
-            }
-            cursor += 1;
-            if (byte == delimiter) quote = null;
-            continue;
-        }
-        if (byte == '/' and cursor + 1 < input.len and input[cursor + 1] == '*') {
-            _ = consumeComment(input, &cursor);
-            continue;
-        }
-        if (byte == '\\') {
-            if (!consumeEscape(input, &cursor)) cursor += 1;
-            continue;
-        }
-        switch (byte) {
-            '\'', '"' => {
-                quote = byte;
-                cursor += 1;
-            },
-            '(' => {
-                parentheses += 1;
-                cursor += 1;
-            },
-            ')' => {
-                if (parentheses > 0) parentheses -= 1;
-                cursor += 1;
-            },
-            '{' => {
-                if (parentheses == 0) depth += 1;
-                cursor += 1;
-            },
-            '}' => {
-                if (parentheses == 0) {
-                    if (depth == 0) return null;
-                    depth -= 1;
-                    if (depth == 0) return cursor;
-                }
-                cursor += 1;
-            },
-            else => cursor += 1,
-        }
-    }
-    return null;
+    const found = scanToTopLevel(input, open + 1, "}");
+    return if (found.delimiter != null) found.end else null;
 }
 
-fn hexValue(byte: u8) u21 {
-    return if (byte >= '0' and byte <= '9') byte - '0' else if (byte >= 'a' and byte <= 'f') byte - 'a' + 10 else byte - 'A' + 10;
+/// Consume the source spelling of an identifier. Returns null without moving
+/// the cursor when it does not start an ident token. Strings remain borrowed.
+pub fn consumeIdentifier(input: []const u8, cursor: *usize) ?[]const u8 {
+    const start = cursor.*;
+    if (!tokenizer.startsIdentifier(input, start)) return null;
+    tokenizer.consumeName(input, cursor);
+    return input[start..cursor.*];
 }
 
-/// Decode one escape for ASCII identifier comparison. Non-ASCII decoded
-/// values intentionally fail the comparison, because the currently supported
-/// CSS property names are ASCII.
-fn escapedAscii(input: []const u8, cursor: *usize) ?u8 {
-    if (cursor.* >= input.len or input[cursor.*] != '\\') return null;
-    cursor.* += 1;
-    if (cursor.* >= input.len) return null;
-    if (!isHexDigit(input[cursor.*])) {
-        const byte = input[cursor.*];
-        cursor.* += 1;
-        return byte;
-    }
-
-    var value: u21 = 0;
-    var digits: usize = 0;
-    while (cursor.* < input.len and digits < 6 and isHexDigit(input[cursor.*])) {
-        value = value * 16 + hexValue(input[cursor.*]);
-        cursor.* += 1;
-        digits += 1;
-    }
-    if (cursor.* < input.len and isWhitespace(input[cursor.*])) cursor.* += 1;
-    if (value == 0 or value > 0x7f) return null;
-    return @intCast(value);
-}
-
-/// Compare a raw CSS identifier with an ASCII name, resolving CSS escapes and
-/// applying CSS's ASCII case-insensitivity for property identifiers.
-pub fn identifierEquals(raw: []const u8, expected: []const u8) bool {
-    var raw_cursor: usize = 0;
-    var expected_cursor: usize = 0;
-    while (raw_cursor < raw.len and expected_cursor < expected.len) {
-        const byte = if (raw[raw_cursor] == '\\') blk: {
-            const escaped = escapedAscii(raw, &raw_cursor) orelse return false;
-            break :blk escaped;
-        } else blk: {
-            const literal = raw[raw_cursor];
-            raw_cursor += 1;
-            break :blk literal;
-        };
-        if (std.ascii.toLower(byte) != std.ascii.toLower(expected[expected_cursor])) return false;
-        expected_cursor += 1;
-    }
-    return raw_cursor == raw.len and expected_cursor == expected.len;
-}
+/// Compare decoded CSS names with ASCII case folding, without allocating.
+pub const identifierEquals = tokenizer.identifierEquals;
 
 test "scanner ignores escaped and quoted declaration delimiters" {
     const escaped = scanToTopLevel("\\}; background: yellow; }", 0, ";}");
@@ -252,4 +143,42 @@ test "identifier comparison decodes CSS escapes without treating hex as text" {
     try std.testing.expect(identifierEquals("m\\61rgin", "margin"));
     // `\\a` is a hexadecimal newline escape, not the letter `a`.
     try std.testing.expect(!identifierEquals("m\\argin", "margin"));
+}
+
+test "component scanner matches typed brackets and ignores escaped delimiters" {
+    const input = "[x;{y:z;}](a;}b);width:12px";
+    const end = scanToTopLevel(input, 0, ";}");
+    try std.testing.expectEqualStrings("[x;{y:z;}](a;}b)", input[0..end.end]);
+    try std.testing.expectEqual(@as(?u8, ';'), end.delimiter);
+    try std.testing.expect(!end.exhausted);
+}
+
+test "component scanner recovers bad strings and preserves line continuations" {
+    const bad = "\"bad\n;width:12px";
+    const end = scanToTopLevel(bad, 0, ";}");
+    try std.testing.expectEqual(@as(usize, 5), end.end);
+    const continued = "\"a\\\r\n;}b\";width:12px";
+    const good = scanToTopLevel(continued, 0, ";}");
+    try std.testing.expectEqualStrings("\"a\\\r\n;}b\"", continued[0..good.end]);
+    try std.testing.expect(identifierEquals("w\\69\r\ndth", "width"));
+    try std.testing.expect(!isWhitespace('\x0b'));
+}
+
+test "component scanner keeps unquoted URL punctuation opaque" {
+    const source = "url(data:text/plain,{[;); color:green";
+    const end = scanToTopLevel(source, 0, ";}");
+    try std.testing.expectEqualStrings("url(data:text/plain,{[;)", source[0..end.end]);
+    const escaped = "u\\72l(data:text/plain,}]); width:120px";
+    const escaped_end = scanToTopLevel(escaped, 0, ";}");
+    try std.testing.expectEqualStrings("u\\72l(data:text/plain,}])", escaped[0..escaped_end.end]);
+}
+
+test "URL names inside other tokens do not hide bracket structure" {
+    for ([_][]const u8{ "#url", "@url", "1url", "-.5e+2url" }) |prefix| {
+        var buffer: [128]u8 = undefined;
+        const source = try std.fmt.bufPrint(&buffer, "{s}([);]); color:green", .{prefix});
+        const end = scanToTopLevel(source, 0, ";}");
+        try std.testing.expectEqual(prefix.len + 6, end.end);
+        try std.testing.expectEqual(@as(?u8, ';'), end.delimiter);
+    }
 }

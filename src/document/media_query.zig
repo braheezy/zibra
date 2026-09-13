@@ -286,7 +286,7 @@ const Condition = struct {
     fn inParens(self: *Condition) ?Truth {
         self.scan.space();
         const start = self.scan.cursor;
-        var iterator = tokens.Iterator{ .input = self.scan.input, .cursor = start, .atomic_urls = false };
+        var iterator = tokens.Iterator{ .input = self.scan.input, .cursor = start };
         const token = iterator.next() orelse return null;
         const function = token.kind == .function;
         if (!function and !std.mem.eql(u8, self.scan.input[token.start..token.end], "(")) return null;
@@ -347,7 +347,7 @@ fn singleMatches(input: []const u8, env: Environment) bool {
 pub fn matches(input: []const u8, env: Environment) bool {
     var start: usize = 0;
     var depth: usize = 0;
-    var iterator = tokens.Iterator{ .input = input, .atomic_urls = false };
+    var iterator = tokens.Iterator{ .input = input };
     while (iterator.next()) |token| {
         const text = input[token.start..token.end];
         if (token.kind == .function or std.mem.eql(u8, text, "(")) depth += 1;

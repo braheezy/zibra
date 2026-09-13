@@ -1,0 +1,21 @@
+# Resolved sRGB colors, currentcolor inheritance and native background paint.
+# Computed helpers use the native CSS.supports API; expectations stay PASS.
+tests:
+  - css/css-color/parsing/color-invalid-named-color.html
+  - css/css-color/parsing/color-computed.html
+  - css/css-color/parsing/color-computed-named-color.html
+  - css/css-color/parsing/color-computed-hex-color.html
+  - css/css-color/parsing/color-computed-rgb.html
+  - css/css-color/parsing/color-computed-hsl.html
+  - css/selectors/invalidation/not-001.html
+reftests:
+  - css/css-color/named-001.html
+  - css/css-color/currentcolor-001.html
+  - css/css-color/currentcolor-002.html
+  - css/css-color/t31-color-currentColor-b.xht
+  - css/css-color/t44-currentcolor-background-b.xht
+  - css/css-color/t44-currentcolor-inherited-c.xht
+  - css/css-color/t44-currentcolor-border-b.xht
+  - css/css-color/t423-transparent-2-a.xht
+crashtests:
+  - css/css-color/crashtests/stop-color-invalid-rgb.html

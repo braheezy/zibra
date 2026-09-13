@@ -101,6 +101,25 @@ test "Referrer background provenance follows cascade and outlives the stylesheet
     try std.testing.expectEqual(@as(usize, 1), context.fetch_count);
 }
 
+test "background URL tokens decode CSS escapes before resource resolution" {
+    const a = std.testing.allocator;
+    const html = try document.HTMLParser.init(a, "<div id=target></div>");
+    defer html.deinit(a);
+    var root = try html.parse();
+    defer root.deinit(a);
+    document.fixParentPointers(&root, null);
+    const rules = try parseRules(a, "#target {background-image:u\\72 l('pixel\\22 .ppm'); width:20px; height:20px}");
+    defer freeRules(a, rules);
+    try document.style(a, &root, rules);
+    const page = try Url.init(a, "https://example.test/index.html");
+    defer page.free(a);
+    var context = TestLoadContext{ .allocator = a, .expected_target = "https://example.test/pixel%22.ppm" };
+    try background_images.loadUsed(a, std.testing.io, &root, &page, .default, true, &context, TestLoadCallbacks);
+    try std.testing.expectEqual(@as(usize, 1), context.fetch_count);
+    try background_images.loadUsed(a, std.testing.io, &root, &page, .default, true, &context, TestLoadCallbacks);
+    try std.testing.expectEqual(@as(usize, 1), context.fetch_count);
+}
+
 test "SVG data URL backgrounds own cached pixels and retire before source replacement" {
     const allocator = std.testing.allocator;
     var html_parser = try document.HTMLParser.init(allocator, "<main><div id=first></div><div id=second></div></main>");

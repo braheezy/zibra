@@ -247,17 +247,19 @@ fn mapImageSourceCoordinateForItem(
             // local origin; every caller that can paint it uses the
             // viewport-sized raster path, so destination coordinates are
             // already viewport-local here.
-            const tile_start = if (tile.attachment == .fixed)
+            // Signed positions can lie outside the i32 clip coordinate range.
+            // Keep subtraction wide until repetition or clipping bounds it.
+            const tile_start: i64 = if (tile.attachment == .fixed)
                 display_commands.DisplayItem.scaleLayoutPx(layout_offset, zoom)
             else
-                destination_start + display_commands.DisplayItem.scaleLayoutPx(layout_offset, zoom);
-            const relative = destination - tile_start;
-            const tile_coordinate = if (repeats)
+                @as(i64, destination_start) + display_commands.DisplayItem.scaleLayoutPx(layout_offset, zoom);
+            const relative = @as(i64, destination) - tile_start;
+            const tile_coordinate: i32 = @intCast(if (repeats)
                 @mod(relative, tile_size)
             else blk: {
                 if (relative < 0 or relative >= tile_size) return -1;
                 break :blk relative;
-            };
+            });
             return mapImageSourceCoordinate(
                 tile_coordinate,
                 0,
@@ -328,6 +330,27 @@ test "raster image sampling repeats a positioned background tile" {
         @as(i32, -1),
         mapImageSourceCoordinateForItem(item, 23, 20, 20, 0, 2, false, 1.0),
     );
+}
+
+test "CSS background sampling bounds extreme signed positions before narrowing" {
+    const pixels = [_]u8{0} ** 16;
+    var item = ImageDisplayItem{
+        .x1 = 10,
+        .y1 = 20,
+        .x2 = 30,
+        .y2 = 40,
+        .source_width = 2,
+        .source_height = 2,
+        .pixels = &pixels,
+        .tiling = .{ .width = 2, .height = 2 },
+    };
+    for ([_]i32{ std.math.minInt(i32), std.math.maxInt(i32) }, [_]i32{ 1, 0 }) |offset, expected| {
+        item.tiling.?.offset_x = offset;
+        item.tiling.?.repeat_x = true;
+        try std.testing.expectEqual(expected, mapImageSourceCoordinateForItem(item, 13, 10, 20, 0, 2, true, 1));
+        item.tiling.?.repeat_x = false;
+        try std.testing.expectEqual(-1, mapImageSourceCoordinateForItem(item, 13, 10, 20, 0, 2, true, 1));
+    }
 }
 
 test "fixed background tiles keep their viewport phase across element clips" {

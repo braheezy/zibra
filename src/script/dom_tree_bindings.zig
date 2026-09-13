@@ -571,11 +571,10 @@ fn appendDomString(agent: *Agent, node: *const Node, output: *kiesel.types.Strin
     }
 }
 
-/// Return the last published CSS value for an element.  The style phase owns
-/// the authoritative computed map; this synchronous snapshot deliberately
-/// uses `lastValue` so a script cannot crash merely by querying style while a
-/// later invalidation is pending.  Defaults cover the properties commonly
-/// observable through `getComputedStyle` in the bounded DOM.
+/// Flush style, then copy a resolved value from clean generation-bound fields.
+/// Color serialization consumes the same foreground as paint; declaration
+/// blocks retain their specified keywords. Dirty fields after a failed flush
+/// yield an empty value rather than exposing an earlier style generation.
 fn computedStyleValue(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error!Value {
     _ = this_value;
     const host = activeHost(agent);
@@ -595,13 +594,47 @@ fn computedStyleValue(agent: *Agent, this_value: Value, arguments: Arguments) Ag
             if (@import("../document/custom_properties.zig").isName(property)) {
                 break :blk if (element.custom_properties) |environment| environment.get(property) orelse "" else "";
             }
-            if (element.style) |*styles| {
-                if (styles.getPtr(property)) |field| break :blk if (field.dirty) "" else field.get().*;
+            _ = std.ascii.lowerString(property, property);
+            const metadata = @import("../document/css_properties.zig");
+            for (metadata.shorthands) |shorthand| {
+                if (!std.mem.eql(u8, property, shorthand.name)) continue;
+                const block = try @import("../document/css_declaration_block.zig").create(host.allocator, "");
+                defer block.destroy();
+                for (shorthand.longhands) |name| {
+                    const component = (try computedLonghand(block.valueAllocator(), element, name)) orelse break :blk "";
+                    try block.put(name, .{ .value = component });
+                }
+                const serialized = try block.propertyValue(host.allocator, property);
+                defer host.allocator.free(serialized);
+                return copiedString(agent, serialized);
+            }
+            if (try computedLonghand(host.allocator, element, property)) |serialized| {
+                defer host.allocator.free(serialized);
+                return copiedString(agent, serialized);
             }
             break :blk if (std.mem.eql(u8, property, "z-index")) "auto" else if (std.mem.eql(u8, property, "white-space")) "normal" else "";
         },
     };
     return copiedString(agent, value);
+}
+
+/// Copy one resolved longhand. The result belongs to the caller; no computed
+/// field or animation-track borrow crosses the native callback.
+fn computedLonghand(allocator: std.mem.Allocator, element: *parser.Element, property: []const u8) !?[]u8 {
+    const styles = if (element.style) |*value| value else return null;
+    const field = styles.getPtr(property) orelse return null;
+    if (field.dirty) return null;
+    if (element.animations) |animations| if (animations.get(property)) |track| return try track.serialize(allocator);
+    const raw = field.get().*;
+    if (@import("../document/css_properties.zig").get(property)) |metadata| {
+        if (metadata.serialization == .color) {
+            const foreground = styles.getPtr("color") orelse return null;
+            if (foreground.dirty) return null;
+            const color = @import("../document/color.zig").resolve(raw, foreground.get().*) orelse return null;
+            return try color.serialize(allocator);
+        }
+    }
+    return try allocator.dupe(u8, raw);
 }
 
 test "DOM tree helpers preserve authored text topology and document order" {

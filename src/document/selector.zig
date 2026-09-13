@@ -5,9 +5,33 @@
 //! for the duration of matching.
 
 const std = @import("std");
-const parser = @import("parser.zig");
+const dom = @import("dom.zig");
 const pseudo = @import("pseudo.zig");
-const Node = parser.Node;
+const Node = dom.Node;
+pub const Specificity = @import("css_cascade.zig").Specificity;
+
+// Matching borrows either the caller's root-to-parent slice or a stack link
+// during :has traversal. Links never escape a synchronous recursive call.
+const Ancestry = union(enum) {
+    slice: []const *Node,
+    link: *const Link,
+
+    const Link = struct { node: *Node, parent: Ancestry };
+
+    fn last(self: Ancestry) ?*Node {
+        return switch (self) {
+            .slice => |nodes| if (nodes.len == 0) null else nodes[nodes.len - 1],
+            .link => |link| link.node,
+        };
+    }
+
+    fn parent(self: Ancestry) Ancestry {
+        return switch (self) {
+            .slice => |nodes| .{ .slice = nodes[0 .. nodes.len - @intFromBool(nodes.len != 0)] },
+            .link => |link| link.parent,
+        };
+    }
+};
 
 fn generatedPseudoHost(node: *Node) ?*Node {
     const element = switch (node.*) {
@@ -34,10 +58,10 @@ fn publicHostNode(node: *Node) *Node {
 /// but selector combinators conceptually start at that host. Remove the host
 /// from relationship traversal so it cannot satisfy its own ancestor, child,
 /// or sibling selector.
-fn relationshipAncestors(node: *Node, ancestor_chain: []const *Node) []const *Node {
+fn relationshipAncestors(node: *Node, ancestor_chain: Ancestry) Ancestry {
     const host = generatedPseudoHost(node) orelse return ancestor_chain;
-    if (ancestor_chain.len != 0 and ancestor_chain[ancestor_chain.len - 1] == host) {
-        return ancestor_chain[0 .. ancestor_chain.len - 1];
+    if (ancestor_chain.last() == host) {
+        return ancestor_chain.parent();
     }
     return ancestor_chain;
 }
@@ -52,7 +76,7 @@ pub const Selector = union(enum) {
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
     structural: StructuralSelector,
-    not: NotSelector,
+    logical: LogicalSelector,
     state: StateSelector,
     pseudo_element: PseudoElementSelector,
     sequence: SelectorSequence,
@@ -79,6 +103,10 @@ pub const Selector = union(enum) {
         ancestor_chain: []const *Node,
         context: MatchContext,
     ) bool {
+        return self.matchesWithin(node, .{ .slice = ancestor_chain }, context);
+    }
+
+    fn matchesWithin(self: Selector, node: *Node, ancestor_chain: Ancestry, context: MatchContext) bool {
         return switch (self) {
             .universal => |universal| universal.matches(node),
             .tag => |t| t.matches(node),
@@ -88,11 +116,11 @@ pub const Selector = union(enum) {
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
             .structural => |structural| structural.matches(node),
-            .not => |not| not.matches(node, context),
+            .logical => |logical| logical.matches(node, ancestor_chain, context),
             .state => |state| state.matches(node),
             .pseudo_element => |pseudo_element| pseudo_element.matches(node),
-            .sequence => |s| s.matches(node),
-            .has => |h| h.matches(node, context),
+            .sequence => |s| s.matches(node, ancestor_chain, context),
+            .has => |h| h.matches(node, ancestor_chain, context),
             .descendant => |d| d.matches(node, ancestor_chain, context),
             .complex => |complex| complex.matches(node, ancestor_chain, context),
         };
@@ -105,6 +133,8 @@ pub const Selector = union(enum) {
         root: *Node,
     ) std.mem.Allocator.Error!void {
         switch (self) {
+            .logical => |logical| try logical.populateHasMatches(cache, root),
+            .sequence => |sequence| try sequence.populateHasMatches(cache, root),
             .has => |has| try has.populateMatches(cache, root),
             .descendant => |descendant| try descendant.populateHasMatches(cache, root),
             .complex => |complex| try complex.populateHasMatches(cache, root),
@@ -123,7 +153,7 @@ pub const Selector = union(enum) {
             .focus_visible => {},
             .hover => {},
             .structural => |*structural| structural.deinit(allocator),
-            .not => |*not| not.deinit(allocator),
+            .logical => |*logical| logical.deinit(allocator),
             .state => {},
             .pseudo_element => {},
             .sequence => |*s| s.deinit(allocator),
@@ -133,26 +163,31 @@ pub const Selector = union(enum) {
         }
     }
 
-    /// Get the cascade priority of this selector
-    /// Used for sorting rules - more specific selectors have higher priority
-    pub fn priority(self: Selector) u32 {
+    /// Count ID, class/attribute/pseudo-class and type/pseudo-element components.
+    pub fn specificity(self: Selector) Specificity {
         return switch (self) {
-            .universal => |universal| universal.priority(),
-            .tag => |t| t.priority(),
-            .class => |c| c.priority(),
-            .id => |id| id.priority(),
-            .attribute => |attribute| attribute.priority(),
-            .focus_visible => |focus_visible| focus_visible.priority(),
-            .hover => |hover| hover.priority(),
-            .structural => |structural| structural.priority(),
-            .not => |not| not.priority(),
-            .state => |state| state.priority(),
-            .pseudo_element => |pseudo_element| pseudo_element.priority(),
-            .sequence => |s| s.priority(),
-            .has => |h| h.priority(),
-            .descendant => |d| d.priority(),
-            .complex => |complex| complex.priority(),
+            .universal => |universal| universal.specificity(),
+            .tag => |t| t.specificity(),
+            .class => |c| c.specificity(),
+            .id => |id| id.specificity(),
+            .attribute => |attribute| attribute.specificity(),
+            .focus_visible => |focus_visible| focus_visible.specificity(),
+            .hover => |hover| hover.specificity(),
+            .structural => |structural| structural.specificity(),
+            .logical => |logical| logical.specificity(),
+            .state => |state| state.specificity(),
+            .pseudo_element => |pseudo_element| pseudo_element.specificity(),
+            .sequence => |s| s.specificity(),
+            .has => |h| h.specificity(),
+            .descendant => |d| d.specificity(),
+            .complex => |complex| complex.specificity(),
         };
+    }
+
+    /// Conservative mutation scope for this selector, including unmatched
+    /// logical branches. No DOM pointer or allocation enters this summary.
+    pub fn dependencies(self: Selector) dom.SelectorDependencies {
+        return selectorDependencies(self);
     }
 
     /// Return the terminal generated pseudo-element selected by this rule.
@@ -180,7 +215,7 @@ pub const SimpleSelector = union(enum) {
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
     structural: StructuralSelector,
-    not: NotSelector,
+    logical: LogicalSelector,
     state: StateSelector,
     pseudo_element: PseudoElementSelector,
     sequence: SelectorSequence,
@@ -196,7 +231,7 @@ pub const SimpleSelector = union(enum) {
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
             .hover => |hover| .{ .hover = hover },
             .structural => |structural| .{ .structural = structural },
-            .not => |not| .{ .not = not },
+            .logical => |logical| .{ .logical = logical },
             .state => |state| .{ .state = state },
             .pseudo_element => |pseudo_element| .{ .pseudo_element = pseudo_element },
             .sequence => |sequence| .{ .sequence = sequence },
@@ -204,7 +239,7 @@ pub const SimpleSelector = union(enum) {
         };
     }
 
-    fn matches(self: SimpleSelector, node: *Node, context: MatchContext) bool {
+    fn matches(self: SimpleSelector, node: *Node, ancestor_chain: Ancestry, context: MatchContext) bool {
         return switch (self) {
             .universal => |universal| universal.matches(node),
             .tag => |tag| tag.matches(node),
@@ -214,11 +249,11 @@ pub const SimpleSelector = union(enum) {
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
             .structural => |structural| structural.matches(node),
-            .not => |not| not.matches(node, context),
+            .logical => |logical| logical.matches(node, ancestor_chain, context),
             .state => |state| state.matches(node),
             .pseudo_element => |pseudo_element| pseudo_element.matches(node),
-            .sequence => |sequence| sequence.matches(node),
-            .has => |has| has.matches(node, context),
+            .sequence => |sequence| sequence.matches(node, ancestor_chain, context),
+            .has => |has| has.matches(node, ancestor_chain, context),
         };
     }
 
@@ -228,6 +263,8 @@ pub const SimpleSelector = union(enum) {
         root: *Node,
     ) std.mem.Allocator.Error!void {
         switch (self) {
+            .logical => |logical| try logical.populateHasMatches(cache, root),
+            .sequence => |sequence| try sequence.populateHasMatches(cache, root),
             .has => |has| try has.populateMatches(cache, root),
             else => {},
         }
@@ -243,7 +280,7 @@ pub const SimpleSelector = union(enum) {
             .focus_visible => {},
             .hover => {},
             .structural => |*structural| structural.deinit(allocator),
-            .not => |*not| not.deinit(allocator),
+            .logical => |*logical| logical.deinit(allocator),
             .state => {},
             .pseudo_element => {},
             .sequence => |*sequence| sequence.deinit(allocator),
@@ -251,21 +288,21 @@ pub const SimpleSelector = union(enum) {
         }
     }
 
-    fn priority(self: SimpleSelector) u32 {
+    fn specificity(self: SimpleSelector) Specificity {
         return switch (self) {
-            .universal => |universal| universal.priority(),
-            .tag => |tag| tag.priority(),
-            .class => |class| class.priority(),
-            .id => |id| id.priority(),
-            .attribute => |attribute| attribute.priority(),
-            .focus_visible => |focus_visible| focus_visible.priority(),
-            .hover => |hover| hover.priority(),
-            .structural => |structural| structural.priority(),
-            .not => |not| not.priority(),
-            .state => |state| state.priority(),
-            .pseudo_element => |pseudo_element| pseudo_element.priority(),
-            .sequence => |sequence| sequence.priority(),
-            .has => |has| has.priority(),
+            .universal => |universal| universal.specificity(),
+            .tag => |tag| tag.specificity(),
+            .class => |class| class.specificity(),
+            .id => |id| id.specificity(),
+            .attribute => |attribute| attribute.specificity(),
+            .focus_visible => |focus_visible| focus_visible.specificity(),
+            .hover => |hover| hover.specificity(),
+            .structural => |structural| structural.specificity(),
+            .logical => |logical| logical.specificity(),
+            .state => |state| state.specificity(),
+            .pseudo_element => |pseudo_element| pseudo_element.specificity(),
+            .sequence => |sequence| sequence.specificity(),
+            .has => |has| has.specificity(),
         };
     }
 
@@ -286,9 +323,9 @@ pub const UniversalSelector = struct {
         return publicHostNode(node).* == .element;
     }
 
-    fn priority(self: UniversalSelector) u32 {
+    fn specificity(self: UniversalSelector) Specificity {
         _ = self;
-        return 0;
+        return .{};
     }
 };
 
@@ -343,9 +380,9 @@ pub const AttributeSelector = struct {
         if (self.value) |value| allocator.free(value);
     }
 
-    fn priority(self: AttributeSelector) u32 {
+    fn specificity(self: AttributeSelector) Specificity {
         _ = self;
-        return 10;
+        return .{ .classes = 1 };
     }
 };
 
@@ -375,14 +412,14 @@ pub const ClassSelector = struct {
         allocator.free(self.class);
     }
 
-    fn priority(self: ClassSelector) u32 {
+    fn specificity(self: ClassSelector) Specificity {
         _ = self;
-        return 10;
+        return .{ .classes = 1 };
     }
 };
 
 /// An ID selector such as `#main`. HTML ID matching is case-sensitive and an
-/// ID contributes the selector specificity's hundreds component.
+/// ID contributes to the first specificity component.
 pub const IdSelector = struct {
     id: []const u8,
 
@@ -403,9 +440,9 @@ pub const IdSelector = struct {
         allocator.free(self.id);
     }
 
-    fn priority(self: IdSelector) u32 {
+    fn specificity(self: IdSelector) Specificity {
         _ = self;
-        return 100;
+        return .{ .ids = 1 };
     }
 };
 
@@ -421,9 +458,9 @@ pub const FocusVisibleSelector = struct {
         };
     }
 
-    fn priority(self: FocusVisibleSelector) u32 {
+    fn specificity(self: FocusVisibleSelector) Specificity {
         _ = self;
-        return 10;
+        return .{ .classes = 1 };
     }
 };
 
@@ -439,9 +476,9 @@ pub const HoverSelector = struct {
         };
     }
 
-    fn priority(self: HoverSelector) u32 {
+    fn specificity(self: HoverSelector) Specificity {
         _ = self;
-        return 10;
+        return .{ .classes = 1 };
     }
 };
 
@@ -477,9 +514,9 @@ pub const StateSelector = struct {
         };
     }
 
-    fn priority(self: StateSelector) u32 {
+    fn specificity(self: StateSelector) Specificity {
         _ = self;
-        return 10;
+        return .{ .classes = 1 };
     }
 };
 
@@ -504,16 +541,17 @@ pub const StructuralKind = enum {
 
 pub const StructuralSelector = struct {
     kind: StructuralKind,
+    /// Raw An+B grammar for nth selectors; decoded identifier/string for lang.
     argument: ?[]const u8 = null,
 
-    fn elementNode(node: *Node) ?*parser.Element {
+    fn elementNode(node: *Node) ?*dom.Element {
         return switch (publicHostNode(node).*) {
             .element => |*element| element,
             .text => null,
         };
     }
 
-    fn parentElement(node: *Node) ?*parser.Element {
+    fn parentElement(node: *Node) ?*dom.Element {
         const element = elementNode(node) orelse return null;
         const parent = element.parent orelse return null;
         return switch (parent.*) {
@@ -548,35 +586,12 @@ pub const StructuralSelector = struct {
     }
 
     fn nthMatches(index: usize, argument: []const u8) bool {
-        const expr = std.mem.trim(u8, argument, " \t\r\n\x0c");
-        if (std.ascii.eqlIgnoreCase(expr, "odd")) return (index & 1) == 1;
-        if (std.ascii.eqlIgnoreCase(expr, "even")) return (index & 1) == 0;
-        const n_pos = std.mem.indexOfScalar(u8, expr, 'n') orelse
-            std.mem.indexOfScalar(u8, expr, 'N') orelse {
-            const value = std.fmt.parseInt(i64, expr, 10) catch return false;
-            return value >= 1 and index == @as(usize, @intCast(value));
-        };
-        const coefficient_text = std.mem.trim(u8, expr[0..n_pos], " \t\r\n\x0c");
-        const coefficient: i64 = if (coefficient_text.len == 0 or std.mem.eql(u8, coefficient_text, "+"))
-            1
-        else if (std.mem.eql(u8, coefficient_text, "-"))
-            -1
-        else
-            std.fmt.parseInt(i64, coefficient_text, 10) catch return false;
-        const offset_text = std.mem.trim(u8, expr[n_pos + 1 ..], " \t\r\n\x0c");
-        const offset: i64 = if (offset_text.len == 0)
-            0
-        else
-            std.fmt.parseInt(i64, offset_text, 10) catch return false;
-        const position: i64 = @intCast(index);
-        const delta = position - offset;
-        if (coefficient == 0) return delta == 0;
-        if ((delta < 0 and coefficient > 0) or (delta > 0 and coefficient < 0)) return false;
-        return @mod(delta, coefficient) == 0;
+        const expression = @import("css_anb.zig").parse(argument) orelse return false;
+        return expression.matches(index);
     }
 
     fn matchesLang(node: *Node, argument: []const u8) bool {
-        const requested = std.mem.trim(u8, argument, " \t\r\n\x0c\"'");
+        const requested = argument;
         if (requested.len == 0) return false;
         var current: ?*Node = publicHostNode(node);
         while (current) |candidate| {
@@ -630,26 +645,44 @@ pub const StructuralSelector = struct {
         self.argument = null;
     }
 
-    fn priority(self: StructuralSelector) u32 {
+    fn specificity(self: StructuralSelector) Specificity {
         _ = self;
-        return 10;
+        return .{ .classes = 1 };
     }
 };
 
-pub const NotSelector = struct {
-    selector: *SimpleSelector,
+/// An owning list of complex selectors. :is/:where accept an empty list
+/// after forgiving parsing; :not requires at least one valid member.
+pub const LogicalSelector = struct {
+    pub const Kind = enum { is, where, not };
+    kind: Kind,
+    selectors: std.ArrayList(Selector),
 
-    fn matches(self: NotSelector, node: *Node, context: MatchContext) bool {
-        return !self.selector.matches(node, context);
+    fn matches(self: LogicalSelector, node: *Node, ancestor_chain: Ancestry, context: MatchContext) bool {
+        if (publicHostNode(node).* != .element) return false;
+        const ancestors = relationshipAncestors(node, ancestor_chain);
+        for (self.selectors.items) |selector| {
+            if (selector.matchesWithin(publicHostNode(node), ancestors, context)) return self.kind != .not;
+        }
+        return self.kind == .not;
     }
 
-    fn deinit(self: *NotSelector, allocator: std.mem.Allocator) void {
-        self.selector.deinit(allocator);
-        allocator.destroy(self.selector);
+    pub fn deinit(self: *LogicalSelector, allocator: std.mem.Allocator) void {
+        for (self.selectors.items) |*selector| selector.deinit(allocator);
+        self.selectors.deinit(allocator);
+        self.selectors = .empty;
     }
 
-    fn priority(self: NotSelector) u32 {
-        return 10 + self.selector.priority();
+    fn specificity(self: LogicalSelector) Specificity {
+        var result: Specificity = .{};
+        if (self.kind != .where) for (self.selectors.items) |selector| {
+            result = result.max(selector.specificity());
+        };
+        return result;
+    }
+
+    fn populateHasMatches(self: LogicalSelector, cache: *HasMatchCache, root: *Node) std.mem.Allocator.Error!void {
+        for (self.selectors.items) |selector| try selector.populateHasMatches(cache, root);
     }
 };
 
@@ -674,10 +707,9 @@ pub const TagSelector = struct {
         allocator.free(self.tag);
     }
 
-    /// Tag selectors have a priority of 1
-    fn priority(self: TagSelector) u32 {
+    fn specificity(self: TagSelector) Specificity {
         _ = self;
-        return 1;
+        return .{ .types = 1 };
     }
 };
 
@@ -693,9 +725,9 @@ pub const PseudoElementSelector = struct {
         };
     }
 
-    fn priority(self: PseudoElementSelector) u32 {
+    fn specificity(self: PseudoElementSelector) Specificity {
         _ = self;
-        return 1;
+        return .{ .types = 1 };
     }
 };
 
@@ -711,7 +743,7 @@ pub const SequenceSelector = union(enum) {
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
     structural: StructuralSelector,
-    not: NotSelector,
+    logical: LogicalSelector,
     state: StateSelector,
     pseudo_element: PseudoElementSelector,
 
@@ -725,13 +757,13 @@ pub const SequenceSelector = union(enum) {
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
             .hover => |hover| .{ .hover = hover },
             .structural => |structural| .{ .structural = structural },
-            .not => |not| .{ .not = not },
+            .logical => |logical| .{ .logical = logical },
             .state => |state| .{ .state = state },
             .pseudo_element => |pseudo_element| .{ .pseudo_element = pseudo_element },
         };
     }
 
-    fn matches(self: SequenceSelector, node: *Node) bool {
+    fn matches(self: SequenceSelector, node: *Node, ancestor_chain: Ancestry, context: MatchContext) bool {
         return switch (self) {
             .universal => |universal| universal.matches(node),
             .tag => |tag| tag.matches(node),
@@ -741,7 +773,7 @@ pub const SequenceSelector = union(enum) {
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
             .structural => |structural| structural.matches(node),
-            .not => |not| not.matches(node, .{}),
+            .logical => |logical| logical.matches(node, ancestor_chain, context),
             .state => |state| state.matches(node),
             .pseudo_element => |pseudo_element| pseudo_element.matches(node),
         };
@@ -757,25 +789,25 @@ pub const SequenceSelector = union(enum) {
             .focus_visible => {},
             .hover => {},
             .structural => |*structural| structural.deinit(allocator),
-            .not => |*not| not.deinit(allocator),
+            .logical => |*logical| logical.deinit(allocator),
             .state => {},
             .pseudo_element => {},
         }
     }
 
-    fn priority(self: SequenceSelector) u32 {
+    fn specificity(self: SequenceSelector) Specificity {
         return switch (self) {
-            .universal => |universal| universal.priority(),
-            .tag => |tag| tag.priority(),
-            .class => |class| class.priority(),
-            .id => |id| id.priority(),
-            .attribute => |attribute| attribute.priority(),
-            .focus_visible => |focus_visible| focus_visible.priority(),
-            .hover => |hover| hover.priority(),
-            .structural => |structural| structural.priority(),
-            .not => |not| not.priority(),
-            .state => |state| state.priority(),
-            .pseudo_element => |pseudo_element| pseudo_element.priority(),
+            .universal => |universal| universal.specificity(),
+            .tag => |tag| tag.specificity(),
+            .class => |class| class.specificity(),
+            .id => |id| id.specificity(),
+            .attribute => |attribute| attribute.specificity(),
+            .focus_visible => |focus_visible| focus_visible.specificity(),
+            .hover => |hover| hover.specificity(),
+            .structural => |structural| structural.specificity(),
+            .logical => |logical| logical.specificity(),
+            .state => |state| state.specificity(),
+            .pseudo_element => |pseudo_element| pseudo_element.specificity(),
         };
     }
 };
@@ -800,17 +832,24 @@ pub const SelectorSequence = struct {
         self.selectors = .empty;
     }
 
-    fn matches(self: SelectorSequence, node: *Node) bool {
+    fn matches(self: SelectorSequence, node: *Node, ancestor_chain: Ancestry, context: MatchContext) bool {
         for (self.selectors.items) |selector| {
-            if (!selector.matches(node)) return false;
+            if (!selector.matches(node, ancestor_chain, context)) return false;
         }
         return true;
     }
 
+    fn populateHasMatches(self: SelectorSequence, cache: *HasMatchCache, root: *Node) std.mem.Allocator.Error!void {
+        for (self.selectors.items) |selector| switch (selector) {
+            .logical => |logical| try logical.populateHasMatches(cache, root),
+            else => {},
+        };
+    }
+
     /// Sequence specificity is the sum of the member specificities.
-    fn priority(self: SelectorSequence) u32 {
-        var total: u32 = 0;
-        for (self.selectors.items) |selector| total += selector.priority();
+    fn specificity(self: SelectorSequence) Specificity {
+        var total: Specificity = .{};
+        for (self.selectors.items) |selector| total = total.add(selector.specificity());
         return total;
     }
 
@@ -869,7 +908,7 @@ pub const HasMatchCache = struct {
         has: HasSelector,
     ) std.mem.Allocator.Error!void {
         if (self.isPrepared(has.descendant)) return;
-        _ = try self.visit(root, has);
+        _ = try self.visit(root, .{ .slice = &.{} }, has);
         try self.prepared.put(has.descendant, {});
     }
 
@@ -879,23 +918,25 @@ pub const HasMatchCache = struct {
     fn visit(
         self: *HasMatchCache,
         node: *Node,
+        ancestors: Ancestry,
         has: HasSelector,
     ) std.mem.Allocator.Error!bool {
         const context = MatchContext{ .has_cache = self };
         var child_contains_match = false;
+        const link = Ancestry.Link{ .node = node, .parent = ancestors };
         switch (node.*) {
             .text => {},
             .element => |*element| {
                 for (element.children.items) |*child| {
-                    if (try self.visit(child, has)) child_contains_match = true;
+                    if (try self.visit(child, .{ .link = &link }, has)) child_contains_match = true;
                 }
             },
         }
 
-        if (child_contains_match and has.ancestor.matches(node, context)) {
+        if (child_contains_match and has.ancestor.matches(node, ancestors, context)) {
             try self.matches.put(.{ .selector = has.descendant, .node = node }, {});
         }
-        return child_contains_match or has.descendant.matches(node, context);
+        return child_contains_match or has.descendant.matches(node, ancestors, context);
     }
 };
 
@@ -926,28 +967,31 @@ pub const HasSelector = struct {
         allocator.destroy(self.descendant);
     }
 
-    fn priority(self: HasSelector) u32 {
-        return self.ancestor.priority() + self.descendant.priority();
+    fn specificity(self: HasSelector) Specificity {
+        return self.ancestor.specificity().add(self.descendant.specificity());
     }
 
-    fn matches(self: HasSelector, node: *Node, context: MatchContext) bool {
-        if (!self.ancestor.matches(node, context)) return false;
+    fn matches(self: HasSelector, node: *Node, ancestor_chain: Ancestry, context: MatchContext) bool {
+        const host = publicHostNode(node);
+        const ancestors = relationshipAncestors(node, ancestor_chain);
+        if (!self.ancestor.matches(host, ancestors, context)) return false;
         if (context.has_cache) |cache| {
             if (cache.isPrepared(self.descendant)) {
-                return cache.contains(self.descendant, node);
+                return cache.contains(self.descendant, host);
             }
         }
-        return self.hasMatchingDescendant(node, context);
+        return self.hasMatchingDescendant(host, ancestors, context);
     }
 
-    fn hasMatchingDescendant(self: HasSelector, node: *Node, context: MatchContext) bool {
+    fn hasMatchingDescendant(self: HasSelector, node: *Node, ancestors: Ancestry, context: MatchContext) bool {
         const element = switch (node.*) {
             .text => return false,
             .element => |*value| value,
         };
+        const link = Ancestry.Link{ .node = node, .parent = ancestors };
         for (element.children.items) |*child| {
-            if (self.descendant.matches(child, context) or
-                self.hasMatchingDescendant(child, context))
+            if (self.descendant.matches(child, .{ .link = &link }, context) or
+                self.hasMatchingDescendant(child, .{ .link = &link }, context))
             {
                 return true;
             }
@@ -987,10 +1031,10 @@ pub const DescendantSelector = struct {
         self.selectors = .empty;
     }
 
-    /// Descendant selectors have a priority equal to the sum of their parts.
-    fn priority(self: DescendantSelector) u32 {
-        var total: u32 = 0;
-        for (self.selectors.items) |selector| total += selector.priority();
+    /// Chain specificity is the sum of its compound selectors.
+    fn specificity(self: DescendantSelector) Specificity {
+        var total: Specificity = .{};
+        for (self.selectors.items) |selector| total = total.add(selector.specificity());
         return total;
     }
 
@@ -1010,22 +1054,20 @@ pub const DescendantSelector = struct {
     fn matches(
         self: DescendantSelector,
         node: *Node,
-        ancestor_chain: []const *Node,
+        ancestor_chain: Ancestry,
         context: MatchContext,
     ) bool {
         const selectors = self.selectors.items;
         if (selectors.len < 2) return false;
 
         var selector_index = selectors.len - 1;
-        if (!selectors[selector_index].matches(node, context)) return false;
+        if (!selectors[selector_index].matches(node, ancestor_chain, context)) return false;
 
-        const ancestors = relationshipAncestors(node, ancestor_chain);
-        var ancestor_index = ancestors.len;
-        while (selector_index > 0 and ancestor_index > 0) {
-            ancestor_index -= 1;
-            if (selectors[selector_index - 1].matches(ancestors[ancestor_index], context)) {
-                selector_index -= 1;
-            }
+        var ancestors = relationshipAncestors(node, ancestor_chain);
+        while (selector_index > 0) {
+            const ancestor = ancestors.last() orelse break;
+            ancestors = ancestors.parent();
+            if (selectors[selector_index - 1].matches(ancestor, ancestors, context)) selector_index -= 1;
         }
         return selector_index == 0;
     }
@@ -1074,9 +1116,9 @@ pub const ComplexSelector = struct {
         self.combinators = .empty;
     }
 
-    fn priority(self: ComplexSelector) u32 {
-        var total: u32 = 0;
-        for (self.selectors.items) |selector| total += selector.priority();
+    fn specificity(self: ComplexSelector) Specificity {
+        var total: Specificity = .{};
+        for (self.selectors.items) |selector| total = total.add(selector.specificity());
         return total;
     }
 
@@ -1112,29 +1154,29 @@ pub const ComplexSelector = struct {
         self: ComplexSelector,
         selector_index: usize,
         node: *Node,
-        ancestor_chain: []const *Node,
+        ancestor_chain: Ancestry,
         context: MatchContext,
     ) bool {
-        if (!self.selectors.items[selector_index].matches(node, context)) return false;
+        if (!self.selectors.items[selector_index].matches(node, ancestor_chain, context)) return false;
         if (selector_index == 0) return true;
 
         const ancestors = relationshipAncestors(node, ancestor_chain);
 
         return switch (self.combinators.items[selector_index - 1]) {
-            .child => if (ancestors.len == 0)
+            .child => if (ancestors.last() == null)
                 false
             else
                 self.matchesAt(
                     selector_index - 1,
-                    ancestors[ancestors.len - 1],
-                    ancestors[0 .. ancestors.len - 1],
+                    ancestors.last().?,
+                    ancestors.parent(),
                     context,
                 ),
-            .adjacent => if (ancestors.len == 0)
+            .adjacent => if (ancestors.last() == null)
                 false
             else if (previousElementSibling(
                 publicHostNode(node),
-                ancestors[ancestors.len - 1],
+                ancestors.last().?,
             )) |previous|
                 self.matchesAt(
                     selector_index - 1,
@@ -1144,10 +1186,10 @@ pub const ComplexSelector = struct {
                 )
             else
                 false,
-            .general_sibling => if (ancestors.len == 0)
+            .general_sibling => if (ancestors.last() == null)
                 false
             else blk: {
-                const parent = ancestors[ancestors.len - 1];
+                const parent = ancestors.last().?;
                 const parent_element = switch (parent.*) {
                     .element => |*element| element,
                     .text => break :blk false,
@@ -1168,15 +1210,10 @@ pub const ComplexSelector = struct {
                 break :blk false;
             },
             .descendant => blk: {
-                var ancestor_index = ancestors.len;
-                while (ancestor_index > 0) {
-                    ancestor_index -= 1;
-                    if (self.matchesAt(
-                        selector_index - 1,
-                        ancestors[ancestor_index],
-                        ancestors[0..ancestor_index],
-                        context,
-                    )) break :blk true;
+                var remaining = ancestors;
+                while (remaining.last()) |ancestor| {
+                    remaining = remaining.parent();
+                    if (self.matchesAt(selector_index - 1, ancestor, remaining, context)) break :blk true;
                 }
                 break :blk false;
             },
@@ -1186,7 +1223,7 @@ pub const ComplexSelector = struct {
     fn matches(
         self: ComplexSelector,
         node: *Node,
-        ancestor_chain: []const *Node,
+        ancestor_chain: Ancestry,
         context: MatchContext,
     ) bool {
         if (self.selectors.items.len < 2 or
@@ -1207,6 +1244,31 @@ pub const ComplexSelector = struct {
         return self.selectors.items[self.selectors.items.len - 1].pseudoElementKind();
     }
 };
+
+fn selectorDependencies(original: anytype) dom.SelectorDependencies {
+    return switch (original) {
+        inline else => |payload| result: {
+            const T = @TypeOf(payload);
+            if (T == StructuralSelector) break :result .{ .descendants = payload.kind == .lang };
+            if (T == HasSelector) {
+                const combined = selectorDependencies(payload.ancestor.*).merge(selectorDependencies(payload.descendant.*));
+                break :result combined.merge(.{ .has = true });
+            }
+            if (T == SelectorSequence or T == DescendantSelector or T == ComplexSelector or T == LogicalSelector) {
+                var summary = dom.SelectorDependencies{ .descendants = T == DescendantSelector };
+                if (T == ComplexSelector) for (payload.combinators.items) |combinator| {
+                    switch (combinator) {
+                        .child, .descendant => summary.descendants = true,
+                        .adjacent, .general_sibling => summary.siblings = true,
+                    }
+                };
+                for (payload.selectors.items) |part| summary = summary.merge(selectorDependencies(part));
+                break :result summary;
+            }
+            break :result .{};
+        },
+    };
+}
 
 // The three selector unions share payload owners. Keep cloning alongside
 // deinitialization so adding an owning payload cannot silently shallow-copy it.
@@ -1236,8 +1298,8 @@ fn cloneSelectorPayload(original: anytype, allocator: std.mem.Allocator) std.mem
             .kind = original.kind,
             .argument = if (original.argument) |text| try allocator.dupe(u8, text) else null,
         };
-    } else if (T == NotSelector) {
-        return .{ .selector = try cloneSimplePointer(original.selector.*, allocator) };
+    } else if (T == LogicalSelector) {
+        return .{ .kind = original.kind, .selectors = try cloneSelectorComponents(Selector, original.selectors.items, allocator) };
     } else if (T == HasSelector) {
         const ancestor = try cloneSimplePointer(original.ancestor.*, allocator);
         errdefer {
@@ -1284,12 +1346,12 @@ fn cloneSelectorComponents(comptime T: type, original: []const T, allocator: std
 
 test "structural selector matching follows element siblings and inherited language" {
     const allocator = std.testing.allocator;
-    var root = Node{ .element = try parser.Element.init(allocator, "html lang=en-GB", null) };
+    var root = Node{ .element = try dom.Element.init(allocator, "html lang=en-GB", null) };
     defer root.deinit(allocator);
-    try root.element.children.append(allocator, Node{ .element = try parser.Element.init(allocator, "div", null) });
-    try root.element.children.append(allocator, Node{ .element = try parser.Element.init(allocator, "span", null) });
-    try root.element.children.append(allocator, Node{ .text = parser.Text.init("", null) });
-    parser.fixParentPointers(&root, null);
+    try root.element.children.append(allocator, Node{ .element = try dom.Element.init(allocator, "div", null) });
+    try root.element.children.append(allocator, Node{ .element = try dom.Element.init(allocator, "span", null) });
+    try root.element.children.append(allocator, Node{ .text = dom.Text.init("", null) });
+    dom.fixParentPointers(&root, null);
 
     const first = &root.element.children.items[0];
     const second = &root.element.children.items[1];
@@ -1308,11 +1370,11 @@ test "structural selector matching follows element siblings and inherited langua
 
 test "state selectors observe live link and form attributes" {
     const allocator = std.testing.allocator;
-    var root = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    var root = Node{ .element = try dom.Element.init(allocator, "html", null) };
     defer root.deinit(allocator);
-    try root.element.children.append(allocator, Node{ .element = try parser.Element.init(allocator, "a href=/next", null) });
-    try root.element.children.append(allocator, Node{ .element = try parser.Element.init(allocator, "input type=checkbox", null) });
-    parser.fixParentPointers(&root, null);
+    try root.element.children.append(allocator, Node{ .element = try dom.Element.init(allocator, "a href=/next", null) });
+    try root.element.children.append(allocator, Node{ .element = try dom.Element.init(allocator, "input type=checkbox", null) });
+    dom.fixParentPointers(&root, null);
 
     const link = &root.element.children.items[0];
     const input = &root.element.children.items[1];
@@ -1336,10 +1398,10 @@ const clone_test_source = "*,div,.a,#id,[data-name='x'],:focus-visible,:hover,:n
 
 test "selector clones retain matches and specificity after original owners retire" {
     const allocator = std.testing.allocator;
-    var root = Node{ .element = try parser.Element.init(allocator, "div id=id class=a data-name=x", null) };
+    var root = Node{ .element = try dom.Element.init(allocator, "div id=id class=a data-name=x", null) };
     defer root.deinit(allocator);
-    try root.element.children.append(allocator, .{ .element = try parser.Element.init(allocator, "span class=a", null) });
-    parser.fixParentPointers(&root, null);
+    try root.element.children.append(allocator, .{ .element = try dom.Element.init(allocator, "span class=a", null) });
+    dom.fixParentPointers(&root, null);
 
     const original = try @import("css_parser.zig").parseSelectorList(allocator, clone_test_source);
     var originals_alive = true;
@@ -1353,23 +1415,23 @@ test "selector clones retain matches and specificity after original owners retir
         clones.deinit(allocator);
     }
     try clones.ensureTotalCapacity(allocator, original.len);
-    var priorities: [15]u32 = undefined;
+    var priorities: [15]Specificity = undefined;
     var matches: [15]bool = undefined;
     try std.testing.expectEqual(priorities.len, original.len);
     for (original, 0..) |selector, index| {
-        priorities[index] = selector.priority();
+        priorities[index] = selector.specificity();
         matches[index] = selector.matches(&root, &.{});
         clones.appendAssumeCapacity(try selector.clone(allocator));
     }
     try std.testing.expect(original[1].tag.tag.ptr != clones.items[1].tag.tag.ptr);
-    try std.testing.expect(original[8].not.selector != clones.items[8].not.selector);
+    try std.testing.expect(original[8].logical.selectors.items.ptr != clones.items[8].logical.selectors.items.ptr);
     try std.testing.expect(original[12].has.descendant != clones.items[12].has.descendant);
     try std.testing.expect(original[14].complex.combinators.items.ptr != clones.items[14].complex.combinators.items.ptr);
     for (original) |*selector| selector.deinit(allocator);
     allocator.free(original);
     originals_alive = false;
     for (clones.items, 0..) |selector, index| {
-        try std.testing.expectEqual(priorities[index], selector.priority());
+        try std.testing.expectEqual(priorities[index], selector.specificity());
         try std.testing.expectEqual(matches[index], selector.matches(&root, &.{}));
     }
     try std.testing.expectEqualStrings("x", clones.items[4].attribute.value.?);
@@ -1380,7 +1442,7 @@ fn selectorCloneAllocationTrial(allocator: std.mem.Allocator, original: []const 
     for (original) |selector| {
         var cloned = try selector.clone(allocator);
         defer cloned.deinit(allocator);
-        try std.testing.expectEqual(selector.priority(), cloned.priority());
+        try std.testing.expectEqual(selector.specificity(), cloned.specificity());
     }
 }
 

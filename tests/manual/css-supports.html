@@ -1,0 +1,72 @@
+<!-- How to verify: expect green PASS and three matching green bars. Resize the
+     window: the matching media rule changes the bars' width together. Queries
+     test declaration/selector support and drive an equivalent class fallback. -->
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CSS feature queries</title><style>
+body { margin:30px; font:18px sans-serif; }
+.bar { width:180px; height:24px; margin:12px 0; background:red; }
+#reference { background:green; }
+@supports (display: block) and selector(:is(.bar, #target)) {
+  #target { background:green; }
+  @media (min-width:600px) { #target { width:240px; } }
+}
+@media (min-width:600px) {
+  @supports (width:1px) { #reference, #script { width:240px; } }
+}
+@supports (color:red) and (color:blue) or (color:green) { #target { background:red; } }
+@supports selector(:is(.bar, :unknown)) { #target { background:red; } }
+@supports not future(!@# {} [] more()) { #fallback.active { color:green; } }
+#script.active { background:green; }
+</style></head><body>
+<h1 id="status">Checking CSS feature queries</h1>
+<p id="fallback" class="active">Unsupported features select the fallback.</p>
+<div id="target" class="bar"></div><div id="script" class="bar"></div><div id="reference" class="bar"></div>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var results = [], target = document.getElementById('target');
+  function equal(a,b) { if (a !== b) throw Error(String(a) + ' != ' + String(b)); }
+  function check(name, run) {
+    try { run(); results.push({name:name, status:0}); }
+    catch (e) { results.push({name:name, status:1, message:String(e)}); }
+  }
+  check('property and condition overloads preserve CSSOM name and priority rules', function() {
+    equal(CSS.supports('color', 'rebeccapurple'), true);
+    equal(CSS.supports('color', 'red!important'), false);
+    equal(CSS.supports('color:red!important'), true);
+    equal(CSS.supports(' width', '1px'), false);
+    equal(CSS.supports('unknown', 'inherit'), false);
+    equal(CSS.supports('display', 'nonsense'), false);
+    equal(CSS.supports('position', 'sticky'), true);
+  });
+  check('custom values and pending substitutions are queried without changing the DOM', function() {
+    var before = target.getAttribute('style');
+    equal(CSS.supports('--empty', ''), true);
+    equal(CSS.supports('color', 'var(--missing)'), true);
+    equal(CSS.supports('color', 'var(invalid)'), false);
+    equal(target.getAttribute('style'), before);
+  });
+  check('boolean grammar and unknown future features select the correct fallback', function() {
+    equal(CSS.supports('not future(!@# {} [] more())'), true);
+    equal(CSS.supports('(color:red) or garbage'), false);
+    equal(CSS.supports('(color:red) and (color:blue) or (color:green)'), false);
+    equal(getComputedStyle(document.getElementById('fallback')).color, 'rgb(0, 128, 0)');
+  });
+  check('selector support checks every forgiving logical branch', function() {
+    equal(CSS.supports('selector(:is(.bar, #target))'), true);
+    equal(CSS.supports('selector(:is(.bar, :unknown))'), false);
+    equal(CSS.supports('selector(div, span)'), false);
+    equal(document.querySelector(':is(#target, :unknown)'), target);
+  });
+  check('JavaScript and stylesheet queries activate equivalent styling', function() {
+    if (CSS.supports('(display: block) and selector(:is(.bar, #target))')) document.getElementById('script').className = 'bar active';
+    equal(getComputedStyle(target).backgroundColor, 'rgb(0, 128, 0)');
+    equal(getComputedStyle(document.getElementById('script')).backgroundColor, 'rgb(0, 128, 0)');
+    equal(target.getBoundingClientRect().width, document.getElementById('reference').getBoundingClientRect().width);
+  });
+  var failures = results.filter(function(result) { return result.status !== 0; });
+  var status = document.getElementById('status');
+  status.textContent = failures.length ? 'FAIL: ' + failures[0].message : 'PASS: CSS feature queries';
+  status.style.color = failures.length ? 'red' : 'green';
+  if (typeof completion_callback === 'function') completion_callback(results, {status:0});
+});
+</script></body></html>

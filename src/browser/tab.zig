@@ -1820,6 +1820,7 @@ pub fn runAnimationFrameForGeneration(
     // region turns this same frame into the required layout/paint pass.
     var lazy_frame_it = self.frames_by_id.valueIterator();
     while (lazy_frame_it.next()) |frame_ptr| {
+        if (frame_ptr.*.updateSticky()) self.needs_paint = true;
         _ = self.browser.loadLazyImagesNearViewport(frame_ptr.*) catch |err| {
             std.log.warn("Lazy image load failed: {}", .{err});
             continue;
@@ -2165,8 +2166,9 @@ test "alternate keyframe cycles preserve endpoints and relayout dimensions" {
         .signature = 1,
         .property_mask = parser.cssAnimationPropertyBit("opacity") |
             parser.cssAnimationPropertyBit("width"),
-        .iterations = null,
-        .direction = .alternate,
+        .name_hash = 1,
+        .timing = .{ .duration_frames = 2, .iterations = null, .direction = .alternate },
+        .templates = .{ root.element.animations.?.get("opacity"), null, null, root.element.animations.?.get("width"), null },
     };
 
     var tab: Tab = undefined;
@@ -2188,7 +2190,6 @@ test "alternate keyframe cycles preserve endpoints and relayout dimensions" {
     try std.testing.expect(frame.documentLayout().?.layoutNeeded());
 
     try std.testing.expect(tab.advanceAnimations(&root, 0));
-    try std.testing.expect(root.element.css_animation.?.restart_pending);
     try std.testing.expectApproxEqAbs(
         @as(f64, 1),
         root.element.animations.?.get("opacity").?.numeric.getValue(),
@@ -2196,19 +2197,17 @@ test "alternate keyframe cycles preserve endpoints and relayout dimensions" {
     );
 
     try std.testing.expect(tab.advanceAnimations(&root, 0));
-    try std.testing.expectEqual(@as(u32, 1), root.element.css_animation.?.completed_iterations);
     try std.testing.expectApproxEqAbs(
-        @as(f64, 1),
+        @as(f64, 0.5),
         root.element.animations.?.get("opacity").?.numeric.getValue(),
         0.000001,
     );
     try std.testing.expectApproxEqAbs(
-        @as(f64, 200),
+        @as(f64, 150),
         root.element.animations.?.get("width").?.pixel.getValue(),
         0.000001,
     );
 
-    try std.testing.expect(tab.advanceAnimations(&root, 0));
     try std.testing.expect(tab.advanceAnimations(&root, 0));
     try std.testing.expectApproxEqAbs(
         @as(f64, 0),
@@ -2233,17 +2232,17 @@ test "finite keyframe animation restores its underlying property" {
     root.element.css_animation = .{
         .signature = 2,
         .property_mask = parser.cssAnimationPropertyBit("width"),
-        .iterations = 1,
-        .direction = .normal,
+        .name_hash = 2,
+        .timing = .{ .duration_frames = 1 },
+        .templates = .{ null, null, null, root.element.animations.?.get("width"), null },
     };
+    root.element.css_animation.?.publish(&root.element.animations.?);
 
     var tab: Tab = undefined;
     var frame: Frame = undefined;
     try initAnimationPhaseTest(&tab, &frame, allocator);
     defer deinitAnimationPhaseTest(&tab, &frame);
 
-    try std.testing.expect(tab.advanceAnimations(&root, 0));
-    try std.testing.expect(root.element.css_animation.?.restart_pending);
     try std.testing.expect(!tab.advanceAnimations(&root, 0));
     try std.testing.expect(root.element.css_animation.?.finished);
     try std.testing.expect(root.element.animations.?.get("width") == null);

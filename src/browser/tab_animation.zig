@@ -46,11 +46,12 @@ pub fn hasActive(node: *const document.Node) bool {
         .element => |*element| blk: {
             if (svg_animation.isRoot(element) and svg_animation.active(element, element.svg_time_seconds)) break :blk true;
             if (element.css_animation) |state| {
-                if (!state.finished) break :blk true;
+                if (state.isRunning()) break :blk true;
             }
             if (element.animations) |animations| {
                 var iterator = animations.iterator();
                 while (iterator.next()) |entry| {
+                    if (element.css_animation) |state| if (state.contains(entry.key_ptr.*)) continue;
                     if (!entry.value_ptr.isComplete()) break :blk true;
                 }
             }
@@ -122,26 +123,6 @@ fn publishValue(
     }
 }
 
-fn restartCssAnimation(
-    sink: Sink,
-    element: *document.Element,
-    state: *document.CssAnimationState,
-) void {
-    state.completed_iterations += 1;
-    state.restart_pending = false;
-    const should_reverse = state.direction == .alternate;
-    if (element.animations) |*animations| {
-        for (document.css_animation_properties) |property| {
-            if (!state.contains(property)) continue;
-            if (animations.getPtr(property)) |animation| {
-                if (should_reverse) animation.reverse();
-                animation.reset();
-                publishValue(sink, element, property, animation, true);
-            }
-        }
-    }
-}
-
 fn invalidateRemovedCssAnimation(
     sink: Sink,
     element: *document.Element,
@@ -186,47 +167,31 @@ pub fn advance(sink: Sink, node: *document.Node) bool {
                 sink.requestPaint();
                 if (svg_animation.active(element, element.svg_time_seconds)) any_running = true;
             }
-            var skip_css_tracks = false;
             if (element.css_animation) |*state| {
-                if (state.restart_pending) {
-                    if (state.hasAnotherIteration()) {
-                        restartCssAnimation(sink, element, state);
-                        any_running = true;
-                    } else {
-                        const property_mask = state.property_mask;
-                        document.finishCssAnimationTracks(element);
-                        invalidateRemovedCssAnimation(sink, element, property_mask);
+                if (state.isRunning()) {
+                    const previous = state.progress;
+                    state.elapsed_frames += 1;
+                    state.publish(&element.animations.?);
+                    if (state.progress == null and previous != null) invalidateRemovedCssAnimation(sink, element, state.property_mask);
+                    if (state.progress != null and state.progress != previous) {
+                        for (document.css_animation_properties) |property| {
+                            if (state.contains(property)) {
+                                if (element.animations.?.getPtr(property)) |track| publishValue(sink, element, property, track, true);
+                            }
+                        }
                     }
-                    skip_css_tracks = true;
+                    any_running = state.isRunning() or any_running;
                 }
             }
-
             if (element.animations) |*animations| {
-                const css_animation_active = if (element.css_animation) |state| !state.finished else false;
-                var css_tracks_complete = css_animation_active;
                 var iterator = animations.iterator();
                 while (iterator.next()) |entry| {
-                    const is_css_track = if (element.css_animation) |state|
-                        !state.finished and state.contains(entry.key_ptr.*)
-                    else
-                        false;
-                    if (is_css_track and skip_css_tracks) continue;
-
-                    const animation = entry.value_ptr;
-                    if (!animation.isComplete()) {
-                        _ = animation.advance();
+                    if (element.css_animation) |state| if (state.contains(entry.key_ptr.*)) continue;
+                    const track = entry.value_ptr;
+                    if (!track.isComplete()) {
+                        _ = track.advance();
                         any_running = true;
-                        publishValue(sink, element, entry.key_ptr.*, animation, is_css_track);
-                    }
-                    if (is_css_track and !animation.isComplete()) css_tracks_complete = false;
-                }
-
-                if (!skip_css_tracks and css_animation_active and css_tracks_complete) {
-                    if (element.css_animation) |*state| {
-                        state.restart_pending = true;
-                        // Preserve the terminal endpoint for this render,
-                        // then schedule one more frame to restart or restore.
-                        any_running = true;
+                        publishValue(sink, element, entry.key_ptr.*, track, false);
                     }
                 }
             }

@@ -51,6 +51,7 @@ const FloatSide = box_model.FloatSide;
 const ClearSide = box_model.ClearSide;
 const PositionMode = box_model.PositionMode;
 const PositionOffset = box_model.PositionOffset;
+const sticky_position = @import("sticky_position.zig");
 const BoxEdges = box_model.BoxEdges;
 const FloatBox = box_model.FloatBox;
 const BoxModelEdges = box_model.BoxModelEdges;
@@ -671,10 +672,8 @@ const ImageLayout = struct {
         if (element) |live_element| if (live_element.style) |*style_map| {
             const background = if (animatedBackgroundColor(live_element.*)) |animated|
                 animated
-            else if (styleValue(style_map, "background-color")) |value|
-                parseColor(value)
             else
-                null;
+                styleColor(style_map, "background-color");
             if (background) |color| {
                 const radius = if (styleValue(style_map, "border-radius")) |value|
                     self.css_scale * parseCssPixelRadius(value)
@@ -702,6 +701,7 @@ const ImageLayout = struct {
                         y,
                         width,
                         height,
+                        self.border,
                         engine.layoutWindowWidth(),
                         engine.layoutWindowHeight(),
                         self.css_scale,
@@ -5231,7 +5231,7 @@ const InputLayout = struct {
         } else if (element.style) |*style_map| {
             if (styleValue(style_map, "background-color")) |bg| {
                 if (!std.ascii.eqlIgnoreCase(bg, "transparent")) {
-                    if (parseColor(bg)) |col| {
+                    if (styleColor(style_map, "background-color")) |col| {
                         self.bgcolor = col;
                     }
                 }
@@ -5362,6 +5362,7 @@ const InputLayout = struct {
                     y,
                     width_value,
                     height_value,
+                    self.box.border,
                     engine.layoutWindowWidth(),
                     engine.layoutWindowHeight(),
                     scaleCssFloat(1.0, self.embed.zoom, engine.zoom()),
@@ -5687,7 +5688,7 @@ const ButtonLayout = struct {
         } else if (element.style) |*style_map| {
             if (styleValue(style_map, "background-color")) |background| {
                 if (!std.ascii.eqlIgnoreCase(background, "transparent")) {
-                    if (parseColor(background)) |color| self.bgcolor = color;
+                    if (styleColor(style_map, "background-color")) |color| self.bgcolor = color;
                 }
             }
             if (styleValue(style_map, "border-radius")) |radius| {
@@ -5826,6 +5827,7 @@ const ButtonLayout = struct {
                     y,
                     self.embed.width,
                     self.embed.height,
+                    .{},
                     engine.layoutWindowWidth(),
                     engine.layoutWindowHeight(),
                     scaleCssFloat(1.0, self.embed.zoom, engine.zoom()),
@@ -6662,6 +6664,9 @@ pub const DocumentLayout = struct {
     node: Node,
     node_ptr: *Node,
     page_zoom: f32 = 1.0,
+    viewport_width: i32 = 0,
+    viewport_height: i32 = 0,
+    sticky_scroll_y: i32 = 0,
 
     zoom: ProtectedField(f32),
     x: ProtectedField(i32),
@@ -6748,6 +6753,8 @@ pub const DocumentLayout = struct {
         // Compute dimensions
         const zoom_value = combinedEffectiveZoom(engine.zoom(), engine.frame_css_zoom);
         self.page_zoom = engine.zoom();
+        self.viewport_width = engine.layoutWindowWidth() - engine.layoutScrollbarWidth();
+        self.viewport_height = engine.layoutWindowHeight();
         const x_value = scaleCssPixel(h_offset, zoom_value, engine.zoom());
         const y_value = scaleCssPixel(v_offset, zoom_value, engine.zoom());
         const width_value = engine.layoutWindowWidth() - engine.layoutScrollbarWidth() - (2 * x_value);
@@ -6793,6 +6800,21 @@ pub const DocumentLayout = struct {
 
         // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
+        _ = self.updateSticky(self.sticky_scroll_y);
+    }
+
+    /// On the serialized document worker after style and layout are clean.
+    /// Refresh visual offsets for painting, hit testing and CSSOM together;
+    /// normal-flow fields and their dependents stay clean during scrolling.
+    pub fn updateSticky(self: *DocumentLayout, scroll_y: i32) bool {
+        std.debug.assert(!self.layoutNeeded());
+        self.sticky_scroll_y = scroll_y;
+        var changed = false;
+        const viewport = element_geometry.Rect{ .width = @floatFromInt(self.viewport_width), .height = @floatFromInt(self.viewport_height) };
+        for (self.children.items) |child| {
+            changed = child.updateSticky(viewport, .{ .y = 0 -| scroll_y }) or changed;
+        }
+        return changed;
     }
 
     pub fn layoutNeeded(self: *const DocumentLayout) bool {
@@ -7067,6 +7089,7 @@ const BlockLayout = struct {
     /// separate from x/y prevents relative positioning from moving the slot
     /// used by a following sibling.
     position_offset: PositionOffset = .{},
+    laid_out_position: PositionMode = .static,
     /// Number of direct DOM children represented by the last successfully
     /// published block-child list. An accepted insertion matches those
     /// existing objects and creates layout objects only for new DOM gaps.
@@ -7914,6 +7937,7 @@ const BlockLayout = struct {
         specified_height: ?i32,
         natural_height: i32,
     ) void {
+        _ = specified_height;
         const node_ptr = self.node_ptr orelse return;
         switch (node_ptr.*) {
             .element => |*element| {
@@ -7922,16 +7946,40 @@ const BlockLayout = struct {
                 else
                     "visible";
                 const normalized = std.mem.trim(u8, overflow, " \t\r\n");
-                const enabled = specified_height != null and
-                    std.ascii.eqlIgnoreCase(normalized, "scroll");
+                const enabled = (node_ptr != self.document.node_ptr or !std.ascii.eqlIgnoreCase(element.tag, "html")) and
+                    (std.ascii.eqlIgnoreCase(normalized, "scroll") or
+                        std.ascii.eqlIgnoreCase(normalized, "auto") or
+                        std.ascii.eqlIgnoreCase(normalized, "hidden"));
                 element.setScrollGeometry(
                     enabled,
-                    specified_height orelse 0,
-                    natural_height,
+                    self.height.get().* -| self.border.vertical(),
+                    natural_height -| self.border.vertical(),
+                );
+                if (std.ascii.eqlIgnoreCase(normalized, "hidden")) element.scroll_interactive = false;
+                if (enabled) element.setHorizontalScrollGeometry(
+                    self.width.get().* -| self.border.horizontal(),
+                    self.scrollOverflowRight() -| self.x.get().* -| self.border.left +| self.padding.right,
                 );
             },
             .text => {},
         }
+    }
+
+    fn scrollOverflowRight(self: *const BlockLayout) i32 {
+        var right = self.x.get().* +| self.width.get().* -| self.border.right -| self.padding.right;
+        for (self.geometry_fragments.items) |fragment| {
+            const end = std.math.clamp(fragment.rect.x + fragment.rect.width, std.math.minInt(i32), std.math.maxInt(i32));
+            right = @max(right, @as(i32, @intFromFloat(end)));
+        }
+        for (self.children.items) |child| switch (child) {
+            .block => |block| {
+                right = @max(right, block.x.get().* +| block.width.get().*);
+                if (liveBlockElement(block)) |element| if (element.scroll_container) continue;
+                right = @max(right, block.scrollOverflowRight());
+            },
+            .line => {},
+        };
+        return right;
     }
 
     fn initAnonymous(
@@ -8343,7 +8391,8 @@ const BlockLayout = struct {
     ) void {
         self.position_offset = .{};
         const mode = self.positionMode();
-        if (mode == .static) return;
+        self.laid_out_position = mode;
+        if (mode == .static or mode == .sticky) return;
 
         const horizontal_context = parser.CssLengthResolutionContext{
             .font_size = self.computedFontSizeCss(),
@@ -8383,6 +8432,72 @@ const BlockLayout = struct {
                 self.position_offset.y = desired_y -| self.y.get().*;
             }
         }
+    }
+
+    fn updateSticky(self: *BlockLayout, nearest_port: element_geometry.Rect, inherited: PositionOffset) bool {
+        var ancestor = inherited;
+        if (self.laid_out_position == .fixed) ancestor = .{};
+        var changed = false;
+        if (self.laid_out_position == .sticky and self.embedded_box == null and self.inline_nodes == null) {
+            const parent = self.parent_block;
+            const factor: f64 = self.zoom.get().* / self.document.page_zoom;
+            const horizontal = parser.CssLengthResolutionContext{ .font_size = self.computedFontSizeCss(), .percentage_base = nearest_port.width / factor };
+            const vertical = parser.CssLengthResolutionContext{ .font_size = self.computedFontSizeCss(), .percentage_base = nearest_port.height / factor };
+            const left = self.specifiedPositionOffset("left", horizontal, self.document.page_zoom);
+            const right = self.specifiedPositionOffset("right", horizontal, self.document.page_zoom);
+            const top = self.specifiedPositionOffset("top", vertical, self.document.page_zoom);
+            const bottom = self.specifiedPositionOffset("bottom", vertical, self.document.page_zoom);
+            const cb_x = if (parent) |p| p.x.get().* +| p.border.left +| p.padding.left else self.document.x.get().*;
+            const cb_y = if (parent) |p| p.y.get().* +| p.border.top +| p.padding.top else self.document.y.get().*;
+            const cb_width = if (parent) |p| p.content_width else self.document.width.get().*;
+            const cb_height = if (parent) |p| p.content_height else self.document.height.get().*;
+            const next = PositionOffset{
+                .x = (sticky_position.Axis{
+                    .start = @floatFromInt(self.x.get().* +| ancestor.x),
+                    .size = @floatFromInt(self.width.get().*),
+                    .containing_start = @floatFromInt(cb_x +| ancestor.x),
+                    .containing_end = @floatFromInt(cb_x +| cb_width +| ancestor.x),
+                    .margin_start = @floatFromInt(self.margin.left),
+                    .margin_end = @floatFromInt(self.margin.right),
+                    .port_start = nearest_port.x,
+                    .port_size = nearest_port.width,
+                    .inset_start = if (left) |v| @floatFromInt(v) else null,
+                    .inset_end = if (right) |v| @floatFromInt(v) else null,
+                }).offsetPixels(),
+                .y = (sticky_position.Axis{
+                    .start = @floatFromInt(self.y.get().* +| ancestor.y),
+                    .size = @floatFromInt(self.height.get().*),
+                    .containing_start = @floatFromInt(cb_y +| ancestor.y),
+                    .containing_end = @floatFromInt(cb_y +| cb_height +| ancestor.y),
+                    .margin_start = @floatFromInt(self.margin.top),
+                    .margin_end = @floatFromInt(self.margin.bottom),
+                    .port_start = nearest_port.y,
+                    .port_size = nearest_port.height,
+                    .inset_start = if (top) |v| @floatFromInt(v) else null,
+                    .inset_end = if (bottom) |v| @floatFromInt(v) else null,
+                }).offsetPixels(),
+            };
+            if (!std.meta.eql(next, self.position_offset)) {
+                self.position_offset = next;
+                self.markPaint(false);
+                changed = true;
+            }
+        }
+        ancestor.x +|= self.position_offset.x;
+        ancestor.y +|= self.position_offset.y;
+        var port = nearest_port;
+        if (liveBlockElement(self)) |element| {
+            if (element.scroll_container) {
+                port = .{ .x = @floatFromInt(self.x.get().* +| ancestor.x +| self.border.left), .y = @floatFromInt(self.y.get().* +| ancestor.y +| self.border.top), .width = @floatFromInt(self.width.get().* -| self.border.horizontal()), .height = @floatFromInt(self.height.get().* -| self.border.vertical()) };
+                ancestor.x -|= element.scroll_x;
+                ancestor.y -|= element.scroll_y;
+            }
+        }
+        for (self.children.items) |child| switch (child) {
+            .block => |block| changed = block.updateSticky(port, ancestor) or changed,
+            .line => {},
+        };
+        return changed;
     }
 
     fn floatBoundsAt(
@@ -10215,6 +10330,7 @@ const BlockLayout = struct {
                 .radius = effects.border_radius,
             },
             .scroll_y = blockHitScrollY(self),
+            .scroll_x = if (liveBlockElement(self)) |element| element.scroll_x else 0,
         }) orelse return null;
         const local = localized.local;
         const content_point = localized.content;
@@ -11208,6 +11324,15 @@ fn parseColor(color_str: []const u8) ?browser.Color {
     return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
 }
 
+/// Borrow clean style fields only during paint/measurement. Resolve currentcolor
+/// against this element before accessibility color remapping or premultiplication.
+fn styleColor(styles: *const parser.StyleMap, property: []const u8) ?browser.Color {
+    const value = styleValue(styles, property) orelse return null;
+    const foreground = styleValue(styles, "color") orelse "black";
+    const color = (@import("../../document/color.zig").resolve(value, foreground) orelse return null).color;
+    return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
+}
+
 const TextShadow = struct {
     color: browser.Color,
     x: i32,
@@ -11271,12 +11396,13 @@ const CanvasBackground = struct {
 };
 
 fn hasCanvasBackground(element: *const parser.Element) bool {
-    if (animatedBackgroundColor(element.*) != null) return true;
-    const styles = if (element.style) |*style_map| style_map else return false;
     if (backgroundImagePaint(element) != null) return true;
+    if (animatedBackgroundColor(element.*)) |color| return color.a != 0;
+    const styles = if (element.style) |*style_map| style_map else return false;
     const value = styleValue(styles, "background-color") orelse return false;
-    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "transparent")) return false;
-    return parseColor(value) != null;
+    const foreground = styleValue(styles, "color") orelse "black";
+    // Propagation depends on CSS transparency before RGBA8 paint quantization.
+    return (@import("../../document/color.zig").resolve(value, foreground) orelse return false).alpha != 0;
 }
 
 /// CSS propagates the body background to the canvas when the root element has
@@ -11307,9 +11433,8 @@ fn rootCanvasBackgroundColor(document: *const DocumentLayout) ?browser.Color {
     const background = rootCanvasBackground(document) orelse return null;
     if (animatedBackgroundColor(background.element.*)) |color| return color;
     const styles = if (background.element.style) |*style_map| style_map else return null;
-    const value = styleValue(styles, "background-color") orelse return null;
-    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "transparent")) return null;
-    return parseColor(value);
+    const color = styleColor(styles, "background-color") orelse return null;
+    return if (color.a == 0) null else color;
 }
 
 fn rootCanvasBackgroundImage(document: *const DocumentLayout) ?BackgroundImagePaint {
@@ -11333,7 +11458,7 @@ test "layout reads the current background color animation value" {
     try element.animations.?.put("background-color", .{ .color = color });
 
     try std.testing.expectEqual(
-        browser.Color{ .r = 128, .g = 0, .b = 128, .a = 128 },
+        browser.Color{ .r = 0, .g = 0, .b = 255, .a = 128 },
         animatedBackgroundColor(element).?,
     );
 }
@@ -11376,6 +11501,13 @@ test "body background color propagates when html is transparent" {
         browser.Color{ .r = 192, .g = 192, .b = 192, .a = 255 },
         rootCanvasBackgroundColor(document).?,
     );
+    for ([_][]const u8{ "rgba(255, 0, 0, 0)", "#0000", "currentcolor" }) |transparent| {
+        try setTestStyleValue(allocator, &root_node, "color", "transparent");
+        try setTestStyleValue(allocator, &root_node, "background-color", transparent);
+        try std.testing.expectEqual(&root_node.element.children.items[0], rootCanvasBackground(document).?.node);
+    }
+    try setTestStyleValue(allocator, &root_node, "color", "rgb(0 0 0 / .0001)");
+    try std.testing.expectEqual(&root_node, rootCanvasBackground(document).?.node);
 }
 
 test "root overflow hidden removes the viewport scrollbar gutter" {
@@ -11458,6 +11590,7 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
                     0,
                     self.layoutWindowWidth(),
                     @max(content_height, self.toLayoutPx(self.window_height)),
+                    .{},
                     self.layoutWindowWidth(),
                     self.layoutWindowHeight(),
                     @floatCast(self.zoom()),
@@ -12244,6 +12377,7 @@ fn applyElementScroll(
         block.allocator,
         commands,
         content_start,
+        if (element.scroll_container) @max(element.scroll_x, 0) else 0,
         if (element.scroll_container) @max(element.scroll_y, 0) else 0,
         opaqueElementForNode(block.node_ptr),
         displaySource(block, block.node_ptr),
@@ -12287,11 +12421,7 @@ fn borderColorForSide(
     element: *const parser.Element,
     property: []const u8,
 ) browser.Color {
-    const value = styleValue(style_map, property) orelse "currentColor";
-    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "currentColor")) {
-        return self.remapColor(textColorForElement(element), .border);
-    }
-    return self.remapColor(parseColor(value) orelse textColorForElement(element), .border);
+    return self.remapColor(styleColor(style_map, property) orelse textColorForElement(element), .border);
 }
 
 fn textColorForElement(element: *const parser.Element) browser.Color {
@@ -12382,7 +12512,7 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
     if (animatedBackgroundColor(element.*)) |animated| {
         color = animated;
     } else if (bgcolor_str) |bg| {
-        if (!std.ascii.eqlIgnoreCase(bg, "transparent")) color = parseColor(bg);
+        if (!std.ascii.eqlIgnoreCase(bg, "transparent")) color = styleColor(styles.?, "background-color");
     } else if (std.mem.eql(u8, element.tag, "pre")) {
         color = .{ .r = 230, .g = 230, .b = 230, .a = 255 };
     }
@@ -12429,6 +12559,7 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
                     block_y,
                     block_width,
                     block_height,
+                    block.border,
                     self.layoutWindowWidth(),
                     self.layoutWindowHeight(),
                     scaleBlockCssFloat(block, 1.0),

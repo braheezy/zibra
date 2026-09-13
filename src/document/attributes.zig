@@ -6,6 +6,9 @@ pub const Map = struct {
     const Storage = std.array_hash_map.String([]const u8);
     allocator: std.mem.Allocator,
     storage: Storage = .empty,
+    /// Changes even when authored style text is replaced with identical bytes.
+    /// CSSOM may retain pending substitutions that text cannot represent.
+    style_revision: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Map {
         return .{ .allocator = allocator };
@@ -41,16 +44,20 @@ pub const Map = struct {
     /// A replacement preserves its list position; a new name appends.
     pub fn put(self: *Map, name: []const u8, value: []const u8) !void {
         try self.storage.put(self.allocator, name, value);
+        if (std.mem.eql(u8, name, "style")) self.style_revision +%= 1;
     }
 
     /// Requires pre-reserved capacity; does not transfer string ownership.
     pub fn putAssumeCapacity(self: *Map, name: []const u8, value: []const u8) void {
         self.storage.putAssumeCapacity(name, value);
+        if (std.mem.eql(u8, name, "style")) self.style_revision +%= 1;
     }
 
     /// Remove without reordering the surviving attributes.
     pub fn orderedRemove(self: *Map, name: []const u8) bool {
-        return self.storage.orderedRemove(name);
+        const removed = self.storage.orderedRemove(name);
+        if (removed and std.mem.eql(u8, name, "style")) self.style_revision +%= 1;
+        return removed;
     }
 };
 

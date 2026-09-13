@@ -32,6 +32,7 @@ pub const ClearSide = enum {
 pub const PositionMode = enum {
     static,
     relative,
+    sticky,
     absolute,
     /// Positioned against the owning frame viewport and excluded from normal
     /// flow. The renderer consumes its paint group in viewport coordinates.
@@ -118,6 +119,7 @@ pub fn parseClearSide(value: []const u8) ClearSide {
 pub fn parsePositionMode(value: []const u8) PositionMode {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (std.ascii.eqlIgnoreCase(trimmed, "relative")) return .relative;
+    if (std.ascii.eqlIgnoreCase(trimmed, "sticky")) return .sticky;
     if (std.ascii.eqlIgnoreCase(trimmed, "absolute")) return .absolute;
     if (std.ascii.eqlIgnoreCase(trimmed, "fixed")) return .fixed;
     return .static;
@@ -643,7 +645,7 @@ test "position float clear and dimension values normalize independently of layou
     try std.testing.expectEqual(PositionMode.relative, parsePositionMode(" RELATIVE "));
     try std.testing.expectEqual(PositionMode.absolute, parsePositionMode("absolute"));
     try std.testing.expectEqual(PositionMode.fixed, parsePositionMode("fixed"));
-    try std.testing.expectEqual(PositionMode.static, parsePositionMode("sticky"));
+    try std.testing.expectEqual(PositionMode.sticky, parsePositionMode("sticky"));
 
     try std.testing.expectEqual(@as(?i32, 240), parseCssPixelLength("240px"));
     try std.testing.expectEqual(@as(?i32, 12), parseCssPixelLength(" 12.75PX "));

@@ -8,12 +8,24 @@
 pub const Property = struct {
     name: []const u8,
     default_value: []const u8,
+    /// Primitive value family after shorthand expansion. Color keywords stay
+    /// specified in declaration blocks and resolve for computed-style readback.
+    serialization: enum { tokens, length, color, position } = .tokens,
 };
+
+/// Static metadata for a canonical lowercase longhand name; no storage is owned.
+pub fn get(name: []const u8) ?Property {
+    for (computed) |property| {
+        if (@import("std").mem.eql(u8, name, property.name)) return property;
+    }
+    return null;
+}
 
 pub const Shorthand = struct { name: []const u8, longhands: []const []const u8 };
 
 /// Reset targets shared by CSS-wide keywords and pending var() shorthands.
 pub const shorthands = [_]Shorthand{
+    .{ .name = "animation", .longhands = &@import("css_animation.zig").names },
     .{ .name = "flex", .longhands = &.{ "flex-grow", "flex-shrink", "flex-basis" } },
     .{ .name = "flex-flow", .longhands = &.{ "flex-direction", "flex-wrap" } },
     .{ .name = "gap", .longhands = &.{ "row-gap", "column-gap" } },
@@ -37,7 +49,7 @@ pub const shorthands = [_]Shorthand{
 /// Static longhand registry used to initialize and recognize computed styles.
 pub const computed = svgProperties() ++ [_]Property{
     .{ .name = "font-family", .default_value = "inherit" },
-    .{ .name = "font-size", .default_value = "inherit" },
+    .{ .name = "font-size", .default_value = "inherit", .serialization = .length },
     .{ .name = "font-weight", .default_value = "inherit" },
     .{ .name = "font-style", .default_value = "inherit" },
     .{ .name = "font-variant", .default_value = "inherit" },
@@ -48,7 +60,7 @@ pub const computed = svgProperties() ++ [_]Property{
     .{ .name = "vertical-align", .default_value = "inherit" },
     .{ .name = "text-align", .default_value = "inherit" },
     .{ .name = "list-style-type", .default_value = "inherit" },
-    .{ .name = "color", .default_value = "inherit" },
+    .{ .name = "color", .default_value = "inherit", .serialization = .color },
     // Paint-only text decoration. The renderer currently consumes the
     // single-shadow form (color plus x/y offsets), while retaining the
     // authored value for future blur/list support.
@@ -59,38 +71,45 @@ pub const computed = svgProperties() ++ [_]Property{
     .{ .name = "content", .default_value = "normal" },
     .{ .name = "opacity", .default_value = "1.0" },
     .{ .name = "transition", .default_value = "" },
-    .{ .name = "animation", .default_value = "none" },
+    .{ .name = "animation-duration", .default_value = "0s" },
+    .{ .name = "animation-timing-function", .default_value = "ease" },
+    .{ .name = "animation-delay", .default_value = "0s" },
+    .{ .name = "animation-iteration-count", .default_value = "1" },
+    .{ .name = "animation-direction", .default_value = "normal" },
+    .{ .name = "animation-fill-mode", .default_value = "none" },
+    .{ .name = "animation-play-state", .default_value = "running" },
+    .{ .name = "animation-name", .default_value = "none" },
     .{ .name = "transform", .default_value = "none" },
     .{ .name = "filter", .default_value = "none" },
     .{ .name = "mix-blend-mode", .default_value = "" },
-    .{ .name = "border-radius", .default_value = "0px" },
-    .{ .name = "margin-top", .default_value = "0px" },
-    .{ .name = "margin-right", .default_value = "0px" },
-    .{ .name = "margin-bottom", .default_value = "0px" },
-    .{ .name = "margin-left", .default_value = "0px" },
-    .{ .name = "padding-top", .default_value = "0px" },
-    .{ .name = "padding-right", .default_value = "0px" },
-    .{ .name = "padding-bottom", .default_value = "0px" },
-    .{ .name = "padding-left", .default_value = "0px" },
-    .{ .name = "border-top-width", .default_value = "0px" },
-    .{ .name = "border-right-width", .default_value = "0px" },
-    .{ .name = "border-bottom-width", .default_value = "0px" },
-    .{ .name = "border-left-width", .default_value = "0px" },
+    .{ .name = "border-radius", .default_value = "0px", .serialization = .length },
+    .{ .name = "margin-top", .default_value = "0px", .serialization = .length },
+    .{ .name = "margin-right", .default_value = "0px", .serialization = .length },
+    .{ .name = "margin-bottom", .default_value = "0px", .serialization = .length },
+    .{ .name = "margin-left", .default_value = "0px", .serialization = .length },
+    .{ .name = "padding-top", .default_value = "0px", .serialization = .length },
+    .{ .name = "padding-right", .default_value = "0px", .serialization = .length },
+    .{ .name = "padding-bottom", .default_value = "0px", .serialization = .length },
+    .{ .name = "padding-left", .default_value = "0px", .serialization = .length },
+    .{ .name = "border-top-width", .default_value = "0px", .serialization = .length },
+    .{ .name = "border-right-width", .default_value = "0px", .serialization = .length },
+    .{ .name = "border-bottom-width", .default_value = "0px", .serialization = .length },
+    .{ .name = "border-left-width", .default_value = "0px", .serialization = .length },
     .{ .name = "border-top-style", .default_value = "none" },
     .{ .name = "border-right-style", .default_value = "none" },
     .{ .name = "border-bottom-style", .default_value = "none" },
     .{ .name = "border-left-style", .default_value = "none" },
-    .{ .name = "border-top-color", .default_value = "currentColor" },
-    .{ .name = "border-right-color", .default_value = "currentColor" },
-    .{ .name = "border-bottom-color", .default_value = "currentColor" },
-    .{ .name = "border-left-color", .default_value = "currentColor" },
+    .{ .name = "border-top-color", .default_value = "currentColor", .serialization = .color },
+    .{ .name = "border-right-color", .default_value = "currentColor", .serialization = .color },
+    .{ .name = "border-bottom-color", .default_value = "currentColor", .serialization = .color },
+    .{ .name = "border-left-color", .default_value = "currentColor", .serialization = .color },
     .{ .name = "overflow", .default_value = "visible" },
     .{ .name = "outline", .default_value = "none" },
-    .{ .name = "background-color", .default_value = "transparent" },
+    .{ .name = "background-color", .default_value = "transparent", .serialization = .color },
     .{ .name = "background-image", .default_value = "none" },
     .{ .name = "background-size", .default_value = "auto" },
     .{ .name = "background-repeat", .default_value = "repeat" },
-    .{ .name = "background-position", .default_value = "0 0" },
+    .{ .name = "background-position", .default_value = "0% 0%", .serialization = .position },
     .{ .name = "background-attachment", .default_value = "scroll" },
     .{ .name = "object-fit", .default_value = "fill" },
     .{ .name = "aspect-ratio", .default_value = "auto" },
@@ -102,10 +121,10 @@ pub const computed = svgProperties() ++ [_]Property{
     .{ .name = "flex-wrap", .default_value = "nowrap" },
     .{ .name = "flex-grow", .default_value = "0" },
     .{ .name = "flex-shrink", .default_value = "1" },
-    .{ .name = "flex-basis", .default_value = "auto" },
+    .{ .name = "flex-basis", .default_value = "auto", .serialization = .length },
     .{ .name = "order", .default_value = "0" },
-    .{ .name = "row-gap", .default_value = "normal" },
-    .{ .name = "column-gap", .default_value = "normal" },
+    .{ .name = "row-gap", .default_value = "normal", .serialization = .length },
+    .{ .name = "column-gap", .default_value = "normal", .serialization = .length },
     .{ .name = "justify-content", .default_value = "normal" },
     .{ .name = "align-content", .default_value = "normal" },
     .{ .name = "align-items", .default_value = "normal" },
@@ -116,22 +135,22 @@ pub const computed = svgProperties() ++ [_]Property{
     .{ .name = "grid-template-rows", .default_value = "none" },
     .{ .name = "grid-auto-rows", .default_value = "auto" },
     .{ .name = "position", .default_value = "static" },
-    .{ .name = "top", .default_value = "auto" },
-    .{ .name = "right", .default_value = "auto" },
-    .{ .name = "bottom", .default_value = "auto" },
-    .{ .name = "left", .default_value = "auto" },
+    .{ .name = "top", .default_value = "auto", .serialization = .length },
+    .{ .name = "right", .default_value = "auto", .serialization = .length },
+    .{ .name = "bottom", .default_value = "auto", .serialization = .length },
+    .{ .name = "left", .default_value = "auto", .serialization = .length },
     // `auto` is observably different from an explicit zero: both occupy the
     // positioned auto/zero paint phase, but only an explicit integer creates
     // the stacking-level semantics needed by nested contexts.
     .{ .name = "z-index", .default_value = "auto" },
     .{ .name = "scroll-behavior", .default_value = "auto" },
     .{ .name = "zoom", .default_value = "1" },
-    .{ .name = "width", .default_value = "auto" },
-    .{ .name = "min-width", .default_value = "0px" },
-    .{ .name = "max-width", .default_value = "none" },
-    .{ .name = "height", .default_value = "auto" },
-    .{ .name = "min-height", .default_value = "0px" },
-    .{ .name = "max-height", .default_value = "none" },
+    .{ .name = "width", .default_value = "auto", .serialization = .length },
+    .{ .name = "min-width", .default_value = "0px", .serialization = .length },
+    .{ .name = "max-width", .default_value = "none", .serialization = .length },
+    .{ .name = "height", .default_value = "auto", .serialization = .length },
+    .{ .name = "min-height", .default_value = "0px", .serialization = .length },
+    .{ .name = "max-height", .default_value = "none", .serialization = .length },
     .{ .name = "float", .default_value = "none" },
     .{ .name = "clear", .default_value = "none" },
 };

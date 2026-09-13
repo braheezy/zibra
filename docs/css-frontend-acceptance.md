@@ -33,11 +33,11 @@ The dependency, generated import bridge, syntax adapter, admission wrapper,
 normalization layer and inspection inline-declaration cache were removed.
 AST-specific tests and duplicate backend pipeline runs no longer apply.
 
-The [manual recovery fixture](../tests/manual/css-recovery.html) retains the
-known native gaps for declarations after unknown nested at-rules and a final
-rule closed by EOF. The old experimental path produced two 120px green bars;
-the native parser currently produces two 24px bars, with the second red. Those
-experimental recovery goldens are not relabeled as passing native behavior.
+At retirement, the [manual recovery fixture](../tests/manual/css-recovery.html)
+exposed native gaps after unknown nested at-rules and a final block closed by
+EOF. Subsequent native structural parsing fixes these gaps and adds dedicated
+pipeline coverage. See the [CSS plan](../CSS_PLAN.md) for the implementation
+and its focused WPT baseline.
 Escaped color-value normalization and comment-separated importance likewise
 remain native-parser work; retaining syntax is not equivalent to CSSOM support.
 

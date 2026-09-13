@@ -1,0 +1,13 @@
+# Ordered inline CSSOM, priority, mutation, serialization, and cloned owners.
+# Keep partial failures visible: MutationObserver, base URL changes and all
+# shorthand support remain separate capabilities in css-style-attr-decl-block.
+tests:
+  - css/cssom/cssstyledeclaration-csstext-final-delimiter.html
+  - css/cssom/cssstyledeclaration-csstext-important.html
+  - css/cssom/cssstyledeclaration-setter-declarations.html
+  - css/cssom/css-style-attr-decl-block.html
+  - css/cssom/serialize-variable-reference.html
+reftests:
+  - css/cssom/style-attr-clone.html
+crashtests:
+  - css/cssom/declaration-block-all-crash.html

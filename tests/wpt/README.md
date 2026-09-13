@@ -63,6 +63,209 @@ the result-collection tasks (`wpt`, `wpt-all`, `latest-results`, category runs,
 
 ### Focused compatibility manifests
 
+[`manifest-css-declarations.yaml`](manifest-css-declarations.yaml) selects five
+inline CSSOM testharness files, a clone-isolation reftest and a declaration-block
+crashtest. All seven are enabled in the default allowlist. The comparison improved
+from 2/7 to 6/7 passing files and 6/19 to 16/19 passing assertions, with no errors,
+crashes, timeouts or infrastructure failures. Use `--mode all --jobs 1`;
+`--fail-on-unexpected` exits nonzero for the remaining upstream failure.
+
+`css-style-attr-decl-block.html` still fails two MutationObserver assertions and
+its base-URL test first encounters missing computed `backgroundImage` readback.
+Its `all:unset`/`all:revert` comparison passes because both unsupported `all`
+declarations are ignored, so that assertion does not establish `all` support.
+The declaration-block crashtest likewise has limited reach until computed-style
+enumeration is implemented. The host/unit tests and
+[regression page](../manual/css-declarations.html) directly exercise ordered
+longhands, pending shorthand ownership and native layout instead. Whole
+stylesheet/rule CSSOM and additional property grammars remain separate slices.
+
+[`manifest-css-values.yaml`](manifest-css-values.yaml) selects five testharness
+files for EOF recovery, token boundaries, custom URL data, specified-value
+serialization and numeric colors, plus two escaped-value reftests and an escape
+crashtest. The seven new cases are enabled in the default allowlist; the
+crashtest was already enabled. Run with `--mode all --jobs 1`.
+
+The focused comparison improved from 2/8 to 5/8 passing files and from 432/794
+to 539/794 passing assertions, with no assertion regressions, errors, crashes,
+timeouts or infrastructure failures. `serialize-values.html` retains unsupported
+property and shorthand serialization failures. At that checkpoint,
+`color-valid.html` failed the four-argument `rgb()` alias and `light-dark()` cases,
+and `escaped-ident-spaces-001.xht` needed escaped selector identifiers. The
+grammar slice below addresses aliases and selectors. Keep these upstream
+PASS expectations unchanged. Stylesheet-identity-dependent serialization cases
+were reviewed but not newly enabled because they exercise the older stylesheet
+shim. Native unit/host tests and the [value regression page](../manual/css-values.html)
+cover owned normalized declarations, escaped custom names, malformed input,
+resource URL decoding and immediate layout independently of that shim.
+The declaration and structural manifests were rerun alongside the value suite
+and retained the results recorded here, without new errors or failures.
+
+[`manifest-css-grammar.yaml`](manifest-css-grammar.yaml) covers escaped
+selectors, absolute RGB/HSL grammar and serialization, and single-layer
+background positions: seven testharness files, six reftests and an existing
+escape crashtest. Run with `--mode all --jobs 1`. Eleven cases were newly
+enabled in the default allowlist; the DOM escape suite, one escaped-value
+reftest and the crashtest were already included. Related background/color
+crashtests were reviewed, but their stylesheet shim, multiple-layer, animation
+or unsupported SVG prerequisites do not exercise this slice fully.
+
+The [native page](../manual/css-grammar.html) also checks escaped-selector
+attribute mutations with synchronous layout, custom-property color substitution,
+background shorthand round trips and bordered image positioning. Native
+owner/render tests cover allocation failures, stylesheet replacement, alpha
+precision, used fonts/zoom, negative percentage bases and extreme signed tile
+offsets. Typed color math and exact surrogate preservation in DOM attribute
+storage remain separate capabilities; upstream PASS expectations are unchanged.
+
+The saved-browser comparison improved from 3/14 to 11/14 passing files and
+from 133/292 to 228/292 passing assertions, without regressions, errors, crashes,
+timeouts or infrastructure failures. All six reftests and the crashtest pass.
+Both background-position grammar suites and both invalid-color suites pass.
+The remaining 64 assertions are 62 typed-color-math cases and two selectors
+whose DOM attribute values contain lone UTF-16 surrogates. The latter reach
+the selector as replacement characters because attribute storage loses those
+original code units; changing CSS escape decoding would be incorrect.
+
+The earlier value manifest was rerun against this implementation: it improved
+from 5/8 to 6/8 passing files and from 539/794 to 628/794 passing assertions,
+also without regressions or infrastructure failures. Its remaining files cover
+unsupported property/shorthand serialization and `light-dark()`; both escaped
+identifier reftests and the four-argument `rgb()` alias now pass.
+
+[`manifest-css-selectors.yaml`](manifest-css-selectors.yaml) reviews logical
+selector lists, specificity, invalidation and nth-formula recovery. On
+2026-09-12 its 17 cases improved from 6 to 8 passing files compared with the
+saved pre-change browser: nested logical/link styling and the negated-is
+ancestor-change reference now pass. All four references and all three crash
+cases pass; there are no regressions, engine crashes, runner errors or
+infrastructure failures. Only 22 testharness assertions execute: 1 passes,
+19 fail on missing named Window globals during parser-time scripts, and 2 stop
+at computed named-color serialization (`green` versus `rgb(0, 128, 0)`). Two
+additional files time out after named-global script errors before assertions
+run. These are prerequisites, not evidence of failed selector matching.
+
+Eight CSS cases are newly enabled in the default allowlist: the sibling
+invalidation test, four references and three crash cases. The focused
+manifest retains the other cases for diagnosis; their global-access blockers
+are not hidden by altered expectations. DOM query receiver exclusion was
+already covered by the default `dom` directory. Selector-text CSSOM parsing,
+namespace/shadow suites and nth `of` lists were reviewed but remain outside
+this implementation. The native tests additionally cover the static-specificity
+cascade from `is-specificity.html` without its named-global prerequisite.
+
+The [logical-selector page](../manual/css-selectors.html) passes five local
+checks through native DOM queries and immediate geometry reads after
+ancestor/sibling and inline changes. It is part of `zig build test-wpt`.
+
+[`manifest-css-supports.yaml`](manifest-css-supports.yaml) covers both
+`CSS.supports` overloads, recursively strict selector queries, CSSStyleDeclaration
+consistency, boolean rule activation, media nesting, invalid child-rule recovery,
+keyframes, variable values and malformed supports blocks. It also includes five
+computed-color files previously blocked by the absent API. Run with
+`--mode all --jobs 1 --timeout-ms 60000`. The initial feature-query work enabled 48 of these
+50 cases. The original comparison improved from 3/50 to 45/50 passing files
+and from 133/5933 to 5858/5933 passing assertions, without crashes, timeouts or
+infrastructure failures. Its remaining gaps motivated the implementation below:
+nesting in `at-supports-048.html`, animation fill modes in
+`at-supports-content-003.html`, RGB/HSL computations and sticky positioning.
+
+The suite review also covered conditional CSSOM/IDL and `conditionText` tests,
+namespace cases, font queries, `@font-face`/`@counter-style` children and quirks
+mode. These need persistent stylesheet/rule objects, namespace ownership,
+downloadable fonts/counters or document-mode grammar that this slice does not
+supply. They were not broadly enabled. Native tests cover source/keyframe
+ownership and allocation-failure publication; the
+[feature-query page](../manual/css-supports.html) covers API/rule agreement and
+media-dependent native geometry in the local WPT gate.
+
+### Color calculations, nesting, animation and sticky
+
+[`manifest-css-completion.yaml`](manifest-css-completion.yaml) selects 57
+unchanged upstream cases across testharness, rendering and crash coverage.
+The default allowlist gains 45 explicit cases, including the two conditional
+references previously waiting on nesting and animation fill modes. Coverage
+includes computed/specified RGB/HSL, animation longhand parsing/computation,
+nested rule order and invalidation, and sticky scrolling/containing limits.
+CSSOM selectorText mutation (`invalidation-004.html`), the combined automatic
+duration/scroll-timeline file, two implicit-nesting tests using named window
+globals and `position-sticky-top-004.html` with its CDATA-bearing XHTML reference
+remain focused diagnostics because their prerequisites are not implemented.
+Their PASS expectations remain intact. Run with `--mode all --jobs 1
+--timeout-ms 60000`; the large computed-HSL matrix can exceed the default
+10-second session deadline.
+
+With the same 60-second per-case limit, the saved-browser comparison improves
+from 14/57 to 41/57 passing files and from 3938/4154 to 4063/4154 passing
+assertions. No previously passing file regresses. The final report has 15
+failing files and one error in the automatic-duration/scroll-timeline diagnostic,
+with no crashes, timeouts or infrastructure failures. The nesting references,
+all three fill-mode files and the vertical sticky testharness cases pass.
+The stacking-context reference improves from 44,400 to 8,800 differing pixels;
+its remaining absolute-position geometry mismatch is kept visible.
+
+The original 50-file feature-query selection now passes 48/50 files and
+5929/5933 assertions, up from 45/50 and 5858/5933. Its only four remaining
+assertion failures require container-unit color math. Both formerly diagnostic
+conditional references and positive sticky parsing now pass.
+
+The native implementation and remaining boundaries are recorded in the
+[CSS plan](../../CSS_PLAN.md#color-calculations-nesting-animation-phases-and-sticky-positioning).
+Container units, canonical relative-expression serialization and atomic-inline
+sticky geometry still produce useful semantic failures. Some specified-color
+cases retain older missing-component serialization expectations; the current
+[CSS Color draft](https://drafts.csswg.org/css-color-4/#serializing-sRGB-values)
+preserves `none` via `color(srgb ...)` or percentage-bearing modern HSL. These
+expectations are reported unchanged, separately from missing arithmetic support.
+Specifically, 16 previously passing specified-RGB assertions and nine HSL
+assertions now disagree with those older missing-component expectations;
+computed missing-component cases pass. This is a documented serialization
+choice, not a claim that every upstream assertion improved.
+The local [`css-completion.html`](../manual/css-completion.html) fixture checks
+native geometry and live edits without upstream CSSOM/timeline prerequisites.
+
+[`manifest-css-colors.yaml`](manifest-css-colors.yaml) covers resolved sRGB
+color values and currentcolor inheritance/paint. Its bounded selection includes
+invalid named keywords, computed colors, the existing selector invalidation
+test, named/currentcolor/transparent references and malformed SVG color syntax.
+Run with `--mode all --jobs 1`. Default coverage adds invalid named-color parsing,
+`named-001.html`, `currentcolor-001.html`, `currentcolor-002.html`, and
+`crashtests/stop-color-invalid-rgb.html`. The selector case was already enabled.
+
+The five computed-color helper files now reach values through native
+`CSS.supports` and are enabled by default as part of feature-query coverage.
+The older XHTML references also exercise the known CDATA stylesheet-loading gap;
+a matching pair does not prove that its CDATA-wrapped rules were styled.
+Modern HTML currentcolor references and the
+[native color page](../manual/css-colors.html) avoid that prerequisite.
+
+The saved-browser comparison improved from 3/16 to 5/16 passing files and
+184/4515 to 186/4515 passing assertions, without regressions, timeouts, crashes
+or infrastructure errors. Named-color rendering and selector invalidation now
+pass. All 4329 remaining assertions stop at missing `CSS.supports`.
+Both modern currentcolor references improve from 36315 differing pixels to
+231 pixels with a maximum channel delta of one. A temporary diagnostic removing
+their same-color text matches the unmodified green-square reference exactly,
+isolating the remaining difference to glyph compositing precision. These
+upstream references still count as failures; no tolerance or expectation changed.
+
+The native page runs in `zig build test-wpt` and covers copied/live readback,
+alpha, names, custom substitution and ancestor mutations. Retained-render tests
+check background recoloring while geometry stays clean. System colors, relative
+and wide-gamut colors, typed color math, missing RGB component preservation and
+full color animation/interpolation remain separate capabilities; upstream
+expectations are unchanged.
+
+[`manifest-css-structure.yaml`](manifest-css-structure.yaml) covers structural
+CSS recovery with one testharness case, five reftests and two crashtests. Use
+`--mode all --jobs 1 --fail-on-unexpected`; all eight cases also appear in the
+default allowlist. The initial implementation improved the focused result from
+5/8 to 7/8 passing cases. `matching-brackets-001.xht` still fails because the
+document loader passes its XHTML CDATA wrapper into CSS; removing just that
+wrapper in an isolated HTML diagnostic produces the expected computed colors.
+Keep this integration gap visible with the unchanged upstream PASS expectation.
+See the [CSS plan](../../CSS_PLAN.md) for syntax, ownership and CSSOM boundaries.
+
 [`manifest-dataset.yaml`](manifest-dataset.yaml) selects six HTML `dataset`
 files covering live data-* reflection, name conversion, deletion, enumeration,
 and prototype behavior. These six cases are also in the default allowlist.

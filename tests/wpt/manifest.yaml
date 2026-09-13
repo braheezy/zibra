@@ -15,6 +15,78 @@ directories:
   - selection
   - uievents
 tests:
+  - css/css-nesting/nested-error-recovery.html
+  # CSS calculation, nesting, animation and sticky capability coverage.
+  - css/css-animations/parsing/animation-fill-mode-valid.html
+  - css/css-animations/parsing/animation-fill-mode-invalid.html
+  - css/css-animations/parsing/animation-fill-mode-computed.html
+  - css/css-animations/parsing/animation-direction-valid.html
+  - css/css-animations/parsing/animation-direction-invalid.html
+  - css/css-animations/parsing/animation-direction-computed.html
+  - css/css-animations/parsing/animation-play-state-valid.html
+  - css/css-animations/parsing/animation-play-state-invalid.html
+  - css/css-animations/parsing/animation-play-state-computed.html
+  - css/css-animations/parsing/animation-delay-valid.html
+  - css/css-animations/parsing/animation-delay-invalid.html
+  - css/css-animations/parsing/animation-delay-computed.html
+  - css/css-animations/parsing/animation-duration-valid.html
+  - css/css-animations/parsing/animation-duration-invalid.html
+  - css/css-animations/parsing/animation-iteration-count-valid.html
+  - css/css-animations/parsing/animation-iteration-count-invalid.html
+  - css/css-animations/parsing/animation-iteration-count-computed.html
+  - css/css-nesting/mixed-declarations-rules.html
+  - css/css-nesting/invalidation-001.html
+  - css/css-nesting/invalidation-002.html
+  - css/css-nesting/invalidation-003.html
+  - css/css-position/sticky/position-sticky-top.html
+  - css/css-position/sticky/position-sticky-bottom.html
+  - css/css-position/sticky/position-sticky-left.html
+  - css/css-position/sticky/position-sticky-right.html
+  - css/css-position/sticky/position-sticky-nested-top.html
+  - css/css-position/sticky/position-sticky-nested-bottom.html
+  - css/css-position/sticky/position-sticky-top-and-bottom.html
+  - css/css-position/sticky/position-sticky-overflow-hidden.html
+  - css/css-display/parsing/display-invalid.html
+  - css/css-position/parsing/position-invalid.html
+  - css/css-position/parsing/position-valid.html
+  - css/css-color/parsing/opacity-invalid.html
+  - css/css-fonts/parsing/font-style-invalid.html
+  - css/css-fonts/parsing/font-weight-invalid.html
+  # Native CSS.supports overloads, strict selector capability and computed helpers.
+  - css/css-conditional/js/CSS-supports-L3.html
+  - css/css-conditional/js/CSS-supports-L4.html
+  - css/css-conditional/js/CSS-supports-selector-detecting-invalid-in-logical-combinations.html
+  - css/css-conditional/js/CSS-supports-CSSStyleDeclaration.html
+  - css/css-color/parsing/color-computed.html
+  - css/css-color/parsing/color-computed-named-color.html
+  - css/css-color/parsing/color-computed-hex-color.html
+  - css/css-color/parsing/color-computed-rgb.html
+  - css/css-color/parsing/color-computed-hsl.html
+  # Reject misspelled and non-ASCII lookalikes of named sRGB colors.
+  - css/css-color/parsing/color-invalid-named-color.html
+  # Logical selector lists; other focused cases await named-window globals.
+  - css/selectors/invalidation/not-001.html
+  # Absolute RGB/HSL grammar and single-layer background position serialization.
+  - css/css-color/parsing/color-valid-rgb.html
+  - css/css-color/parsing/color-invalid-rgb.html
+  - css/css-color/parsing/color-valid-hsl.html
+  - css/css-color/parsing/color-invalid-hsl.html
+  - css/css-backgrounds/parsing/background-position-valid.html
+  - css/css-backgrounds/parsing/background-position-invalid.html
+  # Shared CSS value tokens, normalization and variable token-boundary serialization.
+  - css/css-syntax/unclosed-url-at-eof.html
+  - css/css-syntax/serialize-consecutive-tokens.html
+  - css/css-variables/url-token-serialization.html
+  - css/cssom/serialize-values.html
+  - css/css-color/parsing/color-valid.html
+  # Native ordered inline declaration blocks.
+  - css/cssom/cssstyledeclaration-csstext-final-delimiter.html
+  - css/cssom/cssstyledeclaration-csstext-important.html
+  - css/cssom/cssstyledeclaration-setter-declarations.html
+  - css/cssom/css-style-attr-decl-block.html
+  - css/cssom/serialize-variable-reference.html
+  # Native CSS declaration parsing through computed style.
+  - css/css-syntax/declarations-trim-whitespace.html
   - dom/nodes/Element-firstElementChild.html
   # Referrer policy reflection. Network-heavy generators currently require
   # Fetch/Location and a working security-features substitution server.
@@ -75,6 +147,75 @@ tests:
   - css/cssom-view/offsetTopLeft-empty-inline-offset.html
   - css/cssom-view/offsetTopLeft-leading-space-inline.html
 reftests:
+  - css/css-position/sticky/position-sticky-stacking-context.html
+  # CSS calculation, nesting, animation and sticky capability coverage.
+  - css/css-nesting/nesting-basic.html
+  - css/css-nesting/implicit-nesting.html
+  - css/css-nesting/nesting-type-selector.html
+  - css/css-nesting/conditional-rules.html
+  - css/css-nesting/conditional-properties.html
+  - css/css-nesting/supports-rule.html
+  - css/css-conditional/at-supports-048.html
+  - css/css-conditional/at-supports-content-003.html
+  - css/css-position/sticky/position-sticky-top-002.html
+  - css/css-position/sticky/position-sticky-bottom-002.html
+  - css/css-conditional/at-supports-content-001.html
+  # Conditional groups, boolean grammar, media nesting, selector and variable queries.
+  - css/css-conditional/at-supports-001.html
+  - css/css-conditional/at-supports-002.html
+  - css/css-conditional/at-supports-003.html
+  - css/css-conditional/at-supports-004.html
+  - css/css-conditional/at-supports-005.html
+  - css/css-conditional/at-supports-006.html
+  - css/css-conditional/at-supports-007.html
+  - css/css-conditional/at-supports-008.html
+  - css/css-conditional/at-supports-009.html
+  - css/css-conditional/at-supports-010.html
+  - css/css-conditional/at-supports-011.html
+  - css/css-conditional/at-supports-012.html
+  - css/css-conditional/at-supports-013.html
+  - css/css-conditional/at-supports-014.html
+  - css/css-conditional/at-supports-015.html
+  - css/css-conditional/at-supports-020.html
+  - css/css-conditional/at-supports-027.html
+  - css/css-conditional/at-supports-033.html
+  - css/css-conditional/at-supports-034.html
+  - css/css-conditional/at-supports-046.html
+  - css/css-conditional/at-supports-selector-001.html
+  - css/css-conditional/at-supports-selector-002.html
+  - css/css-conditional/at-supports-selector-003.html
+  - css/css-conditional/at-supports-selector-004.html
+  - css/css-conditional/at-supports-selector-detecting-invalid-in-logical-combinations.html
+  - css/css-variables/variable-supports-01.html
+  - css/css-variables/variable-supports-06.html
+  - css/css-variables/variable-supports-17.html
+  - css/css-variables/variable-supports-25.html
+  - css/css-variables/variable-supports-37.html
+  - css/css-variables/variable-supports-66.html
+  # Named sRGB colors and currentcolor resolved on the receiving element.
+  - css/css-color/named-001.html
+  - css/css-color/currentcolor-001.html
+  - css/css-color/currentcolor-002.html
+  # Explicit specificity and nested logical selectors with link state.
+  - css/CSS2/cascade/specificity-003.xht
+  - css/selectors/is-where-visited.html
+  - css/selectors/invalidation/negated-is-never-matches-negated-first-of-type-when-ancestor-changes.html
+  - css/selectors/invalidation/negated-is-always-matches-negated-last-of-type-when-ancestor-changes.html
+  - css/CSS2/syntax/escaped-ident-char-001.xht
+  - css/css-color/rgb-003.html
+  - css/css-color/hsl-002.html
+  - css/css-backgrounds/background-position-three-four-values.html
+  - css/css-backgrounds/background-position-negative-percentage-comparison.html
+  - css/CSS2/syntax/escaped-ident-spaces-001.xht
+  - css/CSS2/syntax/escaped-ident-spaces-002.xht
+  # Native ordered inline declaration blocks.
+  - css/cssom/style-attr-clone.html
+  # Structural CSS recovery; unchanged upstream expectations.
+  - css/css-syntax/missing-semicolon.html
+  - css/CSS2/syntax/eof-001.xht
+  - css/CSS2/syntax/eof-004.xht
+  - css/CSS2/syntax/invalid-decl-at-rule-002.xht
+  - css/CSS2/syntax/matching-brackets-001.xht
   - css/CSS2/backgrounds/background-color-174.xht
   # Promote the focused table/image sizing regressions into normal runs.
   - html/rendering/non-replaced-elements/tables/table-width.html
@@ -126,6 +267,22 @@ reftests:
   - css/filter-effects/svg-unknown-input-001.html
   - css/filter-effects/svg-empty-element-with-filter-001.html
 crashtests:
+  # CSS calculation, nesting, animation and sticky capability coverage.
+  - css/css-nesting/pseudo-where-crash.html
+  - css/css-nesting/implicit-parent-insertion-crash.html
+  - css/css-position/sticky/position-sticky-scroll-offset-clamp-crash.html
+  - css/css-position/sticky/position-sticky-details-crash.html
+  # Malformed supports blocks through native conditional parsing.
+  - css/css-conditional/crashtests/supports-malformed.html
+  - css/css-color/crashtests/stop-color-invalid-rgb.html
+  # Forgiving logical arguments and invalid nth-formula recovery.
+  - css/selectors/pseudo-where-crash.html
+  - css/selectors/is-where-error-crash.html
+  - css/selectors/nth-child-spurious-brace-crash.html
+  # Native ordered inline declaration blocks.
+  - css/cssom/declaration-block-all-crash.html
+  - css/css-syntax/crashtests/unclosed-open-brackets.html
+  - css/css-syntax/crashtests/atrule-with-escape-character.html
   - css/css-flexbox/flex-shrink-large-value-crash.html
   # Static inputs reach the implemented parser/renderer without SVG IDL,
   # custom elements, testdriver or a script-based completion handshake.

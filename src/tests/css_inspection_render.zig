@@ -120,3 +120,103 @@ test "Native CSS inspection repaints real geometry and pixels after responsive s
     try page.restyle();
     try expectRenderedBox(&page, engine, 55, 25, .{ .r = 255, .g = 0, .b = 0 });
 }
+
+test "CSS supports activation reaches geometry and pixels across media and source replacement" {
+    var page = try inspection.Page.fromHtml(allocator, "<style>#target{display:block;width:20px;height:20px;background:red}" ++
+        "@supports (display:block) and selector(.card) {#target{width:40px;background:green}" ++
+        "@media (min-width:600px){#target{width:80px;background:blue}}}" ++
+        "@supports (unknown:1) {#target{width:999px;background:red}}" ++
+        "@supports (color:red) or garbage {#target{background:red}}" ++
+        "</style><div id=target class=card></div>", .{ .media = .{ .viewport_width_css = 400 } });
+    defer page.deinit();
+    page.repairParentPointers();
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    var engine = try Layout.init(allocator, std.testing.io, &environ, 400, 600, false);
+    defer engine.deinit();
+    try expectRenderedBox(&page, engine, 40, 20, .{ .r = 0, .g = 128, .b = 0 });
+    try page.reselectMedia(.{ .viewport_width_css = 800 });
+    try page.restyle();
+    engine.window_width = 800;
+    try expectRenderedBox(&page, engine, 80, 20, .{ .r = 0, .g = 0, .b = 255 });
+    try page.replaceStylesheet(1, "#target{display:block;width:55px;height:25px;background:green}" ++
+        "@supports selector(:is(.card, :unknown)){#target{width:999px;background:red}}" ++
+        "@supports not (display:block){#target{width:999px;background:red}}");
+    try page.restyle();
+    try expectRenderedBox(&page, engine, 55, 25, .{ .r = 0, .g = 128, .b = 0 });
+}
+
+test "CSS escaped selectors and modern colors reach layout and software pixels after replacement" {
+    var page = try inspection.Page.fromHtml(allocator, "<style>\\64 iv.sm\\:card[data-\\78='a\\20 b'] {display:block;width:40px;height:20px;background-color:rgb(0 50% 0);}</style>" ++
+        "<div id=target class='sm:card' data-x='a b'></div>", .{});
+    defer page.deinit();
+    page.repairParentPointers();
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    var engine = try Layout.init(allocator, std.testing.io, &environ, 400, 600, false);
+    defer engine.deinit();
+    try expectRenderedBox(&page, engine, 40, 20, .{ .r = 0, .g = 128, .b = 0 });
+    try page.replaceStylesheet(1, ".sm\\:card {display:block;width:50px;height:25px;background-color:hsl(.5turn 100% 50%);}");
+    try page.restyle();
+    try expectRenderedBox(&page, engine, 50, 25, .{ .r = 0, .g = 255, .b = 255 });
+}
+
+test "logical selector specificity reaches geometry and pixels across stylesheet replacement" {
+    var page = try inspection.Page.fromHtml(allocator, "<style>.card {display:block;width:40px;height:20px;background:green}" ++
+        ":where(#target) {width:99px;background:red}</style><div id=target class=card></div>", .{});
+    defer page.deinit();
+    page.repairParentPointers();
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    var engine = try Layout.init(allocator, std.testing.io, &environ, 400, 600, false);
+    defer engine.deinit();
+    try expectRenderedBox(&page, engine, 40, 20, .{ .r = 0, .g = 128, .b = 0 });
+    try page.replaceStylesheet(1, ":is(#absent, body > .card):not(aside, .hidden) {display:block;width:60px;height:25px;background:blue}" ++
+        ".card.card.card {width:99px;background:red}");
+    try page.restyle();
+    try expectRenderedBox(&page, engine, 60, 25, .{ .r = 0, .g = 0, .b = 255 });
+}
+
+test "CSS currentcolor repaints retained backgrounds after ancestor mutation" {
+    var page = try inspection.Page.fromHtml(allocator, "<body><section id=parent style='color:green'>" ++
+        "<div id=target style='display:block;width:40px;height:20px;color:currentcolor;background:currentcolor'></div>" ++
+        "</section></body>", .{});
+    defer page.deinit();
+    page.repairParentPointers();
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    var engine = try Layout.init(allocator, std.testing.io, &environ, 400, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&page.root);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    const green = display.Color{ .r = 0, .g = 128, .b = 0 };
+    const blue = display.Color{ .r = 0, .g = 0, .b = 255 };
+    const first = blk: {
+        const commands = try engine.paintDocument(document);
+        defer display.DisplayItem.freeList(allocator, commands);
+        break :blk coloredBox(commands, green, 0, 0) orelse return error.MissingBoxPaint;
+    };
+    try std.testing.expectEqual(@as(i32, 40), first.width());
+    const parent = &findById(&page.root, "parent").?.element;
+    const block = try @import("../document/css_declaration_block.zig").create(allocator, "color:blue");
+    // Replacement takes ownership only after successful publication.
+    parent.replaceInlineStyle(allocator, block) catch |err| {
+        block.destroy();
+        return err;
+    };
+    dom.dirtyStyleForElement(parent);
+    try page.restyle();
+    try std.testing.expect(!document.layoutNeeded());
+    const commands = try engine.paintDocument(document);
+    defer display.DisplayItem.freeList(allocator, commands);
+    const second = coloredBox(commands, blue, 0, 0) orelse return error.MissingBoxPaint;
+    try std.testing.expectEqualDeep(first, second);
+    try std.testing.expect(coloredBox(commands, green, 0, 0) == null);
+}

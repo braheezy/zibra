@@ -31,6 +31,7 @@ pub const NumericAnimation = struct {
     current_frame: u32,
     total_frames: u32,
     easing_function: EasingFunction,
+    progress_override: ?f64 = null,
 
     pub fn init(start: f64, end: f64, frames: u32) NumericAnimation {
         return initWithEasing(start, end, frames, .linear);
@@ -53,9 +54,9 @@ pub const NumericAnimation = struct {
 
     /// Get the current interpolated value
     pub fn getValue(self: NumericAnimation) f64 {
-        if (self.total_frames == 0) return self.end_value;
-        const progress: f64 = @as(f64, @floatFromInt(self.current_frame)) /
-            @as(f64, @floatFromInt(self.total_frames));
+        if (self.total_frames == 0 and self.progress_override == null) return self.end_value;
+        const progress = self.progress_override orelse (@as(f64, @floatFromInt(self.current_frame)) /
+            @as(f64, @floatFromInt(self.total_frames)));
         const t = self.easing_function.apply(progress);
         return self.start_value + (self.end_value - self.start_value) * t;
     }
@@ -119,14 +120,15 @@ pub const PixelAnimation = struct {
     }
 };
 
-/// Animation state for a CSS color transition. Every RGBA channel is
-/// interpolated independently over the same normalized frame position.
+/// Native sRGB transition values use premultiplied-alpha interpolation, then
+/// return straight RGBA8 for painting. Invisible endpoint RGB cannot tint a fade.
 pub const ColorAnimation = struct {
     start_value: CssColor,
     end_value: CssColor,
     current_frame: u32,
     total_frames: u32,
     easing_function: EasingFunction,
+    progress_override: ?f64 = null,
 
     pub fn init(start: CssColor, end: CssColor, frames: u32) ColorAnimation {
         return initWithEasing(start, end, frames, .linear);
@@ -154,15 +156,26 @@ pub const ColorAnimation = struct {
         return @intFromFloat(@round(std.math.clamp(interpolated, 0.0, 255.0)));
     }
 
+    fn interpolateColor(start: u8, end: u8, start_alpha: u8, end_alpha: u8, progress: f64) u8 {
+        const a: f64 = @floatFromInt(start_alpha);
+        const b: f64 = @floatFromInt(end_alpha);
+        const alpha = a + (b - a) * progress;
+        if (alpha <= 0) return 0;
+        const channel = (@as(f64, @floatFromInt(start)) * a * (1 - progress) + @as(f64, @floatFromInt(end)) * b * progress) / alpha;
+        return @intFromFloat(@round(std.math.clamp(channel, 0, 255)));
+    }
+
     pub fn getValue(self: ColorAnimation) CssColor {
-        if (self.total_frames == 0 or self.current_frame >= self.total_frames) return self.end_value;
-        const progress = @as(f64, @floatFromInt(self.current_frame)) /
-            @as(f64, @floatFromInt(self.total_frames));
+        if (self.progress_override == null and (self.total_frames == 0 or self.current_frame >= self.total_frames)) return self.end_value;
+        const progress = self.progress_override orelse (@as(f64, @floatFromInt(self.current_frame)) /
+            @as(f64, @floatFromInt(self.total_frames)));
         const eased_progress = self.easing_function.apply(progress);
+        if (eased_progress == 0) return self.start_value;
+        if (eased_progress == 1) return self.end_value;
         return .{
-            .r = interpolateChannel(self.start_value.r, self.end_value.r, eased_progress),
-            .g = interpolateChannel(self.start_value.g, self.end_value.g, eased_progress),
-            .b = interpolateChannel(self.start_value.b, self.end_value.b, eased_progress),
+            .r = interpolateColor(self.start_value.r, self.end_value.r, self.start_value.a, self.end_value.a, eased_progress),
+            .g = interpolateColor(self.start_value.g, self.end_value.g, self.start_value.a, self.end_value.a, eased_progress),
+            .b = interpolateColor(self.start_value.b, self.end_value.b, self.start_value.a, self.end_value.a, eased_progress),
             .a = interpolateChannel(self.start_value.a, self.end_value.a, eased_progress),
         };
     }
@@ -185,6 +198,7 @@ pub const TransformAnimation = struct {
     current_frame: u32,
     total_frames: u32,
     easing_function: EasingFunction,
+    progress_override: ?f64 = null,
 
     pub fn initWithEasing(
         start: Translation,
@@ -202,9 +216,9 @@ pub const TransformAnimation = struct {
     }
 
     pub fn getValue(self: TransformAnimation) Translation {
-        if (self.total_frames == 0 or self.current_frame >= self.total_frames) return self.end_value;
-        const progress = @as(f64, @floatFromInt(self.current_frame)) /
-            @as(f64, @floatFromInt(self.total_frames));
+        if (self.progress_override == null and (self.total_frames == 0 or self.current_frame >= self.total_frames)) return self.end_value;
+        const progress = self.progress_override orelse (@as(f64, @floatFromInt(self.current_frame)) /
+            @as(f64, @floatFromInt(self.total_frames)));
         const eased = self.easing_function.apply(progress);
         return .{
             .x = self.start_value.x + (self.end_value.x - self.start_value.x) * eased,
@@ -229,6 +243,28 @@ pub const Animation = union(enum) {
     color: ColorAnimation,
     transform: TransformAnimation,
 
+    pub fn sample(self: *Animation, progress: f64) void {
+        switch (self.*) {
+            .numeric => |*track| track.progress_override = progress,
+            .pixel => |*track| track.numeric.progress_override = progress,
+            .color => |*track| track.progress_override = progress,
+            .transform => |*track| track.progress_override = progress,
+        }
+    }
+
+    /// Caller owns this instantaneous computed CSS value; no track is retained.
+    pub fn serialize(self: Animation, allocator: std.mem.Allocator) ![]u8 {
+        return switch (self) {
+            .numeric => |track| std.fmt.allocPrint(allocator, "{d}", .{track.getValue()}),
+            .pixel => |track| std.fmt.allocPrint(allocator, "{d}px", .{@max(track.getValue(), 0)}),
+            .color => |track| blk: {
+                const value = track.getValue();
+                break :blk (css_color.Absolute{ .color = value, .alpha = @round(@as(f64, @floatFromInt(value.a)) / 255 * 1000) / 1000 }).serialize(allocator);
+            },
+            .transform => |track| std.fmt.allocPrint(allocator, "translate({d}px, {d}px)", .{ track.getValue().x, track.getValue().y }),
+        };
+    }
+
     pub fn advance(self: *Animation) bool {
         return switch (self.*) {
             .numeric => |*animation| animation.advance(),
@@ -249,10 +285,22 @@ pub const Animation = union(enum) {
 
     pub fn reset(self: *Animation) void {
         switch (self.*) {
-            .numeric => |*animation| animation.current_frame = 0,
-            .pixel => |*animation| animation.numeric.current_frame = 0,
-            .color => |*animation| animation.current_frame = 0,
-            .transform => |*animation| animation.current_frame = 0,
+            .numeric => |*animation| {
+                animation.current_frame = 0;
+                animation.progress_override = null;
+            },
+            .pixel => |*animation| {
+                animation.numeric.current_frame = 0;
+                animation.numeric.progress_override = null;
+            },
+            .color => |*animation| {
+                animation.current_frame = 0;
+                animation.progress_override = null;
+            },
+            .transform => |*animation| {
+                animation.current_frame = 0;
+                animation.progress_override = null;
+            },
         }
     }
 
@@ -288,19 +336,37 @@ pub const Animation = union(enum) {
 
 pub const CssAnimationState = struct {
     signature: u64,
+    name_hash: u64,
     property_mask: u8,
-    iterations: ?u32,
-    completed_iterations: u32 = 0,
-    direction: css_animation.Direction,
-    restart_pending: bool = false,
+    timing: css_animation.Timing,
+    templates: [css_animation_properties.len]?Animation,
+    elapsed_frames: f64 = 0,
+    progress: ?f64 = null,
     finished: bool = false,
 
     pub fn contains(self: CssAnimationState, property: []const u8) bool {
         return (self.property_mask & cssAnimationPropertyBit(property)) != 0;
     }
 
-    pub fn hasAnotherIteration(self: CssAnimationState) bool {
-        return self.iterations == null or self.completed_iterations + 1 < self.iterations.?;
+    pub fn isRunning(self: CssAnimationState) bool {
+        return !self.finished and !self.timing.paused;
+    }
+
+    /// Publish effective tracks, retaining scalar templates through inactive
+    /// phases. The map must reserve capacity for all five properties first.
+    pub fn publish(self: *CssAnimationState, animations: *std.StringHashMap(Animation)) void {
+        const sampled = self.timing.sample(self.elapsed_frames);
+        self.progress = sampled.progress;
+        self.finished = sampled.finished;
+        for (css_animation_properties, self.templates) |property, template| {
+            if (template) |original| {
+                if (self.progress) |progress| {
+                    var track = original;
+                    track.sample(progress);
+                    animations.putAssumeCapacity(property, track);
+                } else _ = animations.remove(property);
+            }
+        }
     }
 };
 
@@ -330,7 +396,7 @@ test "color animation interpolates every channel" {
     try std.testing.expectEqual(CssColor{ .r = 0, .g = 100, .b = 200, .a = 0 }, animation.getValue());
     _ = animation.advance();
     _ = animation.advance();
-    try std.testing.expectEqual(CssColor{ .r = 128, .g = 50, .b = 150, .a = 128 }, animation.getValue());
+    try std.testing.expectEqual(CssColor{ .r = 255, .g = 0, .b = 100, .a = 128 }, animation.getValue());
     _ = animation.advance();
     try std.testing.expect(animation.advance());
     try std.testing.expectEqual(CssColor{ .r = 255, .g = 0, .b = 100, .a = 255 }, animation.getValue());
@@ -349,7 +415,7 @@ test "numeric and color animations apply easing before interpolation" {
     );
     _ = color.advance();
     try std.testing.expectEqual(
-        CssColor{ .r = 205, .g = 50, .b = 0, .a = 205 },
+        CssColor{ .r = 255, .g = 0, .b = 0, .a = 205 },
         color.getValue(),
     );
 }

@@ -1,6 +1,7 @@
 //! Focused unit-test root for layout, paint, compositing, and hit testing.
 
 comptime {
+    _ = @import("browser/render/sticky_position.zig");
     _ = @import("tests/svg_inline.zig");
     _ = @import("browser/render/svg.zig");
     // Filtered pure-layout runs still link libregexp's C object. Keep its

@@ -1,11 +1,16 @@
 //! Focused unit-test root for DOM, HTML, CSS, and document data types.
 
 comptime {
+    _ = @import("document/css_supports.zig");
+    _ = @import("tests/css_supports.zig");
+    _ = @import("tests/css_nesting.zig");
+    _ = @import("tests/css_animations.zig");
     _ = @import("document/css_stylesheet.zig");
     _ = @import("tests/css_inspection.zig");
     _ = @import("tests/css_stylesheet.zig");
     _ = @import("document/media_query.zig");
     _ = @import("tests/css_computed_values.zig");
+    _ = @import("tests/css_selectors.zig");
     _ = @import("document/canvas.zig");
     _ = @import("document/background_image.zig");
     _ = @import("document/html_parser_session.zig");

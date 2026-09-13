@@ -51,6 +51,10 @@ tiers and baseline policy.
 | [`font-shorthand.html`](font-shorthand.html) | Font shorthand expansion/reset and longhand interaction |
 | [`important.html`](important.html) | Declaration-local `!important` cascade |
 | [`css-declaration-recovery.html`](css-declaration-recovery.html) | Escaped declaration delimiters, comment whitespace, and invalid-value cascade recovery |
+| [`css-selectors.html`](css-selectors.html) | Logical lists, specificity, forgiving recovery, and immediate geometry after ancestor/sibling and inline mutations |
+| [`css-colors.html`](css-colors.html) | Named and resolved colors, currentcolor inheritance, live CSSOM readback, variables and matching native background paint |
+| [`css-supports.html`](css-supports.html) | CSS.supports overloads, boolean and selector queries, conditional styling and matching media-dependent bars |
+| [`css-completion.html`](css-completion.html) | Font-dependent color math, nested-selector invalidation, paused animation fill edits, and shared sticky paint/scroll/geometry |
 | [`selector-sequences.html`](selector-sequences.html) | Concatenated tag/class/ID selectors and specificity |
 | [`generated-pseudo-elements.html`](generated-pseudo-elements.html) | Private `:before`/`::after` generated boxes, before/authored/after layout order, and DOM-child transparency |
 | [`has-selectors.html`](has-selectors.html) | Strict-descendant `:has` matching and recomputation |
@@ -82,6 +86,9 @@ tiers and baseline policy.
 | [`new-input-types.html`](new-input-types.html) | Hidden layout/focus suppression and password masking with real submission value |
 | [`node-children.html`](node-children.html) | Stable live Element-only `children` collections across replacement and emptying |
 | [`document-accessors.html`](document-accessors.html) | Live body replacement and layout, title mutation and tab chrome, and independent detached-document accessors |
+| [`css-values.html`](css-values.html) | Escaped value tokens, normalization, invalid values, custom substitution, and agreement with immediate layout |
+| [`css-grammar.html`](css-grammar.html) | Escaped selectors, RGB/HSL colors, background edge offsets and shorthand serialization, with immediate layout checks |
+| [`css-declarations.html`](css-declarations.html) | Native CSSOM declaration order, shorthand priority, pending variables, and mutation before geometry reads |
 | [`dataset.html`](dataset.html) | Live `data-*` configuration, `DOMStringMap` writes/deletes, and attribute-selector restyling before geometry reads |
 | [`dom-range-boundaries.html`](dom-range-boundaries.html) | Range ordering, containment, atomic validation, detached roots, and Selection document membership |
 | [`js-geometry.html`](js-geometry.html) | Synchronous layout readback, rectangle snapshots, hidden/detached boxes, CSS zoom, inline fragments, and measure-to-position interaction |
@@ -202,4 +209,4 @@ described by their `How to verify` comment. `threaded-loading.html` uses
 `threaded-loading-server.py` so equal-latency resources visibly overlap while
 consumption remains in source order.
 
-- [CSS recovery](css-recovery.html): known native-parser gaps after nested unknown at-rules and at stylesheet EOF; correct output is two 120px green bars.
+- [CSS recovery](css-recovery.html): recovery after nested unknown at-rules and at stylesheet EOF; both bars must be 120px wide and green.

@@ -36,6 +36,9 @@ boundaries.
   keywords, radii, and authored-zoom used values. It does not subscribe to
   style fields; `layout.zig` performs dependency-tracked reads before calling
   it.
+- `sticky_position.zig` computes pointer-free sticky-axis constraints. Layout
+  retains visual offsets and refreshes them only after style/layout are clean,
+  before paint, hits, or script geometry consumes a new scroll position.
 - `border_geometry.zig` derives pointer-free convex mitered solid-border
   sides from a resolved border box and all four widths. It neither parses
   styles nor owns display commands; `layout.zig` retains those responsibilities.
@@ -79,7 +82,8 @@ boundaries.
 - `replaced_paint.zig` appends background-image and rounded-control command
   leaves/groups and owning editor clips without owning layout objects. Background attachment selects
   an element-local or viewport-local tile phase while the command rectangle
-  remains the element clip. Its image pixels and provenance are still
+  remains the element clip. Pass layout's used border widths so ordinary
+  images are positioned within the padding box. Its image pixels and provenance are still
   generation-scoped borrows until snapshot.
 - `paint_effects.zig` resolves scalar block effects from live style and wraps
   owned command slices in blur, clip, blend, transform, position, and scroll

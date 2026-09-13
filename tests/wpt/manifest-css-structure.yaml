@@ -1,0 +1,14 @@
+# Structural syntax through native style, layout and browser loading.
+# CSSOM-only insertion tests remain in manifest-css-frontend.yaml.
+tests:
+  - css/css-syntax/declarations-trim-whitespace.html
+reftests:
+  - css/css-syntax/missing-semicolon.html
+  - css/CSS2/syntax/eof-001.xht
+  - css/CSS2/syntax/eof-004.xht
+  - css/CSS2/syntax/invalid-decl-at-rule-002.xht
+  # Still fails: document loading passes the XHTML CDATA wrapper into CSS.
+  - css/CSS2/syntax/matching-brackets-001.xht
+crashtests:
+  - css/css-syntax/crashtests/unclosed-open-brackets.html
+  - css/css-syntax/crashtests/atrule-with-escape-character.html

@@ -7,8 +7,9 @@ display lists, or DOM-backed interaction state.
 
 ## DOM and source buffers
 
-Most parser-created tag names, DOM text, undecoded attribute values, CSS names,
-and CSS values are borrowed slices. Attribute values containing supported
+Most parser-created tag names, DOM text and undecoded attribute values are
+borrowed slices. Compiled CSS declarations and selector names own their strings.
+Attribute values containing supported
 character references move into `Element.owned_strings`; DOM text stays
 source-backed and escaped because layout decodes it exactly once. Text's
 `character_references` flag distinguishes this representation from literal
@@ -112,14 +113,21 @@ split across acyclic modules:
 - `html_serialization.zig` generically serializes the current live tree and
   owns only temporary output/sorting allocations;
 - `css_syntax.zig` owns source-buffer scanning for comments, strings, escapes,
-  balanced functions, and top-level structural delimiters; it returns only
+  balanced blocks/functions, and top-level structural delimiters; it returns only
   borrowed ranges and never decides property grammar or computed values;
+- `css_rule_syntax.zig` owns borrowed structural rule/declaration iteration,
+  source order, unknown at-rule boundaries and EOF recovery;
+- `css_nesting.zig` lowers parent selectors into bounded temporary source;
+  `css_math.zig` evaluates typed scalar expressions with caller-supplied units;
 - `css_properties.zig` owns the static set of published computed longhands and
   their initial source slices, shared by declaration-name recognition and
   style-map initialization;
 - `css_declarations.zig` owns property validation, shorthand expansion and
   declaration-block precedence shared by stylesheet and inline-style parsing.
-  Its maps own tables only; names and values borrow their source owner;
+  Its maps own tables and arenas containing normalized names and values;
+- `css_supports.zig` owns bounded feature-query evaluation, using declaration
+  validation and a strict selector-admission callback without importing the
+  semantic stylesheet parser. Query temporaries retain no DOM or source state;
 - `pseudo.zig` owns only the shared before/after identity used by DOM,
   selector, and style owners; it owns neither a Node nor a stylesheet value;
 - `animation.zig` defines pure transition/keyframe interpolation values that
@@ -136,13 +144,126 @@ Focused owners may import their direct leaf dependencies, but must not import
 logic-free so DOM storage, parsing, serialization, animation values, and style
 application retain unambiguous lifetimes.
 
+CSS parsing has two distinct stages. `css_rule_syntax.zig` produces borrowed
+source ranges for structural rules/declarations using `css_syntax.zig`'s
+balanced component scanner. These iterators neither allocate nor evaluate
+selectors, property values, media or DOM state. Unknown at-rules remain whole
+structural objects; semantic consumers ignore unsupported kinds. Qualified,
+media and keyframe blocks can end at EOF. Only outer stylesheet lists ignore
+HTML CDO/CDC tokens. A maximum of 64 nested components bounds scanner stack
+use; exceeding it discards the incomplete construct and remainder of that
+iterator input, leaving already completed entries intact.
+
+`css_tokenizer.zig` supplies the shared allocation-free CSS Syntax token stream.
+It preprocesses code points while retaining original UTF-8 byte offsets, decoded
+content access, numeric type/sign, hash type, bad-token kinds and EOF closure
+state. Unicode ranges require explicit descriptor context.
+Comments remain trivia, not synthetic whitespace. `css_syntax.zig` uses these
+tokens for structural boundaries; `css_value_tokens.zig` uses them for computed
+value operations. Neither owner retains input.
+
+Selector admission and atoms use that same lexer and decoder. Tag/class/ID,
+attribute and pseudo names decode after token boundaries are known, so escaped
+punctuation is data, and comments alone cannot create descendant combinators.
+Selector names and arguments are independently owned. HTML tag/attribute names
+fold ASCII case; class/ID/value data retain their case. Existing selector-family
+and namespace limits remain separate from lexical escape support.
+
+`css_values.zig` validates component nesting and var() arguments, rejects bad
+strings/URLs and unmatched closers, and repairs strings/URLs/blocks at EOF.
+Values are bounded to 1 MiB and 64 nested components. Standard values normalize
+escapes, numbers, units, strings, URLs and separators; supported primitive
+serialization is selected by the property registry after shorthand expansion.
+Custom values and pending substitutions preserve spelling, case and interior
+trivia. Token boundaries use comments rather than invented whitespace.
+
+`color.zig` owns finite absolute RGB/HSL grammar and specified serialization.
+Function aliases share comma/space/slash rules and HSL hue units. Alpha remains
+precise until conversion to paint's RGBA8; missing HSL components stay explicit
+in specified values and resolve to zero for absolute painting. Color math,
+relative colors, wider color spaces and color-scheme-dependent colors require
+their own computation/interpolation contracts.
+
+`css_position.zig` owns the single-layer one-to-four-component position grammar,
+canonical axis order and used offsets. Parsed offsets borrow the normalized
+declaration. Declarations, background shorthand and background painting share
+this grammar. Resolution receives the element's unscaled font size, authored
+zoom and the positioning-area minus image dimensions. This percentage basis may
+be negative; only position callers opt into that behavior in the length context.
+Used coordinates saturate to i32 and image clipping/resource lifetimes are
+unchanged. Multiple backgrounds and unsupported length units remain separate.
+
+`css_parser.zig` compiles those ranges into rule and declaration owners.
+Ordinary selectors use the same bounded, unforgiving
+selector-list parser as direct callers; invalid lists cannot consume later
+rules. Media selection remains explicit and currently reparses source.
+`@supports` uses the same native condition evaluator as `CSS.supports` and
+splices active rules/keyframes into authored source order, including nested
+media/supports groups. Conditional group recursion is bounded to 64. Inactive
+or grammatically invalid conditions publish nothing; allocation failure unwinds
+the complete staged generation, including keyframes appended by inner groups.
+
+Feature conditions are bounded to 64 KiB and 64 nested components. The evaluator
+checks all lexical structure and boolean operands; invalid outer grammar and
+resource limits fail closed while unknown general-enclosed features are false
+and can be negated. CSS Syntax EOF closure, trivia and escapes remain token
+operations. Declaration queries compile temporary maps through the same grammar
+as authored CSS. `selector()` accepts exactly one complex selector and enables
+strict admission recursively, so invalid branches of `:is()`/`:where()` cannot
+produce false support claims. Ordinary selector-list forgiving behavior is
+unchanged. Feature support is independent of current DOM matches, the custom-property environment,
+viewport and animation state. Namespace maps,
+font queries and stable CSSSupportsRule/CSSStyleSheet identity remain separate.
+
+Style blocks interleave declarations, nested selectors and conditional groups.
+The parser flushes declarations around nested rules in authored order. Nested
+selectors substitute `:is(parent-list)` for `&`, preserving the maximum parent
+specificity without an exponential Cartesian expansion; implicit descendants
+and leading combinators use the same parent context. Top-level `&` maps to a
+zero-specificity root scope. The temporary lowered source is bounded to 64 KiB;
+the compiled selectors and declaration maps are independent owners. Nested
+conditional declarations retain their parent selectors, including pseudo boxes.
+
+`css_declarations.zig` handles edge trivia, supported property validation,
+shorthand expansion and component-aware priority before emitting into a sink.
+The structural ranges preserve authored order/duplicates; compiled stylesheet
+maps do not, so they must not be exposed as a retained CSSOM representation.
+Both those maps and inline CSSOM blocks use this same declaration grammar.
+Formatting/font keyword families and scalar opacity/radius values have explicit
+admission; animation admission reuses the playback parser. Remaining legacy
+SVG/paint token families need stricter property-specific grammars, so feature
+queries are bounded by current native declaration support.
+
+`css_declaration_block.zig` owns a heap-stable ordered longhand index and an
+arena containing its source/value strings. Winning authored declarations take
+their last winning source position; CSSOM setters replace values/priority in
+place, with new longhands appended. Shorthand queries use the shared registry.
+Each Element lazily owns its parsed inline block. `attributes.Map.style_revision`
+changes on every successful raw style write/removal, including identical text,
+and lets `Element.inlineStyle` stage a new block before retiring a stale one.
+Other attribute edits leave this owner intact. Attribute entry borrows must not
+be used to bypass the map's mutation APIs and revision tracking.
+
+CSSOM mutation clones and edits an unpublished block, then
+`Element.replaceInlineStyle` stages the serialized attribute and its owned
+strings before publishing both together. Ownership transfers only on success;
+the caller dirties style and requests rendering through the synchronous host
+mutation hooks. The style pass reads this retained block directly. A partially
+overridden `var()` shorthand contains pending longhand substitutions that
+serialize as empty CSSOM values: reparsing attribute text cannot retain that
+state. Therefore CSSOM commits and DOM clones keep/deep-copy the actual block;
+explicit raw attribute replacement reparses it. Blocks move with Elements and
+retire with them. They retain no DOM, layout, JavaScript, or stylesheet pointers.
+
 CSS declaration parsing must keep escaped delimiters and delimiters inside
-strings/functions out of block recovery. Comments are CSS whitespace for
-token-based shorthand parsing. The parser validates the supported used-value
+strings, URL tokens and balanced blocks/functions out of recovery. Comments separate tokens without joining their contents. The parser validates the supported used-value
 grammar before a declaration enters its per-rule cascade map, so an invalid
-later value cannot replace a valid earlier supported value. Values and
-canonical property names remain static or source-borrowed; no normalized
-stylesheet string may outlive the stylesheet generation that supplied it.
+later value cannot replace a valid earlier supported value. Compiled declaration maps own an arena for normalized names and values, plus
+their hash table. No stored allocator points into the movable arena. Rule-list
+and keyframe clones deep-copy declarations, so retiring one cannot invalidate
+another. Keyframe names and structural ranges still borrow stylesheet source.
+Values selected from temporary substitution maps must be interned/copied before
+those maps retire.
 At stylesheet top level, invalid qualified-rule starts recover through the
 matching block terminator; a stray semicolon is not silently discarded ahead
 of a later rule.
@@ -156,9 +277,21 @@ each style pass; repeated equal values reuse the same allocation.
 External CSS rules additionally own their final source URL and retain the
 stylesheet's scalar referrer policy. The winning background declaration's
 source URL is interned into the Element before rules retire. Resource loading
-uses this provenance for relative URL resolution and Referer, while retaining
+decodes CSS string escapes before URL resolution and uses this provenance for
+relative URL resolution and Referer, while retaining
 the containing document's CSP and cookie context; see
 [referrer policy](navigation-and-network.md#referrer-policy).
+
+`css_cascade.zig` owns the scalar ordering key: implemented origin/importance
+level, inline attachment, independent ID/class/type specificity, then rule
+source ordinal. Specificity saturates within each count without carrying into
+another. Rule arrays remain in source order throughout Browser and inspection
+publication; no caller may pre-sort them by specificity. Background URL/referrer
+selection uses the same key as declaration selection. Inline attachment beats
+all stylesheet specificity at equal origin/importance. Normal UA declarations,
+HTML hints, author rules, important author rules and important UA rules occupy
+separate levels. Layers, user sheets and further animation/transition cascade
+levels are not represented by numeric bands.
 
 Stylesheet rules carry their cascade origin independently of source ownership.
 Browser and isolated inspection mark their default sheet as user-agent rules;
@@ -173,8 +306,9 @@ margins and authored alignment retain precedence.
 `custom_properties.zig` owns one immutable, heap-stable computed environment
 per styled Element. Inherited entries copy their parent's already-computed
 values; local declarations resolve forward references, fallback dependencies,
-and cycles after cascade. Ordinary declarations containing `var()` defer
-validation, and shorthands publish pending longhands so substitution cannot
+and cycles after cascade. References decode escaped custom names without case folding; substitution
+retains token boundaries with comment separators and scans each appended chunk
+once. Ordinary declarations containing `var()` defer property grammar validation, and shorthands publish pending longhands so substitution cannot
 change cascade order. Invalid winning substitutions use `unset`, not an older
 declaration. Expansion is depth/size bounded. Computed replacement strings are
 retained by the Element, independently of the environment's replacement.
@@ -183,13 +317,36 @@ retained by the Element, independently of the environment's replacement.
 URLs, or identifiers. Style resolves `rem` dimensions against the document
 root's computed font size; the root's own font-size uses the initial 16px.
 Descendants subscribe to that root field, and computed values consumed by
-layout contain pixel dimensions even inside functions. `length.zig` evaluates
-bounded typed `calc`, `min`, `max`, and `clamp` expressions with explicit font
-and percentage bases. An indefinite percentage basis stays unresolved.
+layout contain pixel dimensions even inside functions. `css_math.zig` evaluates
+bounded typed `calc`, `min`, `max`, `clamp`, `abs` and `sign` expressions for
+lengths and RGB/HSL components. Numbers, percentages, lengths and angles remain
+distinct unless the caller supplies a percentage hint. Times also retain their
+dimension; animation declarations preserve `s`/`ms`, while style computes times
+to seconds with the element's font context. An indefinite length
+percentage basis stays unresolved. Color channel ranges clamp only after
+calculation; missing components retain their modern CSSOM representation.
+Font-dependent color calculations remain specified until style supplies the
+computed font size and registers the dependency. Size-container units need a
+layout-aware container contract and are not admitted by guessing a width.
 Supported keyframe endpoints undergo variable/rem computation in a temporary
 arena before scalar track construction. Their signature includes computed
-endpoints, and root-relative tracks subscribe through the Element's animation
+endpoints, and root-relative tracks subscribe through the Element's animation-name
 field so a root-font change refreshes them without retaining temporary strings.
+
+The animation shorthand expands into eight independently cascaded longhands.
+Each Element retains one scalar timeline, scalar property templates and its
+last sampled progress. Delay, negative delay, fractional/zero iteration counts,
+direction and all four fill modes determine whether effective tracks are
+published. Missing endpoints use the underlying computed value; important
+declarations override animation effects. Underlying fields remain untouched.
+Longhand/keyframe changes for the same name resample at the retained elapsed
+time; removing/changing the name retires the prior tracks. Paused and completed
+fills remain visible without requesting more frames. The Tab worker advances
+active timelines and invalidates the appropriate paint or layout owner when
+an effect disappears. Color interpolation premultiplies alpha and returns
+straight RGBA8 to paint. Playback remains a single, frame-driven animation with
+endpoint interpolation; multiple effects, intermediate keyframe segments,
+wall-clock timelines, animation events and WAAPI are separate work.
 
 Custom-property changes publish through a separate heap-stable protected
 version field, not additional entries in the fixed StyleMap. Descendants
@@ -202,8 +359,9 @@ structural mutation still clears the graph before moving Node storage.
 `css_stylesheet.Sheet` owns copies of CSS source and optional serialized base URL,
 plus cascade origin and referrer policy. It uses Zibra's native CSS parser.
 `Sheet.init` copies inputs; `Sheet.select` parses them for an explicit media
-context and returns owning rule/keyframe containers. Declaration strings borrow
-that Sheet, and each rule owns its copied URL provenance. Retire all selections
+context and returns owning rule/keyframe containers. Selectors/declarations own
+their strings, keyframe names borrow that Sheet, and each rule owns its copied
+URL provenance. Retire all selections
 before their source Sheet. Media reselection currently reparses retained source;
 there is no persistent syntax tree or stable CSSOM rule identity.
 
@@ -356,15 +514,45 @@ host's logical child sequence/layout, because partial publication can change
 activation before retry records its previous value. Partially computed maps
 remain dirty; published strings keep their existing Element ownership.
 
+`selector.LogicalSelector` owns complete complex argument lists for `:is()`,
+`:where()` and `:not()`. Forgiving is/where lists discard invalid members;
+negation and ordinary lists reject them. Specificity uses the maximum valid
+argument for is/not and zero for where. Generated before/after selectors apply
+logical conditions to the authored host with the host's own ancestors.
+`css_anb.zig` shares token-based nth admission and matching, with i64 coefficients
+and widened matching arithmetic. Unsupported nth `of` lists are rejected.
+
+Logical matching propagates both ancestry and `MatchContext` through every
+compound. An internal borrowed ancestry view wraps caller root-to-parent slices
+or stack links during descendant recursion; links never enter a cache or outlive
+the matching call. Public callers retain the slice-based matching API.
 `:has(...)` matching additionally builds a synchronous ephemeral post-order
 cache. It borrows both DOM and selector pointers and cannot cross a DOM or rule
-mutation. Selector-relevant mutation dirties the changed element and its
-ancestor chain.
+mutation. The styled tree root carries `SelectorDependencies` for its current
+rule generation, including unmatched logical branches. A style pass rebuilds
+this scalar summary before matching. Selector-relevant mutation dirties the
+changed element and ancestors; ancestor-sensitive rules also dirty descendants,
+and sibling-sensitive rules dirty the parent subtree. Sheets combining `:has`
+with either relationship conservatively dirty the entire tree. Simple selectors
+preserve clean sibling skipping. This is a conservative correctness boundary;
+no per-selector dependency index is installed yet.
 
 Stylesheet selector lists expand into independently owned rules in source
 order, with member-specific specificity. Map tables and selector storage are
-independent owners; declaration strings continue to borrow the stylesheet.
+independent owners; compiled declarations own their normalized strings.
 An invalid member rejects the whole ordinary list before any rule is published.
+
+`color.zig` owns all 148 named sRGB colors, transparent, absolute RGB/HSL
+parsing, and synchronous currentcolor resolution. The style map stores the
+resolved inherited foreground for `color: currentcolor` and registers the
+ordinary checked parent dependency. Other color longhands keep currentcolor
+symbolic, including when inherited explicitly, so paint and CSSOM resolve it
+against the receiving element's foreground. Declaration blocks keep their
+specified keyword spelling. CSSOM copies serialized colors with alpha precision;
+paint projects them to RGBA8 before accessibility remapping and composition.
+Root/body canvas-background selection tests CSS alpha before RGBA8 rounding,
+so transparent colors allow body propagation while tiny nonzero alpha does not.
+Color-only restyling invalidates retained paint without rebuilding clean geometry.
 
 ## Render phases
 
@@ -512,11 +700,21 @@ Important geometry contracts:
   owning frame viewport as their containing block, likewise have no in-flow
   predecessor, and retain an outer `frame_viewport` display-transform wrapper
   so their entire paint subtree ignores document scroll.
-- A fixed-height `overflow: scroll` block preserves natural content height as
-  DOM scroll geometry, translates only its content, and clips that content.
-  `overflow: hidden` uses the same bounded paint and hit-test clip without
-  creating element-local scroll state; the present bounded implementation
-  clips to the layout block bounds. On the root `html` block it additionally
+- Sticky blocks preserve their normal-flow slot and retain only a visual
+  offset. `sticky_position.zig` computes each axis from the nearest scrollport,
+  insets, containing box and effective margins, including oversized boxes.
+  `DocumentLayout.updateSticky` traverses clean layout in parent order and
+  includes ancestor sticky movement and element scroll offsets. It dirties
+  changed paint wrappers, leaving normal-flow ProtectedFields clean. The Tab
+  worker refreshes before the render gate; layout/paint and script geometry
+  also refresh before consumption. Native UI/raster threads receive ordinary
+  numeric transforms and never mutate sticky DOM/layout state. Retained block
+  boxes support both physical axes in horizontal LTR layout; fragmented and
+  temporary atomic-inline sticky boxes need a retained constraint contract.
+- `overflow: scroll`, `auto` and `hidden` blocks preserve natural overflow
+  dimensions and clamped horizontal/vertical offsets as DOM scroll geometry,
+  translate only their content, and clip it. The present bounded implementation
+  clips to the layout block bounds. On the root `html` block hidden overflow
   suppresses the viewport scrollbar gutter and rail without disabling the
   frame's scroll range; layout resolves that boolean before page geometry and
   commits it as scalar presentation state for browser/raster consumers. The
@@ -602,7 +800,9 @@ Pure layout leaves are intentionally separated from retained object state:
   DOM or layout pointers; and
 - `render/replaced_paint.zig` constructs background and rounded-control
   command leaves/groups whose pixels and provenance remain borrowed from the
-  current generation.
+  current generation. Layout passes already-scaled used border widths for
+  ordinary background image positioning within the padding box; the paint
+  clip remains the border box. Fixed backgrounds retain viewport positioning.
 
 These modules must not register ProtectedField dependencies or acquire
 Browser/Frame ownership. Methods that mutate parent/previous links, dirty

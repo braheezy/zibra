@@ -217,7 +217,10 @@ pub fn collect(document: anytype, target: *dom.Node, frame_zoom: f32, scroll_y: 
                 dx += @floatFromInt(translation.x);
                 dy += @floatFromInt(translation.y);
             }
-            if (node != target and !fixed and element.scroll_container) dy -= @floatFromInt(element.scroll_y);
+            if (node != target and !fixed and element.scroll_container) {
+                dx -= @floatFromInt(element.scroll_x);
+                dy -= @floatFromInt(element.scroll_y);
+            }
             if (std.mem.eql(u8, style(element, "position"), "fixed")) fixed = true;
         }
         if (!fixed) dy -= @floatFromInt(scroll_y);

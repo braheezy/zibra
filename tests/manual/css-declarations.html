@@ -1,0 +1,55 @@
+<!-- How to verify: open this page. Expect green PASS and a 240px green card.
+     Toggle must switch the card between 120px blue and 240px green. Each click
+     edits a shorthand, attempts an invalid width and immediately measures the
+     result. No reload should be needed. -->
+<!doctype html>
+<html><head><title>Native inline CSS declarations</title>
+<style>
+body { margin: 30px; font: 18px sans-serif; --space: 10px 20px; }
+#card { width: 80px; height: 40px; background: red; }
+</style></head><body>
+<h1 id="status">Checking native CSS declarations</h1>
+<div id="card" style="margin:var(--space);width:100px">Native CSS</div>
+<button id="toggle">Toggle size and color</button>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var card = document.getElementById('card'), style = card.style, results = [];
+  function equal(a, b) { if (a !== b) throw Error(String(a) + ' != ' + String(b)); }
+  function check(name, run) {
+    try { run(); results.push({name:name, status:0}); }
+    catch (e) { results.push({name:name, status:1, message:String(e)}); }
+  }
+  check('partial var shorthand survives a CSSOM edit and layout flush', function() {
+    style.marginLeft = '4px';
+    equal(parseFloat(getComputedStyle(card).getPropertyValue('margin-right')), 20);
+    equal(parseFloat(getComputedStyle(card).getPropertyValue('margin-left')), 4);
+    style.removeProperty('margin-top');
+    equal(parseFloat(getComputedStyle(card).getPropertyValue('margin-top')), 0);
+    equal(parseFloat(getComputedStyle(card).getPropertyValue('margin-bottom')), 10);
+  });
+  check('shorthand priority and readback agree with layout', function() {
+    style.setProperty('padding', '8px', 'important');
+    style.paddingLeft = '2px';
+    equal(style.getPropertyPriority('padding-left'), '');
+    equal(style.paddingTop, '8px');
+    equal(parseFloat(getComputedStyle(card).getPropertyValue('padding-left')), 2);
+    style.removeProperty('padding');
+  });
+  var wide = false;
+  function toggle() {
+    wide = !wide;
+    style.width = wide ? '240px' : '120px';
+    style.background = wide ? 'green' : 'blue';
+    style.width = 'invalid';
+    equal(card.getBoundingClientRect().width, wide ? 240 : 120);
+    equal(style.width, wide ? '240px' : '120px');
+  }
+  check('invalid setter preserves rendered width and background shorthand', toggle);
+  document.getElementById('toggle').addEventListener('click', toggle);
+  var failures = results.filter(function(result) { return result.status !== 0; });
+  var status = document.getElementById('status');
+  status.textContent = failures.length ? 'FAIL: ' + failures[0].message : 'PASS: shared native CSS declarations';
+  status.style.color = failures.length ? 'red' : 'green';
+  if (typeof completion_callback === 'function') completion_callback(results, {status:0});
+});
+</script></body></html>

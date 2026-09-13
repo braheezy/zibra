@@ -352,6 +352,15 @@ pub fn FrameType(
             return document.layoutNeeded();
         }
 
+        /// Refresh scrolling-dependent visual geometry only on a clean,
+        /// current document generation. Dirty style/layout is handled by render.
+        pub fn updateSticky(self: *Frame) bool {
+            if (self.document.dirty) return false;
+            const document = self.documentLayout() orelse return false;
+            if (document.layoutNeeded()) return false;
+            return document.updateSticky(self.scroll);
+        }
+
         /// Finish a style pass performed by a navigation path before it enters
         /// Browser.layoutTabNodes directly.
         pub fn publishStyledDocument(self: *Frame) void {
@@ -899,7 +908,7 @@ pub fn FrameType(
             while (current) |node| {
                 switch (node.*) {
                     .element => |element| {
-                        if (element.scroll_container) return node;
+                        if (element.scroll_container and element.scroll_interactive) return node;
                         current = element.parent;
                     },
                     .text => |text| current = text.parent,

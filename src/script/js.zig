@@ -31,6 +31,7 @@ pub const MediaCommand = media_bindings.Command;
 pub const MediaResult = media_bindings.Result;
 pub const MediaCallbackFn = media_bindings.Callback;
 const geometry_bindings = @import("geometry_bindings.zig");
+const css_style_bindings = @import("css_style_bindings.zig");
 pub const GeometryCallbackFn = geometry_bindings.Callback;
 pub const GeometryRect = geometry_bindings.Rect;
 pub const GeometryQuery = geometry_bindings.Query;
@@ -309,6 +310,7 @@ canvas_host: canvas_bindings.Host,
 dom_tree_host: dom_tree_bindings.Host,
 character_data_host: character_data_bindings.Host,
 geometry_host: geometry_bindings.Host,
+css_style_host: css_style_bindings.Host,
 media_host: media_bindings.Host,
 event_focus_host: event_focus_bindings.Host,
 network_host: network_bindings.Host,
@@ -361,7 +363,7 @@ pub fn init(
         .context = self,
         .allocator = allocator,
         .io = io,
-        .resolve_element = resolveCanvasBindingElement,
+        .resolve_element = resolveBindingElement,
         .request_render = requestBindingRender,
     };
     self.dom_tree_host = .{
@@ -377,6 +379,7 @@ pub fn init(
     };
     self.media_host = .{ .context = self, .allocator = allocator, .call = callBindingMedia };
     self.geometry_host = .{ .context = self, .allocator = allocator, .measure = measureBindingGeometry };
+    self.css_style_host = .{ .context = self, .allocator = allocator, .resolve_element = resolveBindingElement, .request_render = requestBindingRender };
     self.network_host = .{
         .context = self,
         .allocator = allocator,
@@ -1228,7 +1231,7 @@ fn hostFromBindingContext(context: ?*anyopaque) *Js {
 /// Native binding adapters run synchronously with `JsLock` already held. They
 /// expose only current-window scalars or short-lived Element borrows to the
 /// domain modules and never recursively enter a lock-taking public API.
-fn resolveCanvasBindingElement(context: ?*anyopaque, handle: u32) ?*parser.Element {
+fn resolveBindingElement(context: ?*anyopaque, handle: u32) ?*parser.Element {
     const self = hostFromBindingContext(context);
     const window_id = self.current_window_id orelse return null;
     const window = self.windows.get(window_id) orelse return null;
@@ -5032,6 +5035,7 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         &dom_tree_bindings.bindings,
     );
     try native_bindings.installFunctions(&self.agent, realm, native, &self.geometry_host, &geometry_bindings.bindings);
+    try native_bindings.installFunctions(&self.agent, realm, native, &self.css_style_host, &css_style_bindings.bindings);
     try native_bindings.installFunctions(&self.agent, realm, native, &self.character_data_host, &character_data_bindings.bindings);
     try native_bindings.installFunctions(&self.agent, realm, native, &self.media_host, &media_bindings.bindings);
     try native_bindings.installFunctions(
@@ -5132,15 +5136,14 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
     const selector_str = try selector_arg.asString().toUtf8(js_instance.allocator);
     defer js_instance.allocator.free(selector_str);
 
-    var css_parser = CSSParser.init(js_instance.allocator, selector_str, false) catch {
-        return agent.throwException(.syntax_error, "Invalid selector", .{});
+    const selectors = CSSParser.parseSelectorList(js_instance.allocator, selector_str) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return agent.throwException(.syntax_error, "Invalid selector", .{}),
     };
-    defer css_parser.deinit(js_instance.allocator);
-
-    var selector = css_parser.selector(js_instance.allocator) catch {
-        return agent.throwException(.syntax_error, "Invalid selector", .{});
-    };
-    defer selector.deinit(js_instance.allocator);
+    defer {
+        for (selectors) |*member| member.deinit(js_instance.allocator);
+        js_instance.allocator.free(selectors);
+    }
 
     if (window.current_nodes == null) {
         const empty_array = try kiesel.builtins.arrayCreate(agent, 0, null);
@@ -5149,9 +5152,7 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
 
     var has_cache = CSSParser.HasMatchCache.init(js_instance.allocator);
     defer has_cache.deinit();
-    selector.populateHasMatches(&has_cache, window.current_nodes.?) catch {
-        return agent.throwException(.internal_error, "Could not match selector", .{});
-    };
+    for (selectors) |member| try member.populateHasMatches(&has_cache, window.current_nodes.?);
     const match_context = CSSParser.MatchContext{ .has_cache = &has_cache };
 
     var node_list = std.ArrayList(*Node).empty;
@@ -5184,7 +5185,9 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
         std.mem.reverse(*Node, ancestors.items);
 
         // Check if this node matches the selector
-        const matches = selector.matchesWithContext(node, ancestors.items, match_context);
+        const matches = for (selectors) |member| {
+            if (member.matchesWithContext(node, ancestors.items, match_context)) break true;
+        } else false;
         if (matches) {
             const handle = try js_instance.getHandle(window, node);
             try matching_handles.append(js_instance.allocator, handle);
@@ -5226,13 +5229,22 @@ fn querySelectorAllFrom(agent: *Agent, this_value: Value, arguments: kiesel.type
     if (!selector_arg.isString()) return agent.throwException(.type_error, "querySelectorAll requires a string argument", .{});
     const selector_str = try selector_arg.asString().toUtf8(js_instance.allocator);
     defer js_instance.allocator.free(selector_str);
-    var css_parser = CSSParser.init(js_instance.allocator, selector_str, false) catch return agent.throwException(.syntax_error, "Invalid selector", .{});
-    defer css_parser.deinit(js_instance.allocator);
-    var selector = css_parser.selector(js_instance.allocator) catch return agent.throwException(.syntax_error, "Invalid selector", .{});
-    defer selector.deinit(js_instance.allocator);
+    const selectors = CSSParser.parseSelectorList(js_instance.allocator, selector_str) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return agent.throwException(.syntax_error, "Invalid selector", .{}),
+    };
+    defer {
+        for (selectors) |*member| member.deinit(js_instance.allocator);
+        js_instance.allocator.free(selectors);
+    }
+
     var has_cache = CSSParser.HasMatchCache.init(js_instance.allocator);
     defer has_cache.deinit();
-    selector.populateHasMatches(&has_cache, root) catch return agent.throwException(.internal_error, "Could not match selector", .{});
+    // Logical arguments may inspect ancestors outside an Element query root.
+    // Prepare the cache from the same tree root used by uncached matching.
+    var tree_root = root;
+    while (dom_mutation.nodeParent(tree_root)) |parent| tree_root = parent;
+    for (selectors) |member| try member.populateHasMatches(&has_cache, tree_root);
     const match_context = CSSParser.MatchContext{ .has_cache = &has_cache };
     var node_list = std.ArrayList(*Node).empty;
     defer node_list.deinit(js_instance.allocator);
@@ -5254,7 +5266,10 @@ fn querySelectorAllFrom(agent: *Agent, this_value: Value, arguments: kiesel.type
             } else break;
         }
         std.mem.reverse(*Node, ancestors.items);
-        if (selector.matchesWithContext(node, ancestors.items, match_context)) {
+        const matches = for (selectors) |member| {
+            if (member.matchesWithContext(node, ancestors.items, match_context)) break true;
+        } else false;
+        if (matches) {
             try matching_handles.append(js_instance.allocator, try window.handles.getOrCreate(node, &js_instance.handle_issuer));
         }
     }

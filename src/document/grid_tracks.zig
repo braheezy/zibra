@@ -25,9 +25,7 @@ pub const Components = struct {
         while (iterator.next()) |token| {
             if (token.kind == .function) {
                 iterator.cursor = if (tokens.closeFunction(self.input, token.end)) |end| end + 1 else self.input.len;
-            } else if ((token.end == token.start + 1 and syntax.isWhitespace(self.input[token.start])) or
-                std.mem.startsWith(u8, self.input[token.start..token.end], "/*"))
-            {
+            } else if (token.isTrivia()) {
                 self.cursor = token.start;
                 return self.input[start..self.cursor];
             }

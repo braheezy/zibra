@@ -37,28 +37,28 @@ pub const ResolvedPosition = struct {
     y: i32,
 };
 
-/// Parse one CSS `url(...)` image. Multiple backgrounds, gradients, escapes,
-/// and other image functions intentionally remain outside this basic subset.
+/// Borrow encoded contents of one valid CSS URL, including an empty URL.
+/// Escapes belong to CSS, not URL syntax: consumers decode these contents before
+/// resolving a resource. Empty URLs are valid declarations but load no image.
 pub fn parseUrl(input: []const u8) ?[]const u8 {
-    const value = std.mem.trim(u8, input, " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(value, "none")) return null;
-    if (value.len < 5 or !std.ascii.eqlIgnoreCase(value[0..3], "url")) return null;
-
-    var open_index: usize = 3;
-    while (open_index < value.len and std.ascii.isWhitespace(value[open_index])) : (open_index += 1) {}
-    if (open_index >= value.len or value[open_index] != '(' or value[value.len - 1] != ')') return null;
-
-    var inner = std.mem.trim(u8, value[open_index + 1 .. value.len - 1], " \t\r\n");
-    if (inner.len == 0) return null;
-    if (inner[0] == '\'' or inner[0] == '"') {
-        const quote = inner[0];
-        if (inner.len < 2 or inner[inner.len - 1] != quote) return null;
-        inner = inner[1 .. inner.len - 1];
-        if (inner.len == 0) return null;
-    } else {
-        for (inner) |byte| if (std.ascii.isWhitespace(byte)) return null;
-    }
-    return inner;
+    const tokens = @import("css_tokenizer.zig");
+    var iterator = tokens.Iterator{ .input = input };
+    var token = iterator.next() orelse return null;
+    while (token.isTrivia()) token = iterator.next() orelse return null;
+    const encoded = if (token.kind == .url) token.encodedValue(input) else blk: {
+        if (token.kind != .function or !tokens.identifierEquals(token.encodedValue(input), "url")) return null;
+        var string = iterator.next() orelse return null;
+        while (string.isTrivia()) string = iterator.next() orelse return null;
+        if (string.kind != .string) return null;
+        var close = iterator.next();
+        while (close != null and close.?.isTrivia()) close = iterator.next();
+        if (close != null and close.?.kind != .close_paren) return null;
+        break :blk string.encodedValue(input);
+    };
+    while (iterator.next()) |extra| if (!extra.isTrivia()) {
+        return null;
+    };
+    return encoded;
 }
 
 fn parseComponent(input: []const u8) ?SizeComponent {
@@ -108,30 +108,8 @@ pub fn parseRepeat(input: []const u8) ?Repeat {
     return null;
 }
 
-fn positionComponent(
-    input: []const u8,
-    available: i32,
-    css_scale: f64,
-    horizontal: bool,
-) ?i32 {
-    if (std.mem.eql(u8, input, "0")) return 0;
-    if (std.ascii.eqlIgnoreCase(input, if (horizontal) "left" else "top")) return 0;
-    if (std.ascii.eqlIgnoreCase(input, "center")) return @divFloor(available, 2);
-    if (std.ascii.eqlIgnoreCase(input, if (horizontal) "right" else "bottom")) return available;
-
-    const parsed = length.parse(input) orelse return null;
-    return switch (parsed.unit) {
-        .px => length.toLayoutPixels(parsed.value * css_scale),
-        .mm => length.toLayoutPixels((length.resolveLength(parsed, .{}) orelse return null) * css_scale),
-        .percent => @intFromFloat(@as(f64, @floatFromInt(available)) * parsed.value / 100.0),
-        .em => null,
-        .rem => length.toLayoutPixels((length.resolveLength(parsed, .{}) orelse return null) * css_scale),
-    };
-}
-
-/// Resolve the basic one/two-value background-position grammar. Pixel,
-/// percentage, and edge/center keywords are supported; unsupported values
-/// fall back to the initial top-left position.
+/// Resolve the shared one-to-four-value position grammar using actual image
+/// dimensions and the element's unscaled font size. Invalid input uses 0 0.
 pub fn resolvePosition(
     input: []const u8,
     box_width: i32,
@@ -139,31 +117,11 @@ pub fn resolvePosition(
     image_width: i32,
     image_height: i32,
     css_scale: f64,
+    font_size: f64,
 ) ResolvedPosition {
-    var tokens = std.mem.tokenizeAny(u8, input, " \t\r\n\x0c");
-    const first = tokens.next() orelse return .{ .x = 0, .y = 0 };
-    const second = tokens.next();
-    if (tokens.next() != null) return .{ .x = 0, .y = 0 };
-
-    const available_x = box_width - image_width;
-    const available_y = box_height - image_height;
-    if (second) |vertical| {
-        return .{
-            .x = positionComponent(first, available_x, css_scale, true) orelse 0,
-            .y = positionComponent(vertical, available_y, css_scale, false) orelse 0,
-        };
-    }
-
-    if (std.ascii.eqlIgnoreCase(first, "top") or std.ascii.eqlIgnoreCase(first, "bottom")) {
-        return .{
-            .x = @divFloor(available_x, 2),
-            .y = positionComponent(first, available_y, css_scale, false) orelse 0,
-        };
-    }
-    return .{
-        .x = positionComponent(first, available_x, css_scale, true) orelse 0,
-        .y = @divFloor(available_y, 2),
-    };
+    const position = @import("css_position.zig").parse(input) orelse return .{ .x = 0, .y = 0 };
+    const point = position.resolve(box_width - image_width, box_height - image_height, font_size, css_scale);
+    return .{ .x = point.x, .y = point.y };
 }
 
 fn componentPixels(component: SizeComponent, box: f64, css_scale: f64) ?f64 {
@@ -242,7 +200,7 @@ test "background image URL parser accepts quoted and unquoted basic values" {
     try std.testing.expect(parseUrl("none") == null);
     try std.testing.expect(parseUrl("linear-gradient(red, blue)") == null);
     try std.testing.expect(parseUrl("url(unquoted space.ppm)") == null);
-    try std.testing.expect(parseUrl("url()") == null);
+    try std.testing.expectEqualStrings("", parseUrl("url()").?);
 }
 
 test "background size resolves intrinsic explicit percentage contain and cover forms" {
@@ -279,14 +237,14 @@ test "background repeat and position resolve the supported single layer" {
 
     try std.testing.expectEqual(
         ResolvedPosition{ .x = 1, .y = 0 },
-        resolvePosition("1px 0", 120, 40, 2, 2, 1.0),
+        resolvePosition("1px 0", 120, 40, 2, 2, 1.0, 16),
     );
     try std.testing.expectEqual(
         ResolvedPosition{ .x = 50, .y = 25 },
-        resolvePosition("50% 50%", 120, 60, 20, 10, 1.0),
+        resolvePosition("50% 50%", 120, 60, 20, 10, 1.0, 16),
     );
     try std.testing.expectEqual(
         ResolvedPosition{ .x = 96, .y = 0 },
-        resolvePosition("25.4mm 0", 200, 40, 2, 2, 1.0),
+        resolvePosition("25.4mm 0", 200, 40, 2, 2, 1.0, 16),
     );
 }

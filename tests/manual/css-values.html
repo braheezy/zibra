@@ -1,0 +1,52 @@
+<!-- How to verify: expect green PASS and two equally wide green 120px bars.
+     The checks compare escaped stylesheet/inline values, then mutate CSSOM and
+     immediately measure layout. Invalid strings, URLs and token concatenation
+     must not create a usable replacement value. -->
+<!doctype html>
+<html><head><title>CSS value tokens and normalization</title><style>
+body { margin: 30px; font: 18px sans-serif; }
+.bar { height:20px; padding:0; margin:4px 0; background-color:#008000; }
+#sheet { width:+001.2e2P\58; }
+</style></head><body>
+<h1 id="status">Checking CSS values</h1>
+<div class="bar" id="sheet"></div>
+<div class="bar" id="inline" style="--W: +001.2e2P\58; width:var(--\57)"></div>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var sheet = document.getElementById('sheet'), card = document.getElementById('inline');
+  var style = card.style, results = [];
+  function equal(a, b) { if (a !== b) throw Error(String(a) + ' != ' + String(b)); }
+  function check(name, run) {
+    try { run(); results.push({name:name, status:0}); }
+    catch (e) { results.push({name:name, status:1, message:String(e)}); }
+  }
+  check('escaped stylesheet and substituted inline dimensions reach layout', function() {
+    equal(sheet.getBoundingClientRect().width, 120);
+    equal(card.getBoundingClientRect().width, 120);
+    equal(style.getPropertyValue('--W'), '+001.2e2P\\58');
+    style.width = '+0120.00P\\58'; equal(style.width, '120px');
+    equal(card.getBoundingClientRect().width, 120);
+  });
+  check('numeric colors strings URLs and EOF use canonical CSSOM serialization', function() {
+    style.backgroundColor = 'RGB(0, 128, 0)'; equal(style.backgroundColor, 'rgb(0, 128, 0)');
+    style.content = "'end\\"; equal(style.content, '"end"');
+    style.backgroundImage = 'url(""'; equal(style.backgroundImage, 'url("")');
+    style.backgroundImage = 'url(a b)'; equal(style.backgroundImage, 'url("")');
+  });
+  check('bad values preserve declarations and substitutions preserve token boundaries', function() {
+    style.width = '1/**/px'; equal(style.width, '120px');
+    style.width = 'var(invalid-name)'; equal(style.width, '120px');
+    style.setProperty('--n', '12'); style.width = 'var(--n)px';
+    equal(getComputedStyle(card).width, 'auto');
+    style.width = '120px'; equal(card.getBoundingClientRect().width, 120);
+    style.setProperty('--data', 'A/**/  +01PX');
+    style.setProperty('--data', '"bad\nstring');
+    equal(style.getPropertyValue('--data'), 'A/**/  +01PX');
+  });
+  var failures = results.filter(function(result) { return result.status !== 0; });
+  var status = document.getElementById('status');
+  status.textContent = failures.length ? 'FAIL: ' + failures[0].message : 'PASS: CSS values agree with layout';
+  status.style.color = failures.length ? 'red' : 'green';
+  if (typeof completion_callback === 'function') completion_callback(results, {status:0});
+});
+</script></body></html>

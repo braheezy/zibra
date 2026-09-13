@@ -13,6 +13,7 @@ const UnitTestSuite = struct {
     comprehensive: bool = false,
 
     const Dependencies = enum {
+        syntax,
         document,
         network,
         script,
@@ -21,6 +22,30 @@ const UnitTestSuite = struct {
 };
 
 const unit_test_suites = [_]UnitTestSuite{
+    .{
+        .step_name = "test-css-supports",
+        .description = "Run CSS feature-query grammar and declaration support tests without native libraries",
+        .root_source_file = "src/document/css_supports.zig",
+        .dependencies = .syntax,
+    },
+    .{
+        .step_name = "test-css-values",
+        .description = "Run CSS tokenization and value normalization tests without native libraries",
+        .root_source_file = "src/document/css_values.zig",
+        .dependencies = .syntax,
+    },
+    .{
+        .step_name = "test-css-declarations",
+        .description = "Run ordered declaration and property grammar tests without native libraries",
+        .root_source_file = "src/document/css_declaration_block.zig",
+        .dependencies = .syntax,
+    },
+    .{
+        .step_name = "test-css-syntax",
+        .description = "Run CSS structural syntax tests without DOM or native libraries",
+        .root_source_file = "src/document/css_rule_syntax.zig",
+        .dependencies = .syntax,
+    },
     .{
         .step_name = "test",
         .description = "Run the comprehensive unit-test suite",
@@ -176,6 +201,48 @@ const WptFixture = struct {
 };
 
 const wpt_fixtures = [_]WptFixture{
+    .{
+        .fixture = "tests/manual/css-completion.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-completion.jsonl",
+    },
+    .{
+        .fixture = "tests/manual/css-supports.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-supports.jsonl",
+    },
+    .{
+        .fixture = "tests/manual/css-colors.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-colors.jsonl",
+    },
+    .{
+        .fixture = "tests/manual/css-selectors.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-selectors.jsonl",
+    },
+    .{
+        .fixture = "tests/manual/css-grammar.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-grammar.jsonl",
+    },
+    .{
+        .fixture = "tests/manual/css-declarations.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-declarations.jsonl",
+    },
+    .{
+        .fixture = "tests/manual/css-values.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-values.jsonl",
+    },
     .{
         .fixture = "tests/manual/dataset.html",
         .status = "PASS",
@@ -388,9 +455,12 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
         });
-        test_module.addImport("zigaudio", zigaudio_dep.module("zigaudio"));
-        test_module.addImport("zoto", zoto_dep.module("zoto"));
+        if (suite.dependencies != .syntax) {
+            test_module.addImport("zigaudio", zigaudio_dep.module("zigaudio"));
+            test_module.addImport("zoto", zoto_dep.module("zoto"));
+        }
         switch (suite.dependencies) {
+            .syntax => {},
             .document => {
                 test_module.addImport("z2d", z2d_dep.module("z2d"));
                 test_module.addImport("zigimg", zigimg_dep.module("zigimg"));

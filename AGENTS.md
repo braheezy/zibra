@@ -91,6 +91,8 @@ work actually happens. See the
 
 Use the narrowest relevant step while iterating:
 
+- `zig build test-css-syntax` — CSS structure without DOM/native libraries;
+- `zig build test-css-supports` — CSS feature queries without DOM/native libraries;
 - `zig build test-document`
 - `zig build test-render`
 - `zig build test-network`

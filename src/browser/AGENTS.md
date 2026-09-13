@@ -113,6 +113,8 @@ into either leaf module.
   replacing layers.
 - Structural DOM mutation uses the synchronous retirement/completion boundary.
   Network loading of new resources happens after the host call returns.
+- Retain stylesheet source order when publishing or rebuilding rule generations.
+  Style application compares explicit cascade keys; never pre-sort by specificity.
 - Each Frame owns its URL, decoded HTML, stylesheet source/rule/keyframe
   generation, layout pointer, display list, and child Frames. Raw parent,
   frame-element, focus/hover, and layout pointers borrow that generation.

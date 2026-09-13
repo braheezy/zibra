@@ -1,20 +1,23 @@
 //! Native CSS syntax and shared selector parser for Zibra's supported subset.
 //! Declaration validation and shorthand expansion belong to css_declarations.
 //!
-//! Property names and declared values in returned rules normally borrow the
-//! input stylesheet; shorthand-generated property names and defaults are
-//! static slices. Selectors own their normalized names, selector-sequence lists,
-//! descendant-chain lists, and relational-selector components. The stylesheet
-//! therefore must outlive its rules, and each owned rule must be deinitialized.
+//! Declaration maps own their normalized property names and values; shorthand
+//! defaults may be static. Keyframe names still borrow stylesheet source.
+//! Selectors own their normalized names, selector-sequence lists,
+//! descendant-chain lists, and relational-selector components. Deinitialize
+//! each rule; stylesheet source must outlive keyframes.
 
 const std = @import("std");
 const selector_mod = @import("selector.zig");
 const pseudo = @import("pseudo.zig");
 const css_syntax = @import("css_syntax.zig");
+const tokens = @import("css_tokenizer.zig");
+const rule_syntax = @import("css_rule_syntax.zig");
 const media_query = @import("media_query.zig");
+const supports = @import("css_supports.zig");
+const nesting = @import("css_nesting.zig");
 const css_properties = @import("css_properties.zig");
 const css_declarations = @import("css_declarations.zig");
-const custom_properties = @import("custom_properties.zig");
 const Selector = selector_mod.Selector;
 const SimpleSelector = selector_mod.SimpleSelector;
 const UniversalSelector = selector_mod.UniversalSelector;
@@ -27,7 +30,7 @@ const FocusVisibleSelector = selector_mod.FocusVisibleSelector;
 const HoverSelector = selector_mod.HoverSelector;
 const StructuralSelector = selector_mod.StructuralSelector;
 const StructuralKind = selector_mod.StructuralKind;
-const NotSelector = selector_mod.NotSelector;
+const LogicalSelector = selector_mod.LogicalSelector;
 const StateSelector = selector_mod.StateSelector;
 const StateKind = selector_mod.StateKind;
 const PseudoElementSelector = selector_mod.PseudoElementSelector;
@@ -40,10 +43,8 @@ const Combinator = selector_mod.Combinator;
 
 pub const CSSParser = @This();
 
-pub const IMPORTANT_PRIORITY = css_declarations.IMPORTANT_PRIORITY;
-pub const INLINE_STYLE_PRIORITY: u32 = 1_000;
-pub const PRESENTATIONAL_HINT_PRIORITY: u32 = 20_000;
-pub const AUTHOR_ORIGIN_PRIORITY: u32 = 40_000;
+pub const cascade = @import("css_cascade.zig");
+pub const Specificity = cascade.Specificity;
 pub const MatchContext = selector_mod.MatchContext;
 pub const HasMatchCache = selector_mod.HasMatchCache;
 
@@ -54,7 +55,7 @@ pub const Declaration = css_declarations.Declaration;
 pub const DeclarationMap = css_declarations.Map;
 
 /// One declaration block within an `@keyframes` rule. Selectors are normalized
-/// to a 0...1 offset; declaration values borrow the stylesheet buffer.
+/// to a 0...1 offset; the declaration map owns normalized values.
 pub const Keyframe = struct {
     offset: f64,
     properties: DeclarationMap,
@@ -64,8 +65,8 @@ pub const Keyframe = struct {
     }
 };
 
-/// A named keyframe rule. The name and declaration values borrow the
-/// stylesheet; the frame slice and declaration maps are owned.
+/// A named keyframe rule. Its name borrows the stylesheet; the frame slice,
+/// declaration maps and normalized declaration strings are owned.
 pub const KeyframesRule = struct {
     name: []const u8,
     frames: []Keyframe,
@@ -87,6 +88,12 @@ pub const KeyframesRule = struct {
 string: []const u8,
 pos: usize,
 media: MediaEnvironment,
+top_level: bool = true,
+allow_pseudo_elements: bool = true,
+in_has: bool = false,
+/// Feature queries reject unsupported members even in forgiving logical lists.
+strict_support: bool = false,
+group_depth: usize = 0,
 
 pub fn init(allocator: std.mem.Allocator, string: []const u8, prefers_dark: bool) !*CSSParser {
     return initWithMedia(allocator, string, .{ .prefers_dark = prefers_dark });
@@ -110,74 +117,23 @@ pub fn deinit(self: *CSSParser, allocator: std.mem.Allocator) void {
     allocator.destroy(self);
 }
 
-fn consumeComment(self: *CSSParser) bool {
-    return css_syntax.consumeComment(self.string, &self.pos);
-}
-
 fn whitespace(self: *CSSParser) void {
     css_syntax.skipWhitespaceAndComments(self.string, &self.pos);
 }
 
-const trimValueTrivia = css_declarations.trimValueTrivia;
-
-fn word(self: *CSSParser) ![]const u8 {
-    const start = self.pos;
-    while (self.pos < self.string.len) {
-        const c = self.string[self.pos];
-        if (std.ascii.isAlphanumeric(c) or c == '#' or c == '-' or c == '_' or c == '.' or c == '%') {
-            self.pos += 1;
-        } else if (c == '\\') {
-            if (!css_syntax.consumeEscape(self.string, &self.pos)) return error.InvalidWord;
-        } else {
-            break;
-        }
-    }
-    if (self.pos <= start) {
-        return error.InvalidWord;
-    }
-    return self.string[start..self.pos];
+/// Consume one encoded identifier without interpreting escaped punctuation as
+/// selector syntax. The returned range borrows the current input.
+fn identifier(self: *CSSParser) ![]const u8 {
+    return css_syntax.consumeIdentifier(self.string, &self.pos) orelse error.InvalidSelector;
 }
 
-/// Decode the CSS escape sequences retained by `word` into the identifier's
-/// actual Unicode value. Selectors compare against DOM attribute strings, so
-/// retaining the source spelling (for example `\\2003`) would make escaped
-/// class and ID selectors miss their elements. The returned bytes are owned
-/// by the caller; input must be the source spelling of a validated identifier.
+/// Decode a validated CSS identifier into caller-owned storage.
 pub fn decodeIdentifier(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    var decoded = std.ArrayList(u8).empty;
-    errdefer decoded.deinit(allocator);
-    var cursor: usize = 0;
-    while (cursor < raw.len) {
-        if (raw[cursor] != '\\') {
-            try decoded.append(allocator, raw[cursor]);
-            cursor += 1;
-            continue;
-        }
-        cursor += 1;
-        if (cursor >= raw.len) return error.InvalidWord;
-        var codepoint: u32 = 0;
-        var digits: usize = 0;
-        while (cursor < raw.len and digits < 6) {
-            const byte = raw[cursor];
-            const digit: u32 = if (byte >= '0' and byte <= '9') byte - '0' else if (byte >= 'a' and byte <= 'f') byte - 'a' + 10 else if (byte >= 'A' and byte <= 'F') byte - 'A' + 10 else break;
-            codepoint = codepoint * 16 + digit;
-            cursor += 1;
-            digits += 1;
-        }
-        if (digits == 0) {
-            try decoded.append(allocator, raw[cursor]);
-            cursor += 1;
-            continue;
-        }
-        if (cursor < raw.len and std.ascii.isWhitespace(raw[cursor])) cursor += 1;
-        if (codepoint == 0 or codepoint > 0x10ffff or (codepoint >= 0xd800 and codepoint <= 0xdfff)) {
-            codepoint = 0xfffd;
-        }
-        var encoded: [4]u8 = undefined;
-        const encoded_len = try std.unicode.utf8Encode(@intCast(codepoint), &encoded);
-        try decoded.appendSlice(allocator, encoded[0..encoded_len]);
-    }
-    return decoded.toOwnedSlice(allocator);
+    return tokens.decode(allocator, raw, false);
+}
+
+fn skipSelectorComments(self: *CSSParser) void {
+    while (css_syntax.consumeComment(self.string, &self.pos)) {}
 }
 
 fn literal(self: *CSSParser, lit: u8) !void {
@@ -187,77 +143,20 @@ fn literal(self: *CSSParser, lit: u8) !void {
     self.pos += 1;
 }
 
-/// Read a CSS value until a top-level `;` or `}`. Quoted strings and function
-/// parentheses may contain either byte; this is required for data URLs in
-/// `url(...)` and also keeps other supported function values intact.
-fn value(self: *CSSParser) ![]const u8 {
-    const start = self.pos;
-    const terminator = css_syntax.scanToTopLevel(self.string, self.pos, ";}");
-    self.pos = terminator.end;
-    if (self.pos <= start) {
-        return error.InvalidValue;
-    }
-    const trimmed = trimValueTrivia(self.string[start..self.pos]);
-    if (trimmed.len == 0) return error.InvalidValue;
-    return trimmed;
-}
-
-fn pair(self: *CSSParser) !struct { property: []const u8, value: []const u8 } {
-    const property = try self.word();
-    self.whitespace();
-    try self.literal(':');
-    self.whitespace();
-    const val = self.value() catch |err| if (custom_properties.isName(property)) "" else return err;
-    return .{ .property = property, .value = val };
-}
-
 /// Compatibility entry point for source-spelled declaration insertion.
 pub const putDeclaration = css_declarations.putRaw;
 pub const isValidLonghandValue = css_declarations.isValidLonghandValue;
 
+/// Parse supported declarations into an owning map, including normalized
+/// strings. The caller may retire declaration source afterward. Unknown at-rules
+/// and malformed declarations are recovered structurally before validation.
 pub fn body(self: *CSSParser, allocator: std.mem.Allocator) !DeclarationMap {
     var map = DeclarationMap.init(allocator);
     errdefer map.deinit();
-    // Stop at closing brace
-    while (self.pos < self.string.len and self.string[self.pos] != '}') {
-        self.whitespace();
-        if (self.pos >= self.string.len or self.string[self.pos] == '}') break;
-        // Try to parse a property-value pair, but catch any errors
-        const result = self.pair() catch {
-            // If parsing failed, skip to the next semicolon or closing brace
-            const why = self.ignoreUntil(";}");
-            if (why) |char| {
-                if (char == ';') {
-                    _ = self.literal(';') catch {};
-                    self.whitespace();
-                } else {
-                    // Hit closing brace, stop parsing
-                    break;
-                }
-            } else {
-                // Reached end of string without finding a semicolon or brace
-                break;
-            }
-            continue;
-        };
-
-        // Values borrow the parser input; shorthand defaults are static slices.
-        try putDeclaration(&map, result.property, result.value);
-        self.whitespace();
-        _ = self.literal(';') catch {};
-        self.whitespace();
-    }
+    var declarations = rule_syntax.DeclarationIterator{ .input = self.string, .pos = self.pos };
+    defer self.pos = declarations.pos;
+    try css_declarations.parseInto(&map, &declarations);
     return map;
-}
-
-fn ignoreUntil(self: *CSSParser, chars: []const u8) ?u8 {
-    const match = css_syntax.scanToTopLevel(self.string, self.pos, chars);
-    self.pos = match.end;
-    return match.delimiter;
-}
-
-fn findMatchingBrace(self: *CSSParser, start: usize) ?usize {
-    return css_syntax.findMatchingBrace(self.string, start);
 }
 
 fn parseKeyframeOffset(raw: []const u8) ?f64 {
@@ -271,52 +170,36 @@ fn parseKeyframeOffset(raw: []const u8) ?f64 {
 }
 
 fn cloneDeclarationMap(allocator: std.mem.Allocator, source: *const DeclarationMap) !DeclarationMap {
-    var result = DeclarationMap.init(allocator);
-    errdefer result.deinit();
-    try result.ensureUnusedCapacity(source.count());
-    var iterator = source.iterator();
-    while (iterator.next()) |entry| {
-        result.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
-    }
-    return result;
+    return source.cloneWithAllocator(allocator);
 }
 
-fn parseKeyframesRule(self: *CSSParser, allocator: std.mem.Allocator) !KeyframesRule {
-    self.pos += "@keyframes".len;
-    self.whitespace();
-    const name = try self.word();
-    self.whitespace();
-    try self.literal('{');
-    self.whitespace();
+fn parseKeyframesRule(allocator: std.mem.Allocator, source: []const u8, rule: rule_syntax.Rule) !KeyframesRule {
+    const prelude = rule.prelude.slice(source);
+    var cursor: usize = 0;
+    css_syntax.skipWhitespaceAndComments(prelude, &cursor);
+    const name = css_syntax.consumeIdentifier(prelude, &cursor) orelse return error.InvalidKeyframes;
+    if (!@import("css_animation.zig").validKeyframesName(name)) return error.InvalidKeyframes;
+    css_syntax.skipWhitespaceAndComments(prelude, &cursor);
+    if (cursor != prelude.len) return error.InvalidKeyframes;
 
     var frames = std.ArrayList(Keyframe).empty;
     errdefer {
         for (frames.items) |*frame| frame.deinit();
         frames.deinit(allocator);
     }
-
-    while (self.pos < self.string.len and self.string[self.pos] != '}') {
-        const selector_start = self.pos;
-        const brace = std.mem.indexOfScalarPos(u8, self.string, self.pos, '{') orelse
-            return error.InvalidKeyframes;
-        const selector_text = self.string[selector_start..brace];
-        self.pos = brace + 1;
-        self.whitespace();
-
-        var declarations = try self.body(allocator);
+    const block_source = rule.block.?.slice(source);
+    var blocks = rule_syntax.RuleIterator{ .input = block_source, .top_level = false };
+    while (blocks.next()) |block| {
+        if (block.name != null or block.block == null) continue;
+        var css = CSSParser{ .string = block.block.?.slice(block_source), .pos = 0, .media = .{} };
+        var declarations = try css.body(allocator);
         var declarations_owned = true;
         defer if (declarations_owned) declarations.deinit();
-        try self.literal('}');
-        self.whitespace();
-
-        var selectors = std.mem.splitScalar(u8, selector_text, ',');
+        var selectors = std.mem.splitScalar(u8, block.prelude.slice(block_source), ',');
         var accepted: usize = 0;
-        while (selectors.next()) |selector_text_part| {
-            const offset = parseKeyframeOffset(selector_text_part) orelse continue;
-            const properties = if (accepted == 0)
-                declarations
-            else
-                try cloneDeclarationMap(allocator, &declarations);
+        while (selectors.next()) |selector_text| {
+            const offset = parseKeyframeOffset(selector_text) orelse continue;
+            const properties = if (accepted == 0) declarations else try cloneDeclarationMap(allocator, &declarations);
             if (accepted == 0) declarations_owned = false;
             var frame = Keyframe{ .offset = offset, .properties = properties };
             frames.append(allocator, frame) catch |err| {
@@ -326,26 +209,8 @@ fn parseKeyframesRule(self: *CSSParser, allocator: std.mem.Allocator) !Keyframes
             accepted += 1;
         }
     }
-    try self.literal('}');
     if (frames.items.len == 0) return error.InvalidKeyframes;
     return .{ .name = name, .frames = try frames.toOwnedSlice(allocator) };
-}
-
-fn startsWithKeyframesRule(self: *const CSSParser) bool {
-    const keyword = "@keyframes";
-    if (self.string.len - self.pos < keyword.len) return false;
-    if (!std.ascii.eqlIgnoreCase(self.string[self.pos .. self.pos + keyword.len], keyword)) return false;
-    const next = self.pos + keyword.len;
-    return next == self.string.len or std.ascii.isWhitespace(self.string[next]);
-}
-
-fn startsWithMediaRule(self: *const CSSParser) bool {
-    const keyword = "@media";
-    if (self.string.len - self.pos < keyword.len) return false;
-    if (!std.ascii.eqlIgnoreCase(self.string[self.pos .. self.pos + keyword.len], keyword)) return false;
-    const next = self.pos + keyword.len;
-    return next == self.string.len or css_syntax.isWhitespace(self.string[next]) or self.string[next] == '(' or
-        std.mem.startsWith(u8, self.string[next..], "/*");
 }
 
 /// Parse one complete unforgiving selector list without a declaration block.
@@ -354,6 +219,11 @@ fn startsWithMediaRule(self: *const CSSParser) bool {
 /// Admission limits are 64 KiB, 256 members and 64 nested brackets/functions;
 /// limits fail before recursive parsing or partial selector publication.
 pub fn parseSelectorList(allocator: std.mem.Allocator, source: []const u8) ![]Selector {
+    if (nesting.hasParent(source)) {
+        const lowered = try nesting.lower(allocator, source, null);
+        defer allocator.free(lowered);
+        return parseSelectorList(allocator, lowered);
+    }
     try validateSelectorListInput(source);
     var parser = CSSParser{ .string = source, .pos = 0, .media = .{} };
     var selectors = std.ArrayList(Selector).empty;
@@ -377,51 +247,63 @@ pub fn parseSelectorList(allocator: std.mem.Allocator, source: []const u8) ![]Se
     }
 }
 
+/// Query support for exactly one complex selector, recursively rejecting any
+/// invalid logical-list branch. All temporary selectors retire before return.
+/// Syntax is unsupported; allocation/admission failures remain distinguishable.
+pub fn supportsSelector(allocator: std.mem.Allocator, source: []const u8) supports.Error!bool {
+    if (nesting.hasParent(source)) {
+        const lowered = nesting.lower(allocator, source, null) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.SelectorLimitExceeded => return error.LimitExceeded,
+            else => return false,
+        };
+        defer allocator.free(lowered);
+        return supportsSelector(allocator, lowered);
+    }
+    validateSelectorListInput(source) catch |err| switch (err) {
+        error.SelectorLimitExceeded => return error.LimitExceeded,
+        else => return false,
+    };
+    var parser = CSSParser{ .string = source, .pos = 0, .media = .{}, .strict_support = true };
+    parser.whitespace();
+    var parsed = parser.selector(allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SelectorLimitExceeded => return error.LimitExceeded,
+        else => return false,
+    };
+    defer parsed.deinit(allocator);
+    parser.whitespace();
+    return parser.pos == source.len;
+}
+
 fn validateSelectorListInput(source: []const u8) !void {
     if (source.len > 64 * 1024) return error.SelectorLimitExceeded;
-    var stack: [64]u8 = undefined;
+    var stack: [64]tokens.Kind = undefined;
     var depth: usize = 0;
-    var cursor: usize = 0;
-    var quote: ?u8 = null;
     var members: usize = 1;
-    while (cursor < source.len) {
-        const byte = source[cursor];
-        if (byte == '\\') {
-            if (!css_syntax.consumeEscape(source, &cursor)) return error.InvalidSelector;
-            continue;
+    var iterator = tokens.Iterator{ .input = source };
+    while (iterator.next()) |token| {
+        if (token.kind == .bad_string or token.kind == .bad_url or
+            (token.kind == .string and !token.closed) or
+            ((token.kind == .open_curly or token.kind == .close_curly) and depth == 0)) return error.InvalidSelector;
+        if (token.closer()) |closer| {
+            if (depth == stack.len) return error.SelectorLimitExceeded;
+            stack[depth] = closer;
+            depth += 1;
+        } else if (token.isClose()) {
+            if (depth == 0 or stack[depth - 1] != token.kind) return error.InvalidSelector;
+            depth -= 1;
+        } else if (token.kind == .comma and depth == 0) {
+            members += 1;
+            if (members > 256) return error.SelectorLimitExceeded;
         }
-        if (quote) |delimiter| {
-            if (byte == delimiter) quote = null;
-            cursor += 1;
-            continue;
-        }
-        if (css_syntax.consumeComment(source, &cursor)) continue;
-        switch (byte) {
-            '\'', '"' => quote = byte,
-            '(', '[' => {
-                if (depth == stack.len) return error.SelectorLimitExceeded;
-                stack[depth] = if (byte == '(') ')' else ']';
-                depth += 1;
-            },
-            ')', ']' => {
-                if (depth == 0 or stack[depth - 1] != byte) return error.InvalidSelector;
-                depth -= 1;
-            },
-            '{', '}' => return error.InvalidSelector,
-            ',' => if (depth == 0) {
-                members += 1;
-                if (members > 256) return error.SelectorLimitExceeded;
-            },
-            else => {},
-        }
-        cursor += 1;
     }
-    if (depth != 0 or quote != null) return error.InvalidSelector;
+    if (depth != 0) return error.InvalidSelector;
 }
 
 /// Parse supported compound selectors, relational selectors, and descendant,
 /// child, or adjacent-sibling combinator chains.
-pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
+pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) (std.mem.Allocator.Error || error{ InvalidSelector, InvalidLiteral, SelectorLimitExceeded })!Selector {
     var selectors = std.ArrayList(SimpleSelector).empty;
     var combinators = std.ArrayList(Combinator).empty;
     errdefer {
@@ -505,8 +387,16 @@ fn relationalSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSel
     if (self.pos >= self.string.len or self.string[self.pos] != ':') return ancestor;
 
     try self.literal(':');
-    const pseudo_class = try self.word();
-    if (!std.ascii.eqlIgnoreCase(pseudo_class, "has")) return error.InvalidSelector;
+    const pseudo_class = try decodeIdentifier(allocator, try self.identifier());
+    defer allocator.free(pseudo_class);
+    if (!std.ascii.eqlIgnoreCase(pseudo_class, "has") or self.in_has or ancestor.pseudoElementKind() != null) return error.InvalidSelector;
+    const allow_pseudo_elements = self.allow_pseudo_elements;
+    self.allow_pseudo_elements = false;
+    self.in_has = true;
+    defer {
+        self.allow_pseudo_elements = allow_pseudo_elements;
+        self.in_has = false;
+    }
     try self.literal('(');
     self.whitespace();
 
@@ -518,49 +408,13 @@ fn relationalSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSel
     return .{ .has = try HasSelector.init(allocator, ancestor, descendant) };
 }
 
-fn attributeNameChar(char: u8) bool {
-    return std.ascii.isAlphanumeric(char) or char == '-' or char == '_';
-}
-
-fn attributeSelectorValue(
-    self: *CSSParser,
-    allocator: std.mem.Allocator,
-) ![]u8 {
-    var decoded = std.ArrayList(u8).empty;
-    errdefer decoded.deinit(allocator);
-    if (self.pos >= self.string.len) return error.InvalidSelector;
-
-    const quote: ?u8 = switch (self.string[self.pos]) {
-        '\'', '"' => self.string[self.pos],
-        else => null,
-    };
-    if (quote != null) self.pos += 1;
-
-    while (self.pos < self.string.len) {
-        const char = self.string[self.pos];
-        if (quote) |delimiter| {
-            if (char == delimiter) {
-                self.pos += 1;
-                return decoded.toOwnedSlice(allocator);
-            }
-        } else {
-            if (char == ']' or std.ascii.isWhitespace(char)) break;
-            if (!attributeNameChar(char) and char != '\\') return error.InvalidSelector;
-        }
-
-        if (char == '\\') {
-            self.pos += 1;
-            if (self.pos >= self.string.len) return error.InvalidSelector;
-            try decoded.append(allocator, self.string[self.pos]);
-            self.pos += 1;
-            continue;
-        }
-        try decoded.append(allocator, char);
-        self.pos += 1;
-    }
-
-    if (quote != null or decoded.items.len == 0) return error.InvalidSelector;
-    return decoded.toOwnedSlice(allocator);
+fn attributeSelectorValue(self: *CSSParser, allocator: std.mem.Allocator) ![]u8 {
+    var iterator = tokens.Iterator{ .input = self.string, .cursor = self.pos };
+    const token = iterator.next() orelse return error.InvalidSelector;
+    if (token.kind != .ident and token.kind != .string) return error.InvalidSelector;
+    if (!token.closed) return error.InvalidSelector;
+    self.pos = token.end;
+    return tokens.decode(allocator, token.encodedValue(self.string), token.kind == .string);
 }
 
 fn parseAttributeSelector(
@@ -570,12 +424,8 @@ fn parseAttributeSelector(
     try self.literal('[');
     self.whitespace();
 
-    const name_start = self.pos;
-    while (self.pos < self.string.len and attributeNameChar(self.string[self.pos])) {
-        self.pos += 1;
-    }
-    if (self.pos == name_start) return error.InvalidSelector;
-    const name = try std.ascii.allocLowerString(allocator, self.string[name_start..self.pos]);
+    const name = try decodeIdentifier(allocator, try self.identifier());
+    _ = std.ascii.lowerString(name, name);
     errdefer allocator.free(name);
     self.whitespace();
 
@@ -607,44 +457,10 @@ fn parseAttributeSelector(
     return AttributeSelector.init(name, expected_value, matcher);
 }
 
-fn appendAttributeSelectors(
-    self: *CSSParser,
-    allocator: std.mem.Allocator,
-    selectors: *std.ArrayList(SequenceSelector),
-) !void {
-    while (self.pos < self.string.len and self.string[self.pos] == '[') {
-        const attribute = try self.parseAttributeSelector(allocator);
-        try appendSequenceSelector(
-            allocator,
-            selectors,
-            .{ .attribute = attribute },
-        );
-    }
-}
-
 fn pseudoElementKind(name: []const u8) ?pseudo.Kind {
     if (std.ascii.eqlIgnoreCase(name, "before")) return .before;
     if (std.ascii.eqlIgnoreCase(name, "after")) return .after;
     return null;
-}
-
-/// Consume the identifier portion of a pseudo selector. `word` intentionally
-/// accepts class and ID punctuation for the compact selector syntax, while a
-/// pseudo name must stop before a following `.class` or `#id` token.
-fn pseudoIdentifier(self: *CSSParser) ![]const u8 {
-    const start = self.pos;
-    while (self.pos < self.string.len) {
-        const char = self.string[self.pos];
-        if (std.ascii.isAlphanumeric(char) or char == '-' or char == '_') {
-            self.pos += 1;
-        } else if (char == '\\') {
-            if (!css_syntax.consumeEscape(self.string, &self.pos)) return error.InvalidWord;
-        } else {
-            break;
-        }
-    }
-    if (self.pos == start) return error.InvalidWord;
-    return self.string[start..self.pos];
 }
 
 fn structuralKind(name: []const u8) ?StructuralKind {
@@ -693,81 +509,55 @@ fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelecto
         selectors.deinit(allocator);
     }
 
-    try self.appendAttributeSelectors(allocator, &selectors);
-    if (self.pos < self.string.len and self.string[self.pos] == '*') {
-        self.pos += 1;
-        try appendSequenceSelector(
-            allocator,
-            &selectors,
-            .{ .universal = UniversalSelector{} },
-        );
-    }
-
-    const can_start_word = if (self.pos < self.string.len) blk: {
+    // Comments separate lexical tokens but never create a descendant
+    // combinator. Decode each atom only after its token boundary is known.
+    while (self.pos < self.string.len) {
+        self.skipSelectorComments();
+        if (self.pos == self.string.len) break;
         const char = self.string[self.pos];
-        break :blk char == '.' or char == '#' or std.ascii.isAlphanumeric(char) or
-            char == '-' or char == '_';
-    } else false;
-    if (can_start_word) {
-        const raw = try self.word();
-        if (std.mem.indexOfScalar(u8, raw, '%') != null) return error.InvalidSelector;
-
-        var cursor: usize = 0;
-        if (raw[0] != '.' and raw[0] != '#') {
-            const tag_end = std.mem.indexOfAny(u8, raw, ".#") orelse raw.len;
-            const decoded_tag = try decodeIdentifier(allocator, raw[0..tag_end]);
-            defer allocator.free(decoded_tag);
-            const lower_tag = try std.ascii.allocLowerString(allocator, decoded_tag);
-            try appendSequenceSelector(
-                allocator,
-                &selectors,
-                .{ .tag = TagSelector.init(lower_tag) },
-            );
-            cursor = tag_end;
+        if (char == '[') {
+            const attribute = try self.parseAttributeSelector(allocator);
+            try appendSequenceSelector(allocator, &selectors, .{ .attribute = attribute });
+            continue;
         }
-
-        while (cursor < raw.len) {
-            const marker = raw[cursor];
-            if (marker != '.' and marker != '#') return error.InvalidSelector;
-            const name_start = cursor + 1;
-            if (name_start >= raw.len) return error.InvalidSelector;
-
-            const remaining = raw[name_start..];
-            const name_len = std.mem.indexOfAny(u8, remaining, ".#") orelse remaining.len;
-            if (name_len == 0) return error.InvalidSelector;
-
-            const name = try decodeIdentifier(allocator, remaining[0..name_len]);
-            if (marker == '.') {
-                try appendSequenceSelector(
-                    allocator,
-                    &selectors,
-                    .{ .class = ClassSelector.init(name) },
-                );
-            } else {
-                try appendSequenceSelector(
-                    allocator,
-                    &selectors,
-                    .{ .id = IdSelector.init(name) },
-                );
-            }
-            cursor = name_start + name_len;
+        if (char == '*') {
+            if (selectors.items.len != 0) return error.InvalidSelector;
+            self.pos += 1;
+            try appendSequenceSelector(allocator, &selectors, .{ .universal = UniversalSelector{} });
+            continue;
         }
-    }
-    try self.appendAttributeSelectors(allocator, &selectors);
-
-    // Consume supported dynamic pseudo-classes and terminal pseudo-elements.
-    // Leave an unsupported single colon untouched so relationalSelector can
-    // recognize `:has(...)` or report the existing unsupported-pseudo error.
-    while (self.pos < self.string.len and self.string[self.pos] == ':') {
+        if (char == '.') {
+            self.pos += 1;
+            self.skipSelectorComments();
+            const name = try decodeIdentifier(allocator, try self.identifier());
+            try appendSequenceSelector(allocator, &selectors, .{ .class = ClassSelector.init(name) });
+            continue;
+        }
+        if (char == '#') {
+            var iterator = tokens.Iterator{ .input = self.string, .cursor = self.pos };
+            const token = iterator.next().?;
+            if (token.kind != .hash or token.hash_type != .id) return error.InvalidSelector;
+            self.pos = token.end;
+            const name = try decodeIdentifier(allocator, token.encodedValue(self.string));
+            try appendSequenceSelector(allocator, &selectors, .{ .id = IdSelector.init(name) });
+            continue;
+        }
+        if (tokens.startsIdentifier(self.string, self.pos)) {
+            if (selectors.items.len != 0) return error.InvalidSelector;
+            const tag = try decodeIdentifier(allocator, try self.identifier());
+            _ = std.ascii.lowerString(tag, tag);
+            try appendSequenceSelector(allocator, &selectors, .{ .tag = TagSelector.init(tag) });
+            continue;
+        }
+        if (char != ':') break;
         const pseudo_start = self.pos;
         self.pos += 1;
         const explicit_pseudo_element = self.pos < self.string.len and self.string[self.pos] == ':';
         if (explicit_pseudo_element) self.pos += 1;
-        const pseudo_name = self.pseudoIdentifier() catch {
-            self.pos = pseudo_start;
-            break;
-        };
+        const pseudo_name = try decodeIdentifier(allocator, try self.identifier());
+        defer allocator.free(pseudo_name);
         if (pseudoElementKind(pseudo_name)) |kind| {
+            if (!self.allow_pseudo_elements) return error.InvalidSelector;
             try appendSequenceSelector(
                 allocator,
                 &selectors,
@@ -779,42 +569,36 @@ fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelecto
             self.pos = pseudo_start;
             break;
         }
-        if (std.ascii.eqlIgnoreCase(pseudo_name, "not")) {
-            if (self.pos >= self.string.len or self.string[self.pos] != '(') {
-                self.pos = pseudo_start;
-                break;
-            }
-            self.pos += 1;
-            self.whitespace();
-            const inner = try self.simpleSelector(allocator);
-            var inner_owned = true;
-            errdefer {
-                if (inner_owned) {
-                    var owned_inner = inner;
-                    owned_inner.deinit(allocator);
-                }
-            }
-            self.whitespace();
-            try self.literal(')');
-            const inner_ptr = try allocator.create(SimpleSelector);
-            inner_ptr.* = inner;
-            inner_owned = false;
-            try appendSequenceSelector(allocator, &selectors, .{ .not = NotSelector{ .selector = inner_ptr } });
+        const logical_kind: ?LogicalSelector.Kind = if (std.ascii.eqlIgnoreCase(pseudo_name, "is")) .is else if (std.ascii.eqlIgnoreCase(pseudo_name, "where")) .where else if (std.ascii.eqlIgnoreCase(pseudo_name, "not")) .not else null;
+        if (logical_kind) |kind| {
+            const logical = try self.logicalSelector(allocator, kind);
+            try appendSequenceSelector(allocator, &selectors, .{ .logical = logical });
             continue;
         }
         if (structuralKind(pseudo_name)) |kind| {
+            if (kind == .lang) {
+                try self.literal('(');
+                self.whitespace();
+                const language = try self.attributeSelectorValue(allocator);
+                defer allocator.free(language);
+                self.whitespace();
+                try self.literal(')');
+                try appendStructuralSelector(allocator, &selectors, kind, language);
+                continue;
+            }
             var argument: ?[]const u8 = null;
             const requires_argument = kind == .nth_child or kind == .nth_last_child or
-                kind == .nth_of_type or kind == .nth_last_of_type or kind == .lang;
+                kind == .nth_of_type or kind == .nth_last_of_type;
             if (self.pos < self.string.len and self.string[self.pos] == '(') {
+                if (!requires_argument) return error.InvalidSelector;
                 self.pos += 1;
                 const start = self.pos;
-                var depth: usize = 1;
-                while (self.pos < self.string.len and depth != 0) : (self.pos += 1) {
-                    if (self.string[self.pos] == '(') depth += 1 else if (self.string[self.pos] == ')') depth -= 1;
-                }
-                if (depth != 0) return error.InvalidSelector;
-                argument = self.string[start .. self.pos - 1];
+                const end = css_syntax.scanToTopLevel(self.string, start, ")");
+                if (end.exhausted) return error.SelectorLimitExceeded;
+                if (end.delimiter == null) return error.InvalidSelector;
+                self.pos = end.end + 1;
+                argument = self.string[start..end.end];
+                if (@import("css_anb.zig").parse(argument.?) == null) return error.InvalidSelector;
             } else if (requires_argument) {
                 return error.InvalidSelector;
             }
@@ -833,6 +617,10 @@ fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelecto
         else if (std.ascii.eqlIgnoreCase(pseudo_name, "hover"))
             .{ .hover = HoverSelector{} }
         else {
+            // A bare :has() still has the implicit universal anchor.
+            if (selectors.items.len == 0 and std.ascii.eqlIgnoreCase(pseudo_name, "has")) {
+                try appendSequenceSelector(allocator, &selectors, .{ .universal = .{} });
+            }
             self.pos = pseudo_start;
             break;
         };
@@ -852,6 +640,64 @@ fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelecto
     return .{ .sequence = SelectorSequence.take(&selectors) };
 }
 
+// Each logical member gets a complete selector parser. Its delimiter scan
+// keeps commas in strings, attributes and nested functions inside the member.
+fn logicalSelector(self: *CSSParser, allocator: std.mem.Allocator, kind: LogicalSelector.Kind) !LogicalSelector {
+    try self.literal('(');
+    var result = LogicalSelector{ .kind = kind, .selectors = .empty };
+    errdefer result.deinit(allocator);
+    var stack: [64]tokens.Kind = undefined;
+    stack[0] = .close_paren;
+    var depth: usize = 1;
+    var start = self.pos;
+    var members: usize = 0;
+    var iterator = tokens.Iterator{ .input = self.string, .cursor = self.pos };
+    while (iterator.next()) |token| {
+        if ((token.kind == .comma and depth == 1) or (token.kind == .close_paren and depth == 1)) {
+            members += 1;
+            if (members > 256) return error.SelectorLimitExceeded;
+            try self.appendLogicalMember(allocator, &result, self.string[start..token.start]);
+            start = token.end;
+            if (token.kind == .close_paren) {
+                self.pos = token.end;
+                return result;
+            }
+        } else if (token.closer()) |closer| {
+            if (depth == stack.len) return error.SelectorLimitExceeded;
+            stack[depth] = closer;
+            depth += 1;
+        } else if (token.isClose()) {
+            if (stack[depth - 1] != token.kind) return error.InvalidSelector;
+            depth -= 1;
+        }
+    }
+    return error.InvalidSelector;
+}
+
+fn appendLogicalMember(self: *CSSParser, allocator: std.mem.Allocator, logical: *LogicalSelector, source: []const u8) !void {
+    var parser = CSSParser{
+        .string = source,
+        .pos = 0,
+        .media = self.media,
+        .allow_pseudo_elements = false,
+        .in_has = self.in_has,
+        .strict_support = self.strict_support,
+    };
+    parser.whitespace();
+    var member = parser.selector(allocator) catch |err| switch (err) {
+        error.OutOfMemory, error.SelectorLimitExceeded => return err,
+        else => return if (logical.kind == .not or self.strict_support) error.InvalidSelector else {},
+    };
+    errdefer member.deinit(allocator);
+    parser.whitespace();
+    if (parser.pos != source.len) {
+        if (logical.kind == .not or self.strict_support) return error.InvalidSelector;
+        member.deinit(allocator);
+        return;
+    }
+    try logical.selectors.append(allocator, member);
+}
+
 fn appendSequenceSelector(
     allocator: std.mem.Allocator,
     selectors: *std.ArrayList(SequenceSelector),
@@ -869,33 +715,26 @@ pub const CSSRule = struct {
     selector: Selector,
     properties: DeclarationMap,
     owned: bool = true,
-    origin: enum { user_agent, author } = .author,
+    origin: cascade.Origin = .author,
     /// Independent source URL owner for external-sheet resource provenance.
     source_url: ?[]u8 = null,
     referrer_policy: @import("referrer.zig").Policy = .default,
 
-    /// Origin precedes specificity; important UA rules precede author rules.
-    pub fn declarationPriorityBase(self: CSSRule, important: bool) u32 {
-        return self.cascadePriority() + switch (self.origin) {
-            .author => AUTHOR_ORIGIN_PRIORITY,
-            .user_agent => if (important) @as(u32, 60_000) else 0,
-        };
+    /// Rules must remain in stylesheet source order. The ordinal is local to
+    /// the current rule generation and carries no source or DOM ownership.
+    pub fn cascadeContext(self: CSSRule, source_order: usize) cascade.Context {
+        return .{ .origin = self.origin, .specificity = self.selector.specificity(), .source_order = source_order };
     }
 
     pub fn deinit(self: *CSSRule, allocator: std.mem.Allocator) void {
         if (self.source_url) |url| allocator.free(url);
-        // Free the selector's allocated memory (pass pointer since deinit expects *Selector)
         Selector.deinit(&self.selector, allocator);
 
-        // The map owns its table; declaration values borrow the stylesheet or
-        // are static shorthand expansion strings.
         self.properties.deinit();
     }
 
-    /// Get the cascade priority of this rule
-    /// Used for sorting - more specific selectors override less specific ones
-    pub fn cascadePriority(self: CSSRule) u32 {
-        return self.selector.priority();
+    pub fn specificity(self: CSSRule) Specificity {
+        return self.selector.specificity();
     }
 };
 
@@ -911,7 +750,7 @@ pub fn parse(self: *CSSParser, allocator: std.mem.Allocator) ![]CSSRule {
 }
 
 /// Parse selector rules and append named keyframes to caller-owned storage.
-/// Both products borrow the same stylesheet input buffer.
+/// Rules own their data; keyframe names borrow the stylesheet input buffer.
 pub fn parseWithKeyframes(
     self: *CSSParser,
     allocator: std.mem.Allocator,
@@ -930,123 +769,113 @@ pub fn parseWithKeyframes(
         rules.deinit(allocator);
     }
 
-    while (self.pos < self.string.len) {
-        self.whitespace();
-        if (self.pos >= self.string.len) break;
-
-        if (self.string[self.pos] == '@') {
-            if (self.startsWithKeyframesRule()) {
-                const brace_idx = std.mem.indexOfScalarPos(u8, self.string, self.pos, '{') orelse break;
-                const block_end = self.findMatchingBrace(brace_idx) orelse break;
-                var keyframes_rule = self.parseKeyframesRule(allocator) catch |err| {
-                    if (err == error.OutOfMemory) return err;
-                    self.pos = block_end + 1;
-                    continue;
-                };
-                keyframes.append(allocator, keyframes_rule) catch |err| {
-                    keyframes_rule.deinit(allocator);
-                    return err;
-                };
-                continue;
-            }
-            if (self.startsWithMediaRule()) {
-                const prelude_start = self.pos + "@media".len;
-                const delimiter = css_syntax.scanToTopLevel(self.string, prelude_start, "{;");
-                if (delimiter.delimiter != '{') {
-                    self.pos = delimiter.end + @as(usize, if (delimiter.delimiter == ';') 1 else 0);
-                    continue;
-                }
-                const brace_idx = delimiter.end;
-                const prelude = self.string[prelude_start..brace_idx];
-                const block_end = self.findMatchingBrace(brace_idx) orelse break;
-
-                if (media_query.matches(prelude, self.media)) {
-                    var media_parser = try CSSParser.initWithMedia(
-                        allocator,
-                        self.string[brace_idx + 1 .. block_end],
-                        self.media,
-                    );
-                    defer media_parser.deinit(allocator);
-
-                    const media_rules = try media_parser.parseWithKeyframes(allocator, keyframes);
-                    var media_rules_transferred = false;
-                    defer {
-                        if (!media_rules_transferred) {
-                            for (media_rules) |*rule| {
-                                rule.deinit(allocator);
-                            }
-                        }
-                        allocator.free(media_rules);
-                    }
-
-                    try rules.ensureUnusedCapacity(allocator, media_rules.len);
-                    for (media_rules) |rule| {
-                        rules.appendAssumeCapacity(rule);
-                    }
-                    media_rules_transferred = true;
-                }
-
-                self.pos = block_end + 1;
-                continue;
-            }
-
-            const why = self.ignoreUntil(";{") orelse break;
-            if (why == ';') {
-                _ = self.literal(';') catch {};
-                self.whitespace();
-                continue;
-            }
-            if (why == '{') {
-                const block_end = self.findMatchingBrace(self.pos) orelse break;
-                self.pos = block_end + 1;
-                continue;
-            }
-        }
-
-        self.appendQualifiedRule(allocator, &rules) catch |err| {
+    var input = rule_syntax.RuleIterator{ .input = self.string, .pos = self.pos, .top_level = self.top_level };
+    defer self.pos = input.pos;
+    while (input.next()) |rule| {
+        if (rule.block == null) continue;
+        if (rule.name != null) {
+            try self.appendAtRule(allocator, &rules, keyframes, rule, null, &.{});
+        } else self.appendQualifiedRule(allocator, &rules, keyframes, rule, null) catch |err| {
             if (err == error.OutOfMemory) return err;
-            // Ordinary selector lists are unforgiving: one invalid member
-            // invalidates the entire declaration block, not just that member.
-            _ = self.ignoreUntil("}") orelse break;
-            self.pos += 1;
+            // Structural parsing has already retired the complete bad rule.
+            // Selector admission cannot consume any subsequent rule's source.
         };
     }
-
     return rules.toOwnedSlice(allocator);
 }
 
-/// Expand a selector list into independently owned rules in source order.
-/// Each member retains its own specificity. Declaration strings still borrow
-/// the stylesheet, but every rule owns its map and selector storage.
-fn appendQualifiedRule(self: *CSSParser, allocator: std.mem.Allocator, rules: *std.ArrayList(CSSRule)) !void {
-    var selectors = std.ArrayList(Selector).empty;
-    var transferred: usize = 0;
-    defer {
-        for (selectors.items[transferred..]) |*sel| sel.deinit(allocator);
-        selectors.deinit(allocator);
-    }
-    while (true) {
-        var sel = try self.selector(allocator);
-        selectors.append(allocator, sel) catch |err| {
-            sel.deinit(allocator);
+fn appendAtRule(
+    self: *CSSParser,
+    allocator: std.mem.Allocator,
+    rules: *std.ArrayList(CSSRule),
+    keyframes: *std.ArrayList(KeyframesRule),
+    rule: rule_syntax.Rule,
+    parent_source: ?[]const u8,
+    parents: []const Selector,
+) anyerror!void {
+    if (rule.block == null or self.group_depth >= 64) return;
+    const name = rule.name.?.slice(self.string);
+    if (css_syntax.identifierEquals(name, "keyframes")) {
+        var keyframe_rule = parseKeyframesRule(allocator, self.string, rule) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return;
+        };
+        keyframes.append(allocator, keyframe_rule) catch |err| {
+            keyframe_rule.deinit(allocator);
             return err;
         };
-        self.whitespace();
-        if (self.pos >= self.string.len or self.string[self.pos] != ',') break;
-        self.pos += 1;
-        self.whitespace();
+        return;
     }
-    try self.literal('{');
-    self.whitespace();
-    var properties = try self.body(allocator);
+    const active = if (css_syntax.identifierEquals(name, "media"))
+        media_query.matches(rule.prelude.slice(self.string), self.media)
+    else if (css_syntax.identifierEquals(name, "supports"))
+        try supports.matches(allocator, rule.prelude.slice(self.string), supportsSelector)
+    else
+        false;
+    if (!active) return;
+    var child = CSSParser{ .string = rule.block.?.slice(self.string), .pos = 0, .media = self.media, .top_level = false, .group_depth = self.group_depth + 1 };
+    if (parent_source) |source| {
+        try child.appendStyleContents(allocator, rules, keyframes, source, parents);
+    } else {
+        const children = try child.parseWithKeyframes(allocator, keyframes);
+        var transferred = false;
+        defer {
+            if (!transferred) for (children) |*item| item.deinit(allocator);
+            allocator.free(children);
+        }
+        try rules.appendSlice(allocator, children);
+        transferred = true;
+    }
+}
+
+/// Compile one structural rule and its ordered declaration/nested-rule groups.
+/// Lowered source is temporary; every compiled selector and map owns its data.
+fn appendQualifiedRule(self: *CSSParser, allocator: std.mem.Allocator, rules: *std.ArrayList(CSSRule), keyframes: *std.ArrayList(KeyframesRule), rule: rule_syntax.Rule, parent_source: ?[]const u8) anyerror!void {
+    if (rule.block == null or self.group_depth >= 64) return;
+    const source = try nesting.lower(allocator, rule.prelude.slice(self.string), parent_source);
+    defer allocator.free(source);
+    const selectors = try parseSelectorList(allocator, source);
+    defer {
+        for (selectors) |*sel| sel.deinit(allocator);
+        allocator.free(selectors);
+    }
+    var block = CSSParser{ .string = rule.block.?.slice(self.string), .pos = 0, .media = self.media, .group_depth = self.group_depth + 1 };
+    try block.appendStyleContents(allocator, rules, keyframes, source, selectors);
+}
+
+fn appendDeclarations(allocator: std.mem.Allocator, rules: *std.ArrayList(CSSRule), parents: []const Selector, properties: *DeclarationMap) !void {
+    try rules.ensureUnusedCapacity(allocator, parents.len);
+    for (parents) |parent| {
+        var selector_copy = try parent.clone(allocator);
+        errdefer selector_copy.deinit(allocator);
+        const map = try properties.clone();
+        rules.appendAssumeCapacity(.{ .selector = selector_copy, .properties = map, .owned = true });
+    }
+}
+
+fn appendStyleContents(self: *CSSParser, allocator: std.mem.Allocator, rules: *std.ArrayList(CSSRule), keyframes: *std.ArrayList(KeyframesRule), source: []const u8, parents: []const Selector) anyerror!void {
+    const rules_start = rules.items.len;
+    var iterator = rule_syntax.StyleBlockIterator{ .input = self.string };
+    var properties = DeclarationMap.init(allocator);
     defer properties.deinit();
-    try self.literal('}');
-    try rules.ensureUnusedCapacity(allocator, selectors.items.len);
-    for (selectors.items) |sel| {
-        const cloned = try properties.clone();
-        rules.appendAssumeCapacity(.{ .selector = sel, .properties = cloned, .owned = true });
-        transferred += 1;
-    }
+    while (iterator.next()) |item| switch (item) {
+        .declaration => |declaration| try css_declarations.putRaw(&properties, declaration.name.slice(self.string), declaration.value.slice(self.string)),
+        .rule => |rule| {
+            if (rule.name) |name| {
+                const keyword = name.slice(self.string);
+                if (!css_syntax.identifierEquals(keyword, "media") and !css_syntax.identifierEquals(keyword, "supports") and !css_syntax.identifierEquals(keyword, "keyframes")) continue;
+            }
+            if (properties.count() != 0) try appendDeclarations(allocator, rules, parents, &properties);
+            properties.deinit();
+            properties = DeclarationMap.init(allocator);
+            if (rule.name != null) {
+                try self.appendAtRule(allocator, rules, keyframes, rule, source, parents);
+            } else self.appendQualifiedRule(allocator, rules, keyframes, rule, source) catch |err| {
+                if (err == error.OutOfMemory) return err;
+            };
+        },
+    };
+    if (properties.count() != 0 or rules.items.len == rules_start) try appendDeclarations(allocator, rules, parents, &properties);
 }
 
 test "selector lists preserve member specificity declarations and nested commas" {
@@ -1065,9 +894,9 @@ test "selector lists preserve member specificity declarations and nested commas"
     try std.testing.expectEqualStrings("block", rules[0].properties.get("display").?.value);
     try std.testing.expectEqualStrings("block", rules[1].properties.get("display").?.value);
     try std.testing.expect(rules[1].properties.get("color").?.important);
-    try std.testing.expect(rules[2].cascadePriority() < rules[3].cascadePriority());
+    try std.testing.expect(rules[2].specificity().order(rules[3].specificity()) == .lt);
     try std.testing.expectEqualStrings("blue", rules[5].properties.get("color").?.value);
-    // Tables are independent owners even though declaration values are borrows.
+    // Removing a declaration cannot retire another rule's copy.
     _ = rules[0].properties.remove("color");
     try std.testing.expect(rules[1].properties.contains("color"));
 }
@@ -1114,8 +943,8 @@ test "keyframes parse beside selector rules and normalize offsets" {
 
     try std.testing.expectEqual(@as(usize, 1), rules.len);
     try std.testing.expectEqualStrings(
-        "2s infinite alternate pulse",
-        rules[0].properties.get("animation").?.value,
+        "pulse",
+        rules[0].properties.get("animation-name").?.value,
     );
     try std.testing.expectEqual(@as(usize, 1), keyframes.items.len);
     const pulse = &keyframes.items[0];
@@ -1409,7 +1238,7 @@ test "declaration values retain semicolons inside URL functions" {
     }
     try std.testing.expectEqual(@as(usize, 1), rules.len);
     try std.testing.expectEqualStrings(
-        "url(data:image/png;base64,AAAA)",
+        "url(\"data:image/png;base64,AAAA\")",
         rules[0].properties.get("background-image").?.value,
     );
     try std.testing.expectEqualStrings(
@@ -1465,15 +1294,15 @@ test "legacy and modern generated pseudo selectors retain kind and specificity" 
 
     try std.testing.expectEqual(@as(usize, 3), rules.len);
     try std.testing.expectEqual(pseudo.Kind.before, rules[0].selector.pseudoElementKind().?);
-    try std.testing.expectEqual(@as(u32, 12), rules[0].cascadePriority());
-    try std.testing.expectEqualStrings("'legacy'", rules[0].properties.get("content").?.value);
+    try std.testing.expectEqual(Specificity{ .classes = 1, .types = 2 }, rules[0].specificity());
+    try std.testing.expectEqualStrings("\"legacy\"", rules[0].properties.get("content").?.value);
 
     try std.testing.expectEqual(pseudo.Kind.after, rules[1].selector.pseudoElementKind().?);
-    try std.testing.expectEqual(@as(u32, 101), rules[1].cascadePriority());
+    try std.testing.expectEqual(Specificity{ .ids = 1, .types = 1 }, rules[1].specificity());
     try std.testing.expectEqualStrings("\"modern\"", rules[1].properties.get("content").?.value);
 
     try std.testing.expectEqual(pseudo.Kind.before, rules[2].selector.pseudoElementKind().?);
-    try std.testing.expectEqual(@as(u32, 13), rules[2].cascadePriority());
+    try std.testing.expectEqual(Specificity{ .classes = 1, .types = 3 }, rules[2].specificity());
 }
 
 test "generated pseudo-elements are terminal selectors" {
@@ -1523,7 +1352,7 @@ test "content keeps the generated-content subset and defaults to normal" {
         "\"quoted ; { braces }\"",
         rules[2].properties.get("content").?.value,
     );
-    try std.testing.expectEqualStrings("'single quoted'", rules[3].properties.get("content").?.value);
+    try std.testing.expectEqualStrings("\"single quoted\"", rules[3].properties.get("content").?.value);
     try std.testing.expect(rules[4].properties.get("content") == null);
     try std.testing.expectEqualStrings("red", rules[4].properties.get("color").?.value);
 }
@@ -1546,8 +1375,8 @@ test "z-index retains auto and signed integers while rejecting invalid values" {
 
     try std.testing.expectEqual(@as(usize, 5), rules.len);
     try std.testing.expectEqualStrings("-4", rules[0].properties.get("z-index").?.value);
-    try std.testing.expectEqualStrings("AUTO", rules[1].properties.get("z-index").?.value);
-    try std.testing.expectEqualStrings("+0", rules[2].properties.get("z-index").?.value);
+    try std.testing.expectEqualStrings("auto", rules[1].properties.get("z-index").?.value);
+    try std.testing.expectEqualStrings("0", rules[2].properties.get("z-index").?.value);
     try std.testing.expectEqualStrings("-2147483648", rules[3].properties.get("z-index").?.value);
     try std.testing.expect(rules[4].properties.get("z-index") == null);
 }
@@ -1566,9 +1395,9 @@ test "structural selectors and dash-match attributes parse as owned selectors" {
         allocator.free(rules);
     }
     try std.testing.expectEqual(@as(usize, 15), rules.len);
-    for (rules[0..13]) |rule| try std.testing.expectEqual(@as(u32, 10), rule.cascadePriority());
-    try std.testing.expectEqual(@as(u32, 20), rules[13].cascadePriority());
-    try std.testing.expectEqual(@as(u32, 10), rules[14].cascadePriority());
+    for (rules[0..13]) |rule| try std.testing.expectEqual(Specificity{ .classes = 1 }, rule.specificity());
+    try std.testing.expectEqual(Specificity{ .classes = 1 }, rules[13].specificity());
+    try std.testing.expectEqual(Specificity{ .classes = 1 }, rules[14].specificity());
 }
 
 test "form and link state pseudo-classes parse as compound selectors" {
@@ -1581,7 +1410,7 @@ test "form and link state pseudo-classes parse as compound selectors" {
         allocator.free(rules);
     }
     try std.testing.expectEqual(@as(usize, 4), rules.len);
-    try std.testing.expectEqual(@as(u32, 20), rules[0].cascadePriority());
+    try std.testing.expectEqual(Specificity{ .classes = 2 }, rules[0].specificity());
 }
 
 test "standalone selector lists require complete input and own every member" {
@@ -1597,7 +1426,7 @@ test "standalone selector lists require complete input and own every member" {
         allocator.free(selectors);
     }
     try std.testing.expectEqual(@as(usize, 3), selectors.len);
-    try std.testing.expectEqual(@as(u32, 11), selectors[0].priority());
+    try std.testing.expectEqual(Specificity{ .classes = 1, .types = 1 }, selectors[0].specificity());
     try std.testing.expectEqualStrings("a,b", selectors[1].attribute.value.?);
     try std.testing.expectEqual(@as(usize, 2), selectors[2].complex.selectors.items.len);
     for ([_][]const u8{ "", " ", "div,", ",div", "div,,span", "div {color:red}", "div;span", "div, :unsupported", "div:not(.a", "[title='x'", "div >", "div:not(.a])" }) |invalid| {
@@ -1633,4 +1462,44 @@ fn selectorListAllocationTrial(allocator: std.mem.Allocator) !void {
 
 test "standalone selector parsing reclaims partial owners on allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, selectorListAllocationTrial, .{});
+}
+
+test "CSS escaped selectors retain lexical identity Unicode and compound boundaries" {
+    const allocator = std.testing.allocator;
+    const source = try allocator.dupe(u8, "\\64 iv, .a\\.b, #\\31 23, .caf\u{e9}, [da\\74 a-x='a\\20 b'], #a\\>b, :\\6c ang(e\\6e), div/**/.a:\\68 over.b");
+    const selectors = parseSelectorList(allocator, source) catch |err| {
+        allocator.free(source);
+        return err;
+    };
+    allocator.free(source);
+    defer {
+        for (selectors) |*sel| sel.deinit(allocator);
+        allocator.free(selectors);
+    }
+    try std.testing.expectEqual(8, selectors.len);
+    try std.testing.expectEqualStrings("div", selectors[0].tag.tag);
+    try std.testing.expectEqualStrings("a.b", selectors[1].class.class);
+    try std.testing.expectEqualStrings("123", selectors[2].id.id);
+    try std.testing.expectEqualStrings("caf\u{e9}", selectors[3].class.class);
+    try std.testing.expectEqualStrings("data-x", selectors[4].attribute.name);
+    try std.testing.expectEqualStrings("a b", selectors[4].attribute.value.?);
+    try std.testing.expectEqualStrings("a>b", selectors[5].id.id);
+    try std.testing.expectEqualStrings("en", selectors[6].structural.argument.?);
+    try std.testing.expectEqual(Specificity{ .classes = 3, .types = 1 }, selectors[7].specificity());
+    for ([_][]const u8{ ".123", "#123", "div/**/span", "[attr=123]", "[attr='bad\nstring']", ".a\\\nb", ":hover()", ":first-child()", "div[title=x]span" }) |invalid| {
+        if (parseSelectorList(allocator, invalid)) |unexpected| {
+            for (unexpected) |*sel| sel.deinit(allocator);
+            allocator.free(unexpected);
+            return error.ExpectedInvalidSelector;
+        } else |err| try std.testing.expect(err != error.OutOfMemory);
+    }
+    try std.testing.checkAllAllocationFailures(allocator, struct {
+        fn run(a: std.mem.Allocator) !void {
+            const list = try parseSelectorList(a, "\\64 iv.foo\\:bar[da\\74 a-x='a\\20 b']:\\6e ot(.hi\\#d), .caf\u{e9}");
+            defer {
+                for (list) |*sel| sel.deinit(a);
+                a.free(list);
+            }
+        }
+    }.run, .{});
 }

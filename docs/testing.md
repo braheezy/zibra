@@ -58,6 +58,10 @@ Unsupported or failed workloads are missing data, never zero-time successes.
 Use a subsystem test step while iterating on a contained change. Focused steps
 compile a smaller test root and make it harder to miss the direct regression:
 
+- `zig build test-css-values` — complete lexical kinds, value normalization and bounded malformed-input handling without native libraries;
+- `zig build test-css-syntax` — structural rule/declaration recovery without DOM or native libraries;
+- `zig build test-css-declarations` — ordered blocks, shared property grammar, serialization and allocation failure cleanup without native libraries;
+- `zig build test-css-supports` — feature-query boolean grammar, declaration admission, limits and allocation cleanup without native libraries;
 - `zig build test-document`
 - `zig build test-render`
 - `zig build test-network`
@@ -183,15 +187,59 @@ nested media conditions. Keep their exact goldens when refactoring CSS owners.
 `zig build test-document` includes native stylesheet replacement and restyle
 allocation-failure regressions. The render suite's `Native CSS inspection` test
 checks real geometry, paint and software pixels across viewport/source changes.
-The [CSS recovery fixture](../tests/manual/css-recovery.html) records known
-native-parser gaps after nested unknown at-rules and at EOF; it is not a passing
-pipeline golden.
+The [CSS recovery fixture](../tests/manual/css-recovery.html) checks declarations
+after nested unknown at-rules and blocks closed at EOF. Both bars must be green
+and 120px wide; its style, layout and display list are pipeline goldens.
+The [ordered declaration WPT manifest](../tests/wpt/manifest-css-declarations.yaml)
+covers live inline CSSOM, shorthand priority, serialization, clone isolation and
+crash safety. Run all categories serially against the built binary. The
+[interactive declaration page](../tests/manual/css-declarations.html) checks
+pending shorthand edits and invalid setters through synchronous geometry reads
+and runs in `test-wpt`; `src/tests/css_style.zig` also covers native ownership
+and computed readback.
+
+The [structural syntax WPT manifest](../tests/wpt/manifest-css-structure.yaml)
+covers computed declarations, EOF recovery, bracket matching and malformed-input
+crashes. The same cases are enabled in the default allowlist. CSSOM insertion
+tests remain separate because retained stylesheet objects are not implemented.
 
 The focused [syntax](../tests/wpt/manifest-css-frontend.yaml) and
 [interop](../tests/wpt/manifest-css-interop.yaml) WPT manifests retain their
 upstream cases and PASS expectations. They exercise the native browser; a
 successful inspection capture does not establish an upstream WPT pass. The
 [CSS plan](../CSS_PLAN.md) describes the remaining syntax and CSSOM work.
+
+The [logical selector fixture](../tests/manual/css-selectors.html) checks shared
+DOM queries, forgiving lists, explicit specificity and geometry after ancestor,
+sibling and inline mutations. Document tests cover selector ownership, An+B
+admission, cache equivalence and cascade provenance; script/render tests carry
+those semantics through synchronous style reads and software pixels.
+
+The [color fixture](../tests/manual/css-colors.html) checks live resolved
+readback, named colors, alpha, currentcolor inheritance and variable fallback.
+It runs in the local WPT gate; native render coverage also verifies retained
+background recoloring without geometry invalidation. The
+[focused color manifest](../tests/wpt/manifest-css-colors.yaml) covers
+rendering, keyword parsing and computed-value helpers using `CSS.supports`.
+
+The [feature-query fixture](../tests/manual/css-supports.html) checks both
+`CSS.supports` overloads, conditional rule activation, selector capability and
+matching media-dependent geometry. It runs in the local WPT gate. Native tests
+cover strict selector admission, nested rule/keyframe order, source replacement,
+software pixels and allocation failure cleanup. The
+[focused supports manifest](../tests/wpt/manifest-css-supports.yaml) includes
+unchanged API, rendering, variable and malformed-input cases plus computed-color
+helpers newly able to reach value assertions. CSSOM rule-identity and CSS nesting
+prerequisites remain distinct from feature-query evaluation.
+
+The [CSS completion fixture](../tests/manual/css-completion.html) checks color
+calculations, nested-selector invalidation, animation fill changes and native
+scroll/sticky geometry in the local WPT gate. The corresponding
+[upstream selection](../tests/wpt/manifest-css-completion.yaml) covers color and
+animation value helpers, nested conditional rules, sticky constraints and
+rendering/crash cases. Unsupported CSSOM selector mutation and scroll-linked
+animation prerequisites remain diagnostic; preserve PASS expectations and
+distinguish them from semantic failures in implemented behavior.
 
 ### Native macOS visual checks
 

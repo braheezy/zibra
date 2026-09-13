@@ -1,0 +1,49 @@
+<!-- How to verify: expect green PASS and two matching panels with the same
+     clipped image near the bottom right. Checks mutate escaped selector
+     attributes, modern colors and background shorthand, then read layout. -->
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CSS grammar and escaped selectors</title><style>
+body { margin:30px; font:18px sans-serif; }
+.panel { box-sizing:border-box; width:80px; height:60px; margin:10px 0; font-size:20px; border:2px solid black;
+  background: url(background-image-pattern.ppm) 76px 41px / 20px 20px no-repeat rgb(230 250 230); }
+#reference { width:120px; }
+\64 iv.sm\:card[data-\78="a\20 b"] { width:120px; }
+#sprite\:one { background-position:right 1em bottom -5px; }
+</style></head><body>
+<h1 id="status">Checking CSS grammar</h1>
+<div class="panel sm:card" id="sprite:one" data-x="a b"></div>
+<div class="panel" id="reference"></div>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var target = document.getElementById('sprite:one'), style = target.style, results = [];
+  function equal(a, b) { if (a !== b) throw Error(String(a) + ' != ' + String(b)); }
+  function check(name, run) {
+    try { run(); results.push({name:name, status:0}); }
+    catch (e) { results.push({name:name, status:1, message:String(e)}); }
+  }
+  check('escaped selectors match DOM and restyle after attribute changes', function() {
+    equal(document.querySelector('#sprite\\:one.sm\\:card[data-\\78="a\\20 b"]'), target);
+    equal(target.getBoundingClientRect().width, 120);
+    target.setAttribute('data-x', 'different'); equal(target.getBoundingClientRect().width, 80);
+    target.setAttribute('data-x', 'a b'); equal(target.getBoundingClientRect().width, 120);
+  });
+  check('RGB HSL and custom channels share grammar and serialization', function() {
+    style.color = 'hsl(.5turn 100% 50% / 25%)'; equal(style.color, 'rgba(0, 255, 255, 0.25)');
+    style.color = 'rgb(20%, 10%, 0)'; equal(style.color, 'rgba(0, 255, 255, 0.25)');
+    style.setProperty('--channels', '0 128 0'); style.color = 'rgb(var(--channels) / .75)';
+    equal(getComputedStyle(target).color, 'rgba(0, 128, 0, 0.75)');
+  });
+  check('background shorthand round-trips positions sizes and trailing colors', function() {
+    style.background = 'url(background-image-pattern.ppm) bottom -5px right 1em / 20px 20px no-repeat rgb(230 250 230)';
+    equal(style.backgroundPosition, 'right 1em bottom -5px'); equal(style.backgroundSize, '20px 20px');
+    var text = style.cssText; style.cssText = text; equal(style.cssText, text);
+    style.backgroundPosition = 'left right'; equal(style.backgroundPosition, 'right 1em bottom -5px');
+    equal(target.getBoundingClientRect().width, 120);
+  });
+  var failures = results.filter(function(result) { return result.status !== 0; });
+  var status = document.getElementById('status');
+  status.textContent = failures.length ? 'FAIL: ' + failures[0].message : 'PASS: CSS grammar and escaped selectors';
+  status.style.color = failures.length ? 'red' : 'green';
+  if (typeof completion_callback === 'function') completion_callback(results, {status:0});
+});
+</script></body></html>

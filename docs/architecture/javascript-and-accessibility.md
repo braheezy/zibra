@@ -162,6 +162,20 @@ the mutation module access to the realm coordinator. An optional core
 transaction without coupling the mutation module to parser types; an old
 pointer passed to it is an opaque map key and may not be dereferenced.
 
+## Native selector queries
+
+Document and Element subtree queries compile the same bounded, unforgiving
+selector list used by stylesheets. Logical is/where members perform their own
+forgiving parsing. Invalid members reject the entire ordinary list, allocation
+errors propagate, and wrappers preserve SyntaxError. Matching appends each
+node once in tree order even when multiple selectors match. Element wrappers
+exclude the receiver itself; native document queries include the root.
+
+Query-local selectors and relational caches retire before the callback returns.
+Subtree queries prepare `:has` caches from the actual tree root so logical
+arguments see ancestors outside the requested result subtree, consistent with
+uncached matching. No selector or ancestry pointer is retained in JavaScript.
+
 ## WPT testharness result bridge
 
 The first WPT adapter configures its standalone `Browser` with a generic
@@ -520,15 +534,47 @@ topology, not invent their own document membership heuristic. A non-retaining
 Realm-local Node brand covers native wrappers, synthetic nodes, and documents
 so Range arguments cannot impersonate Nodes with a `nodeType` property.
 
-The bounded inline-style declaration lives in `runtime/css_style.js` and is
-cached per Node wrapper. Its reads parse the current style attribute; writes
-use the wrapper's attribute mutation boundary and preserve unrelated
-declarations, including custom-property case and declaration-local priority.
+The inline-style view in `runtime/css_style.js` is cached per Node wrapper.
+`css_style_bindings.zig` resolves numeric handles through a narrow heap-stable
+Host, borrows the Element only during the callback, and copies all returned
+strings into Kiesel. JavaScript performs string/argument conversion; the native
+ordered declaration owner supplies parsing, validation, priority, longhand
+order, queries, serialization, and transactional mutations. The style pass
+reads the same Element-owned block. CSSOM mutations use owned attribute storage,
+style invalidation and render requests; SVG also invalidates its layout/paint.
+Cloning copies pending shorthand data independently of attribute serialization.
+See the [inline declaration ownership contract](document-and-rendering.md#document-module-ownership)
+for raw attribute revisions and publication. The legacy whole `Node.style`
+assignment still enters `style_set` to preserve its immediate transition-start
+behavior; its raw replacement uses the shared native grammar on the next read.
+
 Computed readback flushes before resolving the target, even when only an
 ancestor was dirty, so inherited variables and root-relative font sizes are
 current. Custom values are copied from the Element's computed environment into
-Kiesel strings; no environment-backed slice crosses the callback. This is not
-a complete stylesheet CSSOM or native declaration-normalization API.
+Kiesel strings; no environment-backed slice crosses the callback. Computed
+views expose the registry's longhands through both CSS and camel-case names;
+ordinary property lookup is ASCII case-insensitive and custom names keep case.
+The native readback uses registry color metadata and `color.resolve` to copy
+resolved RGB/RGBA colors, including the element's foreground for currentcolor.
+Temporary serialization storage retires only after copying to Kiesel. Dirty
+fields after a failed flush yield an empty string. Inline declarations keep
+specified keywords, and held computed views read fresh fields on each access.
+Remaining
+CSSOM work includes additional property-specific grammars/serialization, complete
+IDL/descriptors and mutation records, and persistent stylesheet/rule APIs.
+Value tokenization/normalization and escaped custom-name identity use the shared
+native declaration layer, including source-preserving custom values and EOF repair.
+
+`runtime/css_style.js` also installs a fresh `CSS` namespace in each document
+Realm. `supports` performs Web IDL argument-count/string conversion before the
+native CSS binding evaluates the query. The two-argument form treats property
+names as literal CSSOM strings and rejects embedded priority; the single-argument
+form accepts a condition or an implicitly parenthesized declaration, including
+`!important`. Both use `css_supports.zig`, with the same strict selector predicate
+as `@supports`. Native query allocations are callback-local and only a boolean
+returns to Kiesel. No Element resolution, style flush, DOM mutation, or render
+request occurs. The namespace is capability detection, not a live stylesheet
+or rule-object owner.
 
 ## JavaScript element geometry
 
@@ -536,6 +582,9 @@ a complete stylesheet CSSOM or native declaration-normalization API.
 `offsetWidth`/`offsetHeight`, `offsetLeft`/`offsetTop`/`offsetParent`, and
 `clientWidth`/`clientHeight`/`clientLeft`/`clientTop`, plus
 DOMRectReadOnly/DOMRect/DOMRectList snapshot values.
+Element scroll offsets/dimensions and immediate `scroll`, `scrollTo` and
+`scrollBy` use the same callback. Requests and results contain only numbers;
+absent axes preserve their offsets and non-finite inputs normalize to zero.
 `geometry_bindings.zig` retains only a narrow Host embedded
 in `Js`. Each WindowRealm has a synchronous geometry callback installed after
 document creation and cleared on replacement or retirement, like computed
@@ -586,12 +635,21 @@ the adapter captures its handle with the non-lock-taking active-window helper,
 then JavaScript uses the canonical wrapper cache. Detached/retired handles
 produce zero metrics and a null parent without calling into a retired Frame.
 
+Scroll requests synchronously flush style/layout before clamping to the used
+range. Element offsets use the box's effective zoom; root HTML vertical offsets
+map to the Frame viewport. A successful move refreshes sticky descendants,
+marks the owning paint cache and schedules normal presentation, without
+evaluating JavaScript inside the callback. Geometry reads refresh sticky offsets
+before copying boxes, so script-visible rectangles and the next paint agree.
+Horizontal root scrolling, RTL/reversed ranges, smooth scrolling, scroll events
+and overflow-axis longhands remain separate capabilities.
+
 This is an initial HTML box-geometry slice, not complete CSSOM View. Geometry
 inherits layout's integer precision, bounded formatting, and translation-only
 transform support. Decorated inline boxes and complex/vertical fragmentation,
 SVG boxes, Range text rectangles, quirks-mode body viewport rules, themed
 choice/select/button sizing, textarea editing/scrollbars and intrinsic rows/cols,
-transformed fixed containing blocks, and scroll APIs need separate coverage.
+transformed fixed containing blocks, and additional scroll APIs need separate coverage.
 Do not claim meaningful rendering benchmark scores from merely exposing the
 property names: verify the layout work and supported workload first.
 

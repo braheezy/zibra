@@ -1,0 +1,19 @@
+# Escaped selectors, absolute RGB/HSL colors and single-layer positions.
+# Color math remains visible as unsupported assertions in the valid suites.
+tests:
+  - dom/nodes/ParentNode-querySelector-escapes.html
+  - css/css-color/parsing/color-valid-rgb.html
+  - css/css-color/parsing/color-invalid-rgb.html
+  - css/css-color/parsing/color-valid-hsl.html
+  - css/css-color/parsing/color-invalid-hsl.html
+  - css/css-backgrounds/parsing/background-position-valid.html
+  - css/css-backgrounds/parsing/background-position-invalid.html
+reftests:
+  - css/CSS2/syntax/escaped-ident-spaces-001.xht
+  - css/CSS2/syntax/escaped-ident-char-001.xht
+  - css/css-color/rgb-003.html
+  - css/css-color/hsl-002.html
+  - css/css-backgrounds/background-position-three-four-values.html
+  - css/css-backgrounds/background-position-negative-percentage-comparison.html
+crashtests:
+  - css/css-syntax/crashtests/atrule-with-escape-character.html

@@ -1,0 +1,62 @@
+# Color calculation/serialization, nested rules, animation phases, and sticky scrolling.
+# PASS expectations remain intact; unsupported prerequisites are recorded in the report.
+tests:
+  - css/css-nesting/implicit-nesting-ident.html
+  - css/css-nesting/implicit-nesting-ident-recovery.html
+  - css/css-nesting/nested-error-recovery.html
+  - css/css-color/parsing/color-computed-rgb.html
+  - css/css-color/parsing/color-computed-hsl.html
+  - css/css-color/parsing/color-valid-rgb.html
+  - css/css-color/parsing/color-valid-hsl.html
+  - css/css-color/parsing/color-invalid-rgb.html
+  - css/css-color/parsing/color-invalid-hsl.html
+  - css/css-position/parsing/position-valid.html
+  - css/css-animations/parsing/animation-fill-mode-valid.html
+  - css/css-animations/parsing/animation-fill-mode-invalid.html
+  - css/css-animations/parsing/animation-fill-mode-computed.html
+  - css/css-animations/parsing/animation-direction-valid.html
+  - css/css-animations/parsing/animation-direction-invalid.html
+  - css/css-animations/parsing/animation-direction-computed.html
+  - css/css-animations/parsing/animation-play-state-valid.html
+  - css/css-animations/parsing/animation-play-state-invalid.html
+  - css/css-animations/parsing/animation-play-state-computed.html
+  - css/css-animations/parsing/animation-delay-valid.html
+  - css/css-animations/parsing/animation-delay-invalid.html
+  - css/css-animations/parsing/animation-delay-computed.html
+  - css/css-animations/parsing/animation-duration-valid.html
+  - css/css-animations/parsing/animation-duration-invalid.html
+  - css/css-animations/parsing/animation-duration-computed.html
+  - css/css-animations/parsing/animation-iteration-count-valid.html
+  - css/css-animations/parsing/animation-iteration-count-invalid.html
+  - css/css-animations/parsing/animation-iteration-count-computed.html
+  - css/css-nesting/mixed-declarations-rules.html
+  - css/css-nesting/invalidation-001.html
+  - css/css-nesting/invalidation-002.html
+  - css/css-nesting/invalidation-003.html
+  - css/css-nesting/invalidation-004.html
+  - css/css-position/sticky/position-sticky-top.html
+  - css/css-position/sticky/position-sticky-bottom.html
+  - css/css-position/sticky/position-sticky-left.html
+  - css/css-position/sticky/position-sticky-right.html
+  - css/css-position/sticky/position-sticky-nested-top.html
+  - css/css-position/sticky/position-sticky-nested-bottom.html
+  - css/css-position/sticky/position-sticky-top-and-bottom.html
+  - css/css-position/sticky/position-sticky-overflow-hidden.html
+reftests:
+  - css/css-position/sticky/position-sticky-top-004.html
+  - css/css-position/sticky/position-sticky-stacking-context.html
+  - css/css-nesting/nesting-basic.html
+  - css/css-nesting/implicit-nesting.html
+  - css/css-nesting/nesting-type-selector.html
+  - css/css-nesting/conditional-rules.html
+  - css/css-nesting/conditional-properties.html
+  - css/css-nesting/supports-rule.html
+  - css/css-conditional/at-supports-048.html
+  - css/css-conditional/at-supports-content-003.html
+  - css/css-position/sticky/position-sticky-top-002.html
+  - css/css-position/sticky/position-sticky-bottom-002.html
+crashtests:
+  - css/css-nesting/pseudo-where-crash.html
+  - css/css-nesting/implicit-parent-insertion-crash.html
+  - css/css-position/sticky/position-sticky-scroll-offset-clamp-crash.html
+  - css/css-position/sticky/position-sticky-details-crash.html

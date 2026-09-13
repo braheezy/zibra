@@ -9,6 +9,7 @@ const parser = @import("../../document/parser.zig");
 const background_image = @import("../../document/background_image.zig");
 const display_list = @import("display_list.zig");
 const paint_effects = @import("paint_effects.zig");
+const BoxEdges = @import("box_model.zig").BoxEdges;
 
 const DisplayItem = display_list.DisplayItem;
 
@@ -19,6 +20,7 @@ pub const BackgroundImagePaint = struct {
     size: background_image.Size,
     repeat: background_image.Repeat,
     position: []const u8,
+    font_size: f64 = 16,
     attachment: display_list.ImageTiling.Attachment,
 };
 
@@ -40,7 +42,8 @@ pub fn backgroundImagePaint(element: *const parser.Element) ?BackgroundImagePain
         .source_height = @intCast(data.image.height),
         .size = size,
         .repeat = repeat,
-        .position = styleValue(styles, "background-position") orelse "0 0",
+        .position = styleValue(styles, "background-position") orelse "0% 0%",
+        .font_size = @import("../../document/length.zig").parsePixel(styleValue(styles, "font-size") orelse "16px") orelse 16,
         // `local` needs a scrollable element's own scroll offset, which is
         // outside this single-layer background subset. It therefore retains
         // the ordinary scroll-attached phase until element scrolling gains a
@@ -97,8 +100,9 @@ pub fn appendBackgroundBox(
     }
 }
 
-/// Paint one positioned background tile clipped to the element's box. The
-/// raster command retains repetition metadata so small images do not produce
+/// Paint one positioned background tile clipped to the element's border box.
+/// Used borders are already scaled by layout; the padding box positions tiles.
+/// The raster command retains repetition metadata so small images do not produce
 /// one display command per tile. A fixed attachment resolves its size and
 /// position against the frame viewport but keeps the supplied element box as
 /// its paint clip.
@@ -110,14 +114,16 @@ pub fn appendBackgroundImageBox(
     y: i32,
     width: i32,
     height: i32,
+    border: BoxEdges,
     viewport_width: i32,
     viewport_height: i32,
     css_scale: f64,
     source: ?display_list.DisplayItemSource,
 ) !void {
     if (width <= 0 or height <= 0) return;
-    const positioning_width = if (paint.attachment == .fixed) viewport_width else width;
-    const positioning_height = if (paint.attachment == .fixed) viewport_height else height;
+    const fixed = paint.attachment == .fixed;
+    const positioning_width = if (fixed) viewport_width else @max(width -| border.left -| border.right, 0);
+    const positioning_height = if (fixed) viewport_height else @max(height -| border.top -| border.bottom, 0);
     const resolved = background_image.resolveSize(
         paint.size,
         positioning_width,
@@ -134,6 +140,7 @@ pub fn appendBackgroundImageBox(
         resolved.width,
         resolved.height,
         css_scale,
+        paint.font_size,
     );
 
     try commands.append(allocator, .{ .image = .{
@@ -147,8 +154,8 @@ pub fn appendBackgroundImageBox(
         .tiling = .{
             .width = resolved.width,
             .height = resolved.height,
-            .offset_x = position.x,
-            .offset_y = position.y,
+            .offset_x = position.x +| if (fixed) @as(i32, 0) else border.left,
+            .offset_y = position.y +| if (fixed) @as(i32, 0) else border.top,
             .repeat_x = paint.repeat.x,
             .repeat_y = paint.repeat.y,
             .attachment = paint.attachment,
@@ -230,6 +237,7 @@ test "background image paint resolves size and fractional source crop" {
         20,
         100,
         100,
+        .{},
         300,
         200,
         1.0,
@@ -268,6 +276,7 @@ test "fixed background images use viewport sizing but retain element clipping" {
         80,
         20,
         20,
+        .{ .top = 3, .left = 5, .bottom = 3, .right = 5 },
         200,
         100,
         1.0,
@@ -283,6 +292,28 @@ test "fixed background images use viewport sizing but retain element clipping" {
     try std.testing.expectEqual(@as(i32, 100), image.tiling.?.width);
     try std.testing.expectEqual(@as(i32, 100), image.tiling.?.offset_x);
     try std.testing.expectEqual(display_list.ImageTiling.Attachment.fixed, image.tiling.?.attachment);
+}
+
+test "CSS background edge positions preserve font zoom negative offsets and clip geometry" {
+    const pixels = [_]u8{ 0, 128, 0, 255 };
+    var commands: std.ArrayList(DisplayItem) = .empty;
+    defer commands.deinit(std.testing.allocator);
+    try appendBackgroundImageBox(&commands, std.testing.allocator, .{
+        .pixels = &pixels,
+        .source_width = 1,
+        .source_height = 1,
+        .size = .{ .dimensions = .{ .width = .{ .pixels = 20 }, .height = .{ .pixels = 10 } } },
+        .position = "bottom -5px right 1em",
+        .font_size = 24,
+        .repeat = .{ .x = false, .y = false },
+        .attachment = .scroll,
+    }, 10, 20, 200, 100, .{ .left = 3, .right = 7, .top = 5, .bottom = 9 }, 800, 600, 2, null);
+    const command = commands.items[0].image;
+    try std.testing.expectEqual(10, command.x1);
+    try std.testing.expectEqual(210, command.x2);
+    try std.testing.expectEqual(40, command.tiling.?.width);
+    try std.testing.expectEqual(105, command.tiling.?.offset_x);
+    try std.testing.expectEqual(81, command.tiling.?.offset_y);
 }
 
 test "rounded control group constrains child hits without compositing" {

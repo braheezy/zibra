@@ -45,6 +45,7 @@ pub const BlockInput = struct {
     opacity: f64 = 1.0,
     clip: Clip = .{},
     scroll_y: i32 = 0,
+    scroll_x: i32 = 0,
 };
 
 pub const LocalizedBlock = struct {
@@ -119,7 +120,7 @@ pub fn localizeBlock(parent_point: Point, input: BlockInput) ?LocalizedBlock {
     if (input.clip.enabled and !containsRoundedBox(local, input.size, input.clip.radius)) return null;
     return .{
         .local = local,
-        .content = addOffset(local, .{ .x = 0, .y = @max(input.scroll_y, 0) }),
+        .content = addOffset(local, .{ .x = @max(input.scroll_x, 0), .y = @max(input.scroll_y, 0) }),
         .hits_own_box = containsRoundedBox(local, input.size, input.clip.radius),
     };
 }
