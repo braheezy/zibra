@@ -138,6 +138,26 @@ fn boundedDimension(value: f64) i32 {
     return @intFromFloat(std.math.clamp(value, 1.0, maximum));
 }
 
+/// Generated gradients have no intrinsic dimensions or aspect ratio. Each
+/// automatic axis fills the positioning area independently; contain/cover do too.
+pub fn resolveGeneratedSize(size: Size, box_width: i32, box_height: i32, css_scale: f64) ResolvedSize {
+    if (box_width <= 0 or box_height <= 0) return .{ .width = 0, .height = 0 };
+    return switch (size) {
+        .contain, .cover => .{ .width = box_width, .height = box_height },
+        .dimensions => |dimensions| .{
+            .width = boundedDimension(componentPixels(dimensions.width, @floatFromInt(box_width), css_scale) orelse @as(f64, @floatFromInt(box_width))),
+            .height = boundedDimension(componentPixels(dimensions.height, @floatFromInt(box_height), css_scale) orelse @as(f64, @floatFromInt(box_height))),
+        },
+    };
+}
+
+test "gradient sizing fills automatic axes without inventing an intrinsic ratio" {
+    try std.testing.expectEqual(ResolvedSize{ .width = 80, .height = 60 }, resolveGeneratedSize(parseSize("40px auto").?, 200, 60, 2));
+    try std.testing.expectEqual(ResolvedSize{ .width = 200, .height = 30 }, resolveGeneratedSize(parseSize("auto 50%").?, 200, 60, 2));
+    try std.testing.expectEqual(ResolvedSize{ .width = 200, .height = 60 }, resolveGeneratedSize(.cover, 200, 60, 2));
+    try std.testing.expectEqual(ResolvedSize{ .width = 200, .height = 60 }, resolveGeneratedSize(.contain, 200, 60, 2));
+}
+
 /// Resolve a parsed size into layout pixels. Intrinsic dimensions are CSS
 /// pixels; `css_scale` applies authored subtree zoom but not accessibility
 /// zoom, which is applied later while rastering the display list.

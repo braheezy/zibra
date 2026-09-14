@@ -12,6 +12,7 @@ const HtmlSourceStore = @import("../document/html_source.zig").Store;
 const document_lifecycle = @import("document_lifecycle.zig");
 const Layout = @import("render/layout.zig");
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
+const frame_styles = @import("frame_styles.zig");
 const scroll_model = @import("scroll.zig");
 const js_module = @import("../script/js.zig");
 const JsRenderContext = @import("js_context.zig").JsRenderContext;
@@ -229,9 +230,9 @@ pub fn FrameType(
         rules: std.ArrayList(CSSParser.CSSRule),
         keyframes: std.ArrayList(CSSParser.KeyframesRule),
         default_rules_count: usize = 0,
-        // Owned linked and inline author stylesheet buffers in DOM order. Owned
-        // rules borrow their property strings from these allocations.
-        css_texts: std.ArrayList([]const u8),
+        // Retained author programs in DOM order; executable keyframe names
+        // borrow their source text. Retire selections before these owners.
+        stylesheets: std.ArrayList(frame_styles.Source),
         // Structural DOM mutation can add scripts/stylesheets/iframes or remove
         // linked stylesheets and iframe contexts. The next worker-side render
         // rebuilds deferred resources from the final attached DOM generation;
@@ -258,7 +259,7 @@ pub fn FrameType(
                 .frame_element = frame_element,
                 .rules = std.ArrayList(CSSParser.CSSRule).empty,
                 .keyframes = std.ArrayList(CSSParser.KeyframesRule).empty,
-                .css_texts = std.ArrayList([]const u8).empty,
+                .stylesheets = std.ArrayList(frame_styles.Source).empty,
                 .children = std.ArrayList(*Frame).empty,
                 .audio_elements = .init(allocator),
                 .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
@@ -499,10 +500,8 @@ pub fn FrameType(
             for (self.keyframes.items) |*rule| rule.deinit(self.allocator);
             self.keyframes.deinit(self.allocator);
 
-            for (self.css_texts.items) |css_text| {
-                self.allocator.free(css_text);
-            }
-            self.css_texts.deinit(self.allocator);
+            for (self.stylesheets.items) |*source| source.deinit();
+            self.stylesheets.deinit(self.allocator);
 
             self.clearContentSecurityPolicy();
 
@@ -575,6 +574,9 @@ pub fn FrameType(
                 self.publishStyledDocument();
                 return;
             };
+            if (!self.stylesheets_dirty and try frame_styles.mediaChanged(self.allocator, root, self.stylesheets.items)) {
+                try browser.rebuildFrameStyleRules(self);
+            }
             // Browser-level focus/paint requests conservatively enter the
             // protected style phase. The DOM summary lets a clean document
             // republish immediately without walking its tree (or rescanning

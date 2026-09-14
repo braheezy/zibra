@@ -1,0 +1,12 @@
+# Retained programs, live sheet media, nesting, condition order and recovery.
+tests:
+  - html/semantics/document-metadata/the-style-element/style_media.html
+  - html/semantics/document-metadata/the-style-element/style_media_change.html
+  - css/css-nesting/nested-error-recovery.html
+  - css/css-nesting/mixed-declarations-rules.html
+reftests:
+  - css/css-conditional/at-media-001.html
+  - css/css-conditional/at-media-002.html
+  - css/css-conditional/at-supports-001.html
+crashtests:
+  - css/css-conditional/crashtests/supports-malformed.html

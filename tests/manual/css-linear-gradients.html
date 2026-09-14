@@ -1,0 +1,93 @@
+<!-- How to verify: expect green PASS and nine painted swatches. Toggle theme
+     and font to change the inherited gradient, resize to check corner direction,
+     and scroll to check the fixed background. Reset restores the initial state. -->
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CSS linear gradients</title>
+<style>
+body { margin:24px; font:16px sans-serif; background:white; color:#17202a; }
+.row { display:flex; flex-wrap:wrap; gap:16px; }
+.sample { width:180px; }
+.swatch { width:180px; height:80px; margin:8px 0; background-color:#eee; border:2px solid #17202a; }
+#legacy { background-image:linear-gradient(to right,red,blue); }
+#modern { background-image:linear-gradient(to right in oklab,red,blue); }
+#hue { background-image:linear-gradient(to right in hsl longer hue,red,blue); }
+#corner { background-image:linear-gradient(to bottom right,white,black); }
+#stripes { background-image:repeating-linear-gradient(135deg,#2563eb 0px 12px,#dbeafe 12px 24px); }
+#hint { background-image:linear-gradient(to right,black,25%,white); }
+#alpha { background-image:linear-gradient(to right,transparent,#2563eb); border:0; border-radius:12px; }
+#tiles { background:linear-gradient(to right,#7c3aed 50%,#ddd6fe 50%) right bottom / 40px 40px repeat; }
+#parent { color:red; font-size:20px; background-image:linear-gradient(to right,currentcolor 1em,blue calc(50% + 1rem)); }
+#live { background-image:inherit; color:lime; font-size:40px; }
+#fixed { height:80px; margin-top:16px; background:repeating-linear-gradient(to right,#0f766e 0px 20px,#ccfbf1 20px 40px) fixed; }
+@supports (background-image:linear-gradient(red,blue)) { #support { color:green; } }
+</style></head><body>
+<h1 id="status">Checking linear gradients</h1>
+<p id="support">Gradient support is enabled.</p>
+<div class="row">
+<div class="sample">sRGB<div id="legacy" class="swatch"></div></div>
+<div class="sample">Oklab<div id="modern" class="swatch"></div></div>
+<div class="sample">Longer hue<div id="hue" class="swatch"></div></div>
+<div class="sample">Corner direction<div id="corner" class="swatch"></div></div>
+<div class="sample">Repeating stripes<div id="stripes" class="swatch"></div></div>
+<div class="sample">25% transition hint<div id="hint" class="swatch"></div></div>
+<div class="sample">Alpha and rounded clip<div id="alpha" class="swatch"></div></div>
+<div class="sample">Sized tiles<div id="tiles" class="swatch"></div></div>
+<div class="sample">Inherited stops<div id="parent"><div id="live" class="swatch"></div></div></div>
+</div>
+<button id="toggle">Toggle theme and font</button><button id="reset">Reset</button>
+<p id="details"></p><div id="fixed"></div>
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+  var results=[], alternate=false;
+  function element(id){return document.getElementById(id);}
+  function equal(a,b){if(a!==b)throw Error(String(a)+' != '+String(b));}
+  function check(name,fn){try{fn();results.push({name:name,status:0});}catch(e){results.push({name:name,status:1,message:String(e)});}}
+  function setTheme(changed){
+    alternate=changed; element('parent').style.fontSize=changed?'30px':'20px';
+    element('live').style.color=changed?'#f59e0b':'lime';
+  }
+  check('supports and conditional styles share gradient grammar',function(){
+    equal(CSS.supports('background-image','linear-gradient(red,blue)'),true);
+    equal(CSS.supports('background','linear-gradient(in oklab to top right,red,blue) no-repeat'),true);
+    equal(CSS.supports('background-image','linear-gradient(red,20%,30%,blue)'),false);
+    equal(getComputedStyle(element('support')).color,'rgb(0, 128, 0)');
+  });
+  check('specified colors and invalid assignment preserve declarations',function(){
+    var style=element('legacy').style;
+    style.backgroundImage='linear-gradient(to bottom,red 0 20%,blue)';
+    equal(style.backgroundImage,'linear-gradient(red 0px, red 20%, blue)');
+    style.backgroundImage='linear-gradient(red,broken)';
+    equal(style.backgroundImage,'linear-gradient(red 0px, red 20%, blue)');
+    style.removeProperty('background-image');
+  });
+  check('inherited gradients compute font units before changing receiver color',function(){
+    var held=getComputedStyle(element('live'));
+    equal(held.backgroundImage,'linear-gradient(to right, rgb(0, 255, 0) 20px, rgb(0, 0, 255) calc(50% + 16px))');
+    setTheme(true);
+    equal(held.backgroundImage,'linear-gradient(to right, rgb(245, 158, 11) 30px, rgb(0, 0, 255) calc(50% + 16px))');
+    setTheme(false);
+  });
+  check('gradient sizing and shorthand resets are visible through CSSOM',function(){
+    equal(getComputedStyle(element('tiles')).backgroundSize,'40px 40px');
+    var style=element('tiles').style; style.background='linear-gradient(red,blue)';
+    equal(style.backgroundSize,'auto'); equal(style.backgroundPosition,'0% 0%');
+    style.cssText='';
+  });
+  check('custom property substitution and escaped functions share admission',function(){
+    var style=element('corner').style;
+    style.backgroundImage='l\\69near-gradient(r\\65 d,blue)';
+    equal(style.backgroundImage,'linear-gradient(red, blue)');
+    style.setProperty('--stops','red,blue'); style.backgroundImage='linear-gradient(var(--stops))';
+    equal(getComputedStyle(element('corner')).backgroundImage,'linear-gradient(rgb(255, 0, 0), rgb(0, 0, 255))');
+    style.backgroundImage='linear-gradient(var(--missing))'; equal(getComputedStyle(element('corner')).backgroundImage,'none');
+    style.cssText='';
+  });
+  element('toggle').addEventListener('click',function(){setTheme(!alternate);});
+  element('reset').addEventListener('click',function(){setTheme(false);});
+  var failed=results.filter(function(r){return r.status!==0;});
+  element('status').textContent=failed.length?'FAIL: '+failed[0].name:'PASS: CSS linear gradients';
+  element('status').style.color=failed.length?'red':'green';
+  element('details').textContent=failed.map(function(r){return r.message;}).join('; ');
+  if(typeof completion_callback==='function')completion_callback(results,{status:0});
+});
+</script></body></html>

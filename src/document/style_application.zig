@@ -24,7 +24,6 @@ const PixelAnimation = animation.PixelAnimation;
 const ColorAnimation = animation.ColorAnimation;
 const TransformAnimation = animation.TransformAnimation;
 const Translation = animation.Translation;
-const parseCssColor = animation.parseCssColor;
 const parseTranslate = animation.parseTranslate;
 const cssAnimationPropertyBit = animation.cssAnimationPropertyBit;
 const css_animation_properties = animation.css_animation_properties;
@@ -182,12 +181,17 @@ pub fn Application(
             name: []const u8,
         ) ?*const CSSParser.KeyframesRule {
             if (@import("css_tokenizer.zig").identifierEquals(name, "none")) return null;
-            var index = keyframes.len;
-            while (index > 0) {
-                index -= 1;
-                if (std.mem.eql(u8, keyframes[index].name, name)) return &keyframes[index];
+            var winner: ?*const CSSParser.KeyframesRule = null;
+            var priority: ?CSSParser.cascade.Key = null;
+            for (keyframes, 0..) |*rule, index| {
+                if (!std.mem.eql(u8, rule.name, name)) continue;
+                const key = CSSParser.cascade.Key.from(.{ .origin = rule.origin, .layer_order = rule.layer.order(), .source_order = index }, false);
+                if (priority == null or key.order(priority.?) != .lt) {
+                    winner = rule;
+                    priority = key;
+                }
             }
-            return null;
+            return winner;
         }
 
         fn keyframeAnimationForProperty(
@@ -208,9 +212,9 @@ pub fn Application(
                 ) };
             }
             if (std.mem.eql(u8, property, "background-color")) {
-                const start = parseCssColor(start_value) orelse return null;
-                const end = parseCssColor(end_value) orelse return null;
-                return .{ .color = ColorAnimation.initWithEasing(
+                const start = @import("color.zig").parseAbsolute(start_value) orelse return null;
+                const end = @import("color.zig").parseAbsolute(end_value) orelse return null;
+                return .{ .color = ColorAnimation.initAbsoluteWithEasing(
                     start,
                     end,
                     spec.frames,
@@ -284,10 +288,13 @@ pub fn Application(
             if (std.mem.eql(u8, property, "background-color")) {
                 const colors = @import("color.zig");
                 const styles = &element.style.?;
-                if (std.ascii.eqlIgnoreCase(value, "currentcolor")) value = styles.getPtr("color").?.get().*;
-                if (colors.hasCalculation(value)) {
-                    try styles.getPtr("animation-name").?.tryAddDependency(styles.getPtr("font-size").?, styles.allocator);
-                    const computed = colors.parseWithContext(value, .{ .font_size = css_length.parsePixel(styles.getPtr("font-size").?.get().*) orelse 16 }) orelse return null;
+                if (colors.hasCurrentColor(value) or colors.hasCalculation(value) or colors.isMix(value)) {
+                    if (colors.hasRelativeUnits(value)) try styles.getPtr("animation-name").?.tryAddDependency(styles.getPtr("font-size").?, styles.allocator);
+                    if (colors.hasCurrentColor(value)) try styles.getPtr("animation-name").?.tryAddDependency(styles.getPtr("color").?, styles.allocator);
+                    const computed = colors.parseWithContext(value, .{
+                        .font_size = css_length.parsePixel(styles.getPtr("font-size").?.get().*) orelse 16,
+                        .current_color = colors.parseAbsolute(styles.getPtr("color").?.get().*),
+                    }) orelse return null;
                     value = try computed.serialize(values_allocator);
                 }
             }
@@ -1014,13 +1021,33 @@ pub fn Application(
                             if (prop.serialization != .color) continue;
                             const authored = new_style.get(prop.name).?;
                             const colors = @import("color.zig");
-                            if (!colors.hasCalculation(authored)) continue;
+                            if (!colors.hasCalculation(authored) and !colors.isMix(authored)) continue;
                             const field = style_map.getPtr(prop.name).?;
-                            try field.tryAddDependency(style_map.getPtr("font-size").?, allocator);
-                            const computed = colors.parseWithContext(authored, .{
+                            if (colors.hasRelativeUnits(authored)) try field.tryAddDependency(style_map.getPtr("font-size").?, allocator);
+                            const foreground = if (std.mem.eql(u8, prop.name, "color") and colors.hasCurrentColor(authored)) blk: {
+                                const inherited = if (parent_style.getPtr("color")) |parent_field|
+                                    try inheritedValue(parent_field, field, parent_is_ephemeral_default, allocator)
+                                else
+                                    cssInitialValue("color");
+                                break :blk colors.parseAbsolute(inherited);
+                            } else null;
+                            const computed = try colors.serializeComputed(allocator, authored, .{
                                 .font_size = css_length.parsePixel(new_style.get("font-size").?) orelse 16,
+                                .current_color = foreground,
                             }) orelse continue;
-                            try new_style.put(prop.name, try retainComputed(e, allocator, try computed.serialize(allocator)));
+                            try new_style.put(prop.name, try retainComputed(e, allocator, computed));
+                        }
+
+                        {
+                            const authored = new_style.get("background-image").?;
+                            if (@import("css_gradient.zig").parse(authored) != null) {
+                                if (@import("color.zig").hasRelativeUnits(authored))
+                                    try style_map.getPtr("background-image").?.tryAddDependency(style_map.getPtr("font-size").?, allocator);
+                                const computed = (try @import("css_gradient.zig").serialize(allocator, authored, .{
+                                    .font_size = css_length.parsePixel(new_style.get("font-size").?) orelse 16,
+                                }, .computed)).?;
+                                try new_style.put("background-image", try retainComputed(e, allocator, computed));
+                            }
                         }
 
                         for ([_][]const u8{ "animation-duration", "animation-delay", "animation-iteration-count" }) |name| {

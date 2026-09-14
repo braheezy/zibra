@@ -368,7 +368,7 @@ fn splitValueTokens(raw_value: []const u8, tokens: *[4][]const u8) ?usize {
 
 fn isBorderColor(raw_value: []const u8) bool {
     const trimmed = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
-    return std.ascii.eqlIgnoreCase(trimmed, "currentcolor") or css_color.parse(trimmed) != null;
+    return css_color.isValid(trimmed);
 }
 
 fn validBackgroundPosition(raw_value: []const u8) bool {
@@ -477,7 +477,7 @@ pub fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     }
     if (std.mem.eql(u8, property, "background-image")) {
         const trimmed = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
-        return std.ascii.eqlIgnoreCase(trimmed, "none") or background_image.parseUrl(trimmed) != null;
+        return std.ascii.eqlIgnoreCase(trimmed, "none") or background_image.parseUrl(trimmed) != null or @import("css_gradient.zig").parse(trimmed) != null;
     }
     if (std.mem.eql(u8, property, "background-size")) return background_image.parseSize(raw_value) != null;
     if (std.mem.eql(u8, property, "background-repeat")) return background_image.parseRepeat(raw_value) != null;
@@ -805,7 +805,7 @@ fn expandBackground(
             if (saw_color) return false;
             saw_color = true;
             color = token;
-        } else if (std.ascii.eqlIgnoreCase(token, "none") or background_image.parseUrl(token) != null) {
+        } else if (std.ascii.eqlIgnoreCase(token, "none") or background_image.parseUrl(token) != null or @import("css_gradient.zig").parse(token) != null) {
             if (saw_image) return false;
             saw_image = true;
             image = token;

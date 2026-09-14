@@ -53,6 +53,13 @@ Unsupported or failed workloads are missing data, never zero-time successes.
 
 ## Check tiers
 
+On macOS, `build.zig` uses the same `linkSdl` policy for the browser and native
+tests. SDL2 and SDL_ttf are explicit dynamic dependencies. SDL_ttf's pkg-config
+expansion is disabled because its dylib records its dependencies; expanding
+them again can emit duplicate SDL2 Mach-O load commands through different search
+paths and make dyld abort before the program starts. SDK library paths and
+frameworks still come from the SDL build integration.
+
 ### Fast focused checks
 
 Use a subsystem test step while iterating on a contained change. Focused steps
@@ -240,6 +247,14 @@ animation value helpers, nested conditional rules, sticky constraints and
 rendering/crash cases. Unsupported CSSOM selector mutation and scroll-linked
 animation prerequisites remain diagnostic; preserve PASS expectations and
 distinguish them from semantic failures in implemented behavior.
+
+The [modern color fixture](../tests/manual/css-modern-colors.html) checks
+original-space CSSOM serialization, custom properties/currentcolor after sheet
+replacement, inherited font calculations and modern animation endpoints. Its
+[upstream selection](../tests/wpt/manifest-css-modern-colors.yaml) covers valid,
+invalid and computed HWB/Lab/predefined-space values, native color references
+and the existing malformed SVG-color crashtest. Review computed/paint results
+separately: original-space readback must not expose the gamut-mapped RGBA8 value.
 
 ### Native macOS visual checks
 

@@ -67,6 +67,30 @@ test "normalized declaration owners clone and retire independently including all
     }.run, .{});
 }
 
+test "mix CSSOM presentation and cloning preserve independently retained color precision" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const block = try create(allocator, "border-color:color-mix(hsl(120 10% 20%), hsl(30 30% 40%))");
+            defer block.destroy();
+            const before = block.get("border-top-color").?.value;
+            try std.testing.expect(std.mem.indexOf(u8, before, "45.9") != null);
+            const value = try block.propertyValue(allocator, "border-top-color");
+            defer allocator.free(value);
+            try std.testing.expectEqualStrings("color-mix(rgb(46, 56, 46), rgb(133, 102, 71))", value);
+            const shorthand = try block.propertyValue(allocator, "border-color");
+            defer allocator.free(shorthand);
+            try std.testing.expectEqualStrings(value, shorthand);
+            const text = try block.serialize(allocator);
+            defer allocator.free(text);
+            try std.testing.expect(std.mem.indexOf(u8, text, value) != null);
+            const copy = try block.clone(allocator);
+            defer copy.destroy();
+            try std.testing.expectEqualStrings(before, copy.get("border-top-color").?.value);
+            try std.testing.expectEqualStrings(before, block.get("border-top-color").?.value);
+        }
+    }.run, .{});
+}
+
 test "CSS background grammar and serialization preserve full position groups and trailing components" {
     const block = try create(std.testing.allocator, "background: url(tile.png) top 5px right -10% / 20px 30px no-repeat fixed rgb(0 100 0 / 75%);");
     defer block.destroy();
@@ -211,7 +235,32 @@ pub fn propertyValue(self: *const Block, allocator: std.mem.Allocator, raw_name:
     const name = declarations.canonicalDecodedPropertyName(raw_name) orelse return allocator.dupe(u8, "");
     if (shorthandFor(name)) |shorthand| return self.shorthandValue(allocator, shorthand);
     const value = self.get(name) orelse return allocator.dupe(u8, "");
+    if (value.pending_shorthand == null) if (try valuePresentation(allocator, name, value.value)) |text| return text;
     return allocator.dupe(u8, if (value.pending_shorthand != null) "" else value.value);
+}
+
+// Retained color operands have more precision than legacy CSSOM presentation.
+// Custom values and pending substitutions remain opaque to this boundary.
+fn valuePresentation(allocator: std.mem.Allocator, name: []const u8, source: []const u8) !?[]u8 {
+    const property = properties.get(name) orelse return null;
+    if (@import("css_value_tokens.zig").hasVariable(source)) return null;
+    if (property.serialization == .image) return @import("css_gradient.zig").serialize(allocator, source, .{}, .specified);
+    if (property.serialization != .color) return null;
+    const colors = @import("color.zig");
+    return if (colors.isMix(source)) try colors.serializeSpecified(allocator, source) else null;
+}
+
+test "gradient declaration clones preserve fractional operands beyond CSSOM presentation" {
+    const allocator = std.testing.allocator;
+    const block = try create(allocator, "background: l\\69 near-gradient(r\\65 d, rgb(10.25 20.5 30.75)) no-repeat");
+    defer block.destroy();
+    try std.testing.expectEqualStrings("linear-gradient(red, rgb(10.25, 20.5, 30.75))", block.get("background-image").?.value);
+    const text = try block.propertyValue(allocator, "background-image");
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("linear-gradient(red, rgb(10, 21, 31))", text);
+    const copy = try block.clone(allocator);
+    defer copy.destroy();
+    try std.testing.expectEqualStrings(block.get("background-image").?.value, copy.get("background-image").?.value);
 }
 
 fn shorthandFor(name: []const u8) ?properties.Shorthand {
@@ -247,6 +296,12 @@ fn shorthandValue(self: *const Block, allocator: std.mem.Allocator, shorthand: p
     }
     if (pending) return allocator.dupe(u8, if (same and std.mem.eql(u8, first.pending_shorthand orelse "", shorthand.name)) first.value else "");
     if (wide) return allocator.dupe(u8, if (same) first.value else "");
+    var color_text = [_]?[]u8{null} ** 12;
+    defer for (color_text) |owned| if (owned) |text| allocator.free(text);
+    for (shorthand.longhands, 0..) |longhand, i| {
+        color_text[i] = try valuePresentation(allocator, longhand, values[i]);
+        if (color_text[i]) |text| values[i] = text;
+    }
     const name = shorthand.name;
     const parts = values[0..shorthand.longhands.len];
     if (std.mem.eql(u8, name, "animation")) {
@@ -331,7 +386,9 @@ pub fn serialize(self: *const Block, allocator: std.mem.Allocator) ![]u8 {
         defer allocator.free(serialized_name);
         try output.appendSlice(allocator, serialized_name);
         try output.appendSlice(allocator, ": ");
-        try output.appendSlice(allocator, best_value orelse if (declaration.pending_shorthand == null) declaration.value else "");
+        const presented = if (best_value == null and declaration.pending_shorthand == null) try valuePresentation(allocator, key, declaration.value) else null;
+        defer if (presented) |text| allocator.free(text);
+        try output.appendSlice(allocator, best_value orelse presented orelse if (declaration.pending_shorthand == null) declaration.value else "");
         if (declaration.important) try output.appendSlice(allocator, " !important");
         try output.append(allocator, ';');
     }

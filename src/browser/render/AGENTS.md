@@ -80,11 +80,13 @@ boundaries.
   part hit provenance retires with the ordinary command generation. Playback
   changes dirty paint only, without remeasuring the control.
 - `replaced_paint.zig` appends background-image and rounded-control command
-  leaves/groups and owning editor clips without owning layout objects. Background attachment selects
-  an element-local or viewport-local tile phase while the command rectangle
+  leaves/groups and owning editor clips without owning layout objects.
+  Background attachment selects an element-local or viewport-local tile phase
+  while the command rectangle
   remains the element clip. Pass layout's used border widths so ordinary
-  images are positioned within the padding box. Its image pixels and provenance are still
-  generation-scoped borrows until snapshot.
+  images are positioned within the padding box. Its image pixels and provenance
+  are generation-scoped borrows until snapshot. Generated background images own
+  scalar gradient stops; clone that owner at every command materialization.
 - `paint_effects.zig` resolves scalar block effects from live style and wraps
   owned command slices in blur, clip, blend, transform, position, and scroll
   groups. `wrapOwned` consumes its input slice on every outcome; callers must
@@ -150,7 +152,8 @@ modules over forwarding wrappers.
   `retained_commands.appendClone` because their layout owners retire before
   the outer line is committed.
 - `.blend` and `.transform` own children; `.blend` owns its copied mode string.
-  Image/glyph leaves borrow pixels, canvas leaves own immutable pixels, and
+  Bitmap image/glyph leaves borrow pixels, generated images own gradient stops,
+  canvas leaves own immutable pixels, and
   provenance borrows the current DOM/layout generation.
 - Effect wrapping is transactional: convert a temporary command list to an
   owned slice before calling `paint_effects.wrapOwned`. When transferring the

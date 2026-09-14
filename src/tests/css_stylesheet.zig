@@ -116,7 +116,7 @@ fn allocationTrial(trial_allocator: std.mem.Allocator) !void {
         trial_allocator,
         "p, #x{color:green!important; margin:1px 2px; --tone:red}" ++
             "@media(min-width:10px){p{color:var(--tone)}@keyframes pulse{from,to{opacity:0.5}}}",
-        .{ .base_url = "https://example.test/style.css" },
+        .{ .base_url = "https://example.test/style.css", .media = "screen" },
     );
     defer sheet.deinit();
     var selection = try sheet.select(trial_allocator, .{ .viewport_width_css = 20 });
@@ -172,4 +172,88 @@ test "selector escape decoding consumes CRLF as one CSS whitespace" {
     const decoded = try parser.decodeIdentifier(allocator, "a\\62\r\nc");
     defer allocator.free(decoded);
     try std.testing.expectEqualStrings("abc", decoded);
+}
+
+test "retained stylesheet selects nested conditions and keyframes without recompiling" {
+    var sheet = try stylesheet.Sheet.init(allocator, "p{color:red}" ++
+        "@media(min-width:600px){@supports(color:green){p{color:green}" ++
+        "@media(prefers-color-scheme:dark){p{color:blue}" ++
+        "@keyframes pulse{from{opacity:0.2}to{opacity:0.8}}}}}" ++
+        "@supports(color:unsupported){p{color:black}}" ++
+        "@media(max-width:500px){p{color:purple}}p{width:10px}", .{});
+    defer sheet.deinit();
+    const compiled_rules = sheet.rules.ptr;
+    try std.testing.expectEqual(@as(usize, 5), sheet.rules.len);
+    try std.testing.expectEqual(@as(usize, 3), sheet.conditions.len);
+    try std.testing.expectEqual(@as(?usize, 0), sheet.conditions[1].parent);
+    const Case = struct { width: f64, dark: bool, color: []const u8, count: usize, keyframes: usize };
+    for ([_]Case{
+        .{ .width = 400, .dark = true, .color = "purple", .count = 3, .keyframes = 0 },
+        .{ .width = 800, .dark = false, .color = "green", .count = 3, .keyframes = 0 },
+        .{ .width = 800, .dark = true, .color = "blue", .count = 4, .keyframes = 1 },
+        .{ .width = 400, .dark = false, .color = "purple", .count = 3, .keyframes = 0 },
+    }) |case| {
+        var selected = try sheet.select(allocator, .{ .viewport_width_css = case.width, .prefers_dark = case.dark });
+        defer selected.deinit();
+        try std.testing.expectEqual(case.count, selected.rules.len);
+        try std.testing.expectEqual(case.keyframes, selected.keyframes.len);
+        try std.testing.expectEqualStrings(case.color, selected.rules[case.count - 2].properties.get("color").?.value);
+        try std.testing.expectEqual(compiled_rules, sheet.rules.ptr);
+        for (selected.rules) |rule| try std.testing.expect(rule.media_condition == null);
+        // Selected declarations are independent of both the program and later selections.
+        try selected.rules[0].properties.put("color", .{ .value = "orange" });
+        try std.testing.expectEqualStrings("red", sheet.rules[0].properties.get("color").?.value);
+    }
+}
+
+test "stylesheet media attributes gate complete programs including keyframes" {
+    var sheet = try stylesheet.Sheet.init(allocator, "p{color:green}@keyframes pulse{from{opacity:0}to{opacity:1}}", .{ .media = "print" });
+    defer sheet.deinit();
+    var hidden = try sheet.select(allocator, .{});
+    defer hidden.deinit();
+    try std.testing.expectEqual(@as(usize, 0), hidden.rules.len);
+    try std.testing.expectEqual(@as(usize, 0), hidden.keyframes.len);
+    for ([_]?[]const u8{ null, "", " \t/**/ ", "all", "print, screen", "(min-width:600px)" }) |query| {
+        var selected = try sheet.selectWithMedia(allocator, .{ .viewport_width_css = 800 }, query);
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(usize, 1), selected.rules.len);
+        try std.testing.expectEqual(@as(usize, 1), selected.keyframes.len);
+    }
+    for ([_][]const u8{ "none", "aural", "not all", "(min-width:900px)", ",", "screen and" }) |query| {
+        var selected = try sheet.selectWithMedia(allocator, .{ .viewport_width_css = 800 }, query);
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(usize, 0), selected.rules.len);
+        try std.testing.expectEqual(@as(usize, 0), selected.keyframes.len);
+    }
+    try std.testing.expectEqualStrings("print", sheet.options().media.?);
+}
+
+fn selectionAllocationTrial(trial_allocator: std.mem.Allocator, sheet: *const stylesheet.Sheet) !void {
+    var selected = try sheet.select(trial_allocator, .{});
+    defer selected.deinit();
+    var rules: std.ArrayList(parser.CSSRule) = .empty;
+    defer {
+        for (rules.items) |*rule| rule.deinit(trial_allocator);
+        rules.deinit(trial_allocator);
+    }
+    var keyframes: std.ArrayList(parser.KeyframesRule) = .empty;
+    defer {
+        for (keyframes.items) |*rule| rule.deinit(trial_allocator);
+        keyframes.deinit(trial_allocator);
+    }
+    selected.appendTo(&rules, &keyframes) catch |err| {
+        try std.testing.expectEqual(@as(usize, 2), selected.rules.len);
+        try std.testing.expectEqual(@as(usize, 1), selected.keyframes.len);
+        try std.testing.expectEqual(@as(usize, 0), rules.items.len);
+        try std.testing.expectEqual(@as(usize, 0), keyframes.items.len);
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 0), selected.rules.len);
+    try std.testing.expectEqualStrings("pulse", keyframes.items[0].name);
+}
+
+test "stylesheet selection uses its destination allocator and moves atomically" {
+    var sheet = try stylesheet.Sheet.init(allocator, "p,div{color:green}@media screen{@keyframes pulse{from,to{opacity:0.5}}}", .{ .base_url = "https://example.test/assets/main.css", .media = "screen" });
+    defer sheet.deinit();
+    try std.testing.checkAllAllocationFailures(allocator, selectionAllocationTrial, .{&sheet});
 }

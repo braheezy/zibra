@@ -58,18 +58,31 @@ pub fn hasRem(input: []const u8) bool {
 /// Return an owned replacement only when a real rem dimension occurs. This
 /// computes root-relative tokens before property-specific used-value parsing.
 pub fn resolveRem(allocator: std.mem.Allocator, input: []const u8, root_size: f64) !?[]const u8 {
+    return resolveRelativeUnits(allocator, input, null, root_size);
+}
+
+/// Resolve font-relative dimensions inside one already validated value. The
+/// caller registers font dependencies before retaining the owned replacement.
+pub fn resolveFontUnits(allocator: std.mem.Allocator, input: []const u8, font_size: f64, root_size: f64) !?[]const u8 {
+    return resolveRelativeUnits(allocator, input, font_size, root_size);
+}
+
+fn resolveRelativeUnits(allocator: std.mem.Allocator, input: []const u8, font_size: ?f64, root_size: f64) !?[]const u8 {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
     var copied: usize = 0;
     var changed = false;
     var tokens = Iterator{ .input = input };
     while (tokens.next()) |token| {
-        if (token.kind != .dimension or !syntax.identifierEquals(input[token.number_end..token.end], "rem")) continue;
+        if (token.kind != .dimension) continue;
+        const basis = if (syntax.identifierEquals(token.encodedValue(input), "rem")) root_size else if (syntax.identifierEquals(token.encodedValue(input), "em")) font_size orelse continue else continue;
         const number = std.fmt.parseFloat(f64, input[token.start..token.number_end]) catch continue;
-        if (!std.math.isFinite(number * root_size)) continue;
+        if (!std.math.isFinite(number * basis)) continue;
         try output.appendSlice(allocator, input[copied..token.start]);
         var buffer: [384]u8 = undefined;
-        try output.appendSlice(allocator, try std.fmt.bufPrint(&buffer, "{d:.6}px", .{number * root_size}));
+        // A finite f64 needs at most 309 integer digits, sign, six fractional
+        // digits and this suffix; the fixed buffer covers every such value.
+        try output.appendSlice(allocator, std.fmt.bufPrint(&buffer, "{d:.6}px", .{number * basis}) catch unreachable);
         copied = token.end;
         changed = true;
     }

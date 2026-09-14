@@ -1,0 +1,14 @@
+# Layer precedence and dynamic generation changes through real Browser frames.
+# Named-window globals block layer-vs-inline-style and layer-keyframes-override;
+# layer-media-toggle's XHTML reference needs XML/CDATA style parsing.
+# Engine/page regressions cover inline, animation and media precedence.
+tests:
+  - css/css-cascade/layer-basic.html
+  - css/css-cascade/layer-important.html
+  - css/css-nesting/nesting-layer.html
+reftests:
+  - css/css-cascade/layer-stylesheet-sharing.html
+  - css/css-cascade/layer-stylesheet-sharing-important.html
+crashtests:
+  - css/css-cascade/layer-statement-copy-crash.html
+  - css/css-cascade/layer-namespace-sandwich-crash.html

@@ -9,6 +9,9 @@ pub const Map = struct {
     /// Changes even when authored style text is replaced with identical bytes.
     /// CSSOM may retain pending substitutions that text cannot represent.
     style_revision: u64 = 0,
+    /// Attached stylesheets reselect their retained program after a media
+    /// attribute mutation. The revision owns no DOM or attribute-string borrow.
+    media_revision: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Map {
         return .{ .allocator = allocator };
@@ -44,20 +47,25 @@ pub const Map = struct {
     /// A replacement preserves its list position; a new name appends.
     pub fn put(self: *Map, name: []const u8, value: []const u8) !void {
         try self.storage.put(self.allocator, name, value);
-        if (std.mem.eql(u8, name, "style")) self.style_revision +%= 1;
+        self.changed(name);
     }
 
     /// Requires pre-reserved capacity; does not transfer string ownership.
     pub fn putAssumeCapacity(self: *Map, name: []const u8, value: []const u8) void {
         self.storage.putAssumeCapacity(name, value);
-        if (std.mem.eql(u8, name, "style")) self.style_revision +%= 1;
+        self.changed(name);
     }
 
     /// Remove without reordering the surviving attributes.
     pub fn orderedRemove(self: *Map, name: []const u8) bool {
         const removed = self.storage.orderedRemove(name);
-        if (removed and std.mem.eql(u8, name, "style")) self.style_revision +%= 1;
+        if (removed) self.changed(name);
         return removed;
+    }
+
+    fn changed(self: *Map, name: []const u8) void {
+        if (std.mem.eql(u8, name, "style")) self.style_revision +%= 1;
+        if (std.mem.eql(u8, name, "media")) self.media_revision +%= 1;
     }
 };
 

@@ -131,7 +131,7 @@ test "Native CSS stylesheet replacement retires source while historical computed
     try std.testing.expect(!dom.styleTreeNeedsUpdate(&page.root));
 }
 
-const Publication = enum { replace, reselect, replace_supports };
+const Publication = enum { replace, reselect, replace_supports, replace_layers };
 
 fn publicationAllocationFailures(operation: Publication) !void {
     // Keep the allocator context at one address throughout Page construction,
@@ -158,6 +158,8 @@ fn publicationAllocationFailures(operation: Publication) !void {
             .replace_supports => page.replaceStylesheet(1, "@supports (color:purple) and selector(:is(#target, .card)) {" ++
                 "@keyframes supported {from {opacity:0} to {opacity:1}}" ++
                 "@supports not future() {#target {width:73px;color:purple}}}"),
+            .replace_layers => page.replaceStylesheet(1, "@layer base, theme; @layer theme {#target{width:73px;color:purple}}" ++
+                "@layer base.child {#target{width:1px;color:red}@keyframes pulse{from,to{opacity:0.5}}}"),
             .reselect => page.reselectMedia(wide),
         };
         result catch |err| {
@@ -199,6 +201,10 @@ test "Native CSS inspection stylesheet publication preserves the styled generati
 
 test "CSS supports publication preserves the styled generation at every query or nested rule allocation failure" {
     try publicationAllocationFailures(.replace_supports);
+}
+
+test "CSS layer publication preserves the styled generation at every allocation failure" {
+    try publicationAllocationFailures(.replace_layers);
 }
 
 test "Native CSS inspection media publication preserves the styled generation at every allocation failure" {
@@ -360,4 +366,29 @@ test "Native structural recovery survives source replacement and media reselecti
     try page.reselectMedia(wide);
     try page.restyle();
     try std.testing.expectEqualStrings("120px", value(target, "width"));
+}
+
+test "inspection stylesheet media attributes compose with nested conditions on reselection" {
+    var page = try Page.fromHtml(allocator, "<style>#target{color:green;width:20px}</style>" ++
+        "<style media=print>#target{color:red}</style>" ++
+        "<style media='(min-width:600px)'>#target{width:80px}" ++
+        "@media(max-height:500px){#target{width:90px}}</style><div id=target></div>", .{ .media = narrow });
+    defer page.deinit();
+    page.repairParentPointers();
+    const target = findById(&page.root, "target").?;
+    try std.testing.expectEqual(@as(usize, 4), page.sheetCount());
+    try std.testing.expectEqualStrings("green", value(target, "color"));
+    try std.testing.expectEqualStrings("20px", value(target, "width"));
+    try page.reselectMedia(wide);
+    try page.restyle();
+    try std.testing.expectEqualStrings("80px", value(target, "width"));
+    try page.reselectMedia(.{ .viewport_width_css = 800, .viewport_height_css = 400 });
+    try page.restyle();
+    try std.testing.expectEqualStrings("90px", value(target, "width"));
+    try page.replaceStylesheet(2, "#target{color:orange}");
+    try page.restyle();
+    try std.testing.expectEqualStrings("green", value(target, "color"));
+    try page.reselectMedia(narrow);
+    try page.restyle();
+    try std.testing.expectEqualStrings("20px", value(target, "width"));
 }

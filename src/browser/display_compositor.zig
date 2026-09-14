@@ -184,6 +184,7 @@ pub const Compositor = struct {
 
     fn cloneDisplayItem(self: *Compositor, item: DisplayItem) CloneError!DisplayItem {
         switch (item) {
+            .image => |image_item| return .{ .image = try image_item.clone(self.allocator) },
             .canvas => |canvas_item| {
                 var copy = canvas_item;
                 copy.pixels = try self.allocator.dupe(u8, canvas_item.pixels);

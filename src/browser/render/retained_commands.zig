@@ -33,6 +33,7 @@ pub fn cloneItem(
     item: DisplayItem,
 ) CloneError!DisplayItem {
     return switch (item) {
+        .image => |image_item| .{ .image = try image_item.clone(allocator) },
         // A materialized command cannot retain a pointer to another layout
         // object's cache. An identity transform provides an owning container.
         .cached_subtree => |cached| .{ .transform = .{

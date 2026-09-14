@@ -3,6 +3,26 @@ const std = @import("std");
 const document = @import("../document/parser.zig");
 const Js = @import("../script/js.zig");
 
+test "CSS gradients retain specified operands while held computed views resolve inheritance" {
+    try checkInlineStyle(
+        \\equal(CSS.supports('background-image', 'linear-gradient(to right in oklab, red, blue)'), true);
+        \\equal(CSS.supports('background-image', 'linear-gradient(red, 20%, 30%, blue)'), false);
+        \\style.background = 'linear-gradient(to right, currentcolor 1em, rgb(10.25 0 0) calc(50% + 1rem)) no-repeat';
+        \\style.color = 'lime'; style.fontSize = '20px';
+        \\var held = getComputedStyle(target);
+        \\equal(style.backgroundImage, 'linear-gradient(to right, currentcolor 1em, rgb(10, 0, 0) calc(50% + 1rem))');
+        \\equal(held.backgroundImage, 'linear-gradient(to right, rgb(0, 255, 0) 20px, rgb(10, 0, 0) calc(50% + 16px))');
+        \\var child = document.createElement('div'); child.style.backgroundImage='inherit'; child.style.color='blue'; child.style.fontSize='40px'; target.appendChild(child);
+        \\var childView = getComputedStyle(child);
+        \\equal(childView.backgroundImage, 'linear-gradient(to right, rgb(0, 0, 255) 20px, rgb(10, 0, 0) calc(50% + 16px))');
+        \\style.fontSize='30px'; style.color='red';
+        \\equal(held.backgroundImage, 'linear-gradient(to right, rgb(255, 0, 0) 30px, rgb(10, 0, 0) calc(50% + 16px))');
+        \\equal(childView.backgroundImage, 'linear-gradient(to right, rgb(0, 0, 255) 30px, rgb(10, 0, 0) calc(50% + 16px))');
+        \\style.backgroundImage='linear-gradient(red, invalid)'; equal(style.backgroundRepeat,'no-repeat');
+        \\style.backgroundImage='var(--missing)'; equal(held.backgroundImage,'none');
+    );
+}
+
 test "CSS supports namespace overload conversion and queries leave live declarations untouched" {
     try checkInlineStyle(
         \\equal(typeof CSS, 'object'); equal(CSS, window.CSS);
@@ -216,6 +236,40 @@ test "CSS currentcolor follows parent changes and inherited colors resolve on th
     );
 }
 
+test "CSS modern color spaces survive CSSOM variables currentcolor and font changes" {
+    try checkInlineStyle(
+        \\var computed = getComputedStyle(target);
+        \\equal(CSS.supports('color', 'oklch(60% 0.2 30)'), true);
+        \\equal(CSS.supports('(color:color(display-p3 1 0 0))'), true);
+        \\equal(CSS.supports('color', 'color(--profile 1 0 0)'), false);
+        \\style.color = 'OKLCH(60% 50% 1turn / 50%)';
+        \\equal(style.color, 'oklch(0.6 0.2 0 / 0.5)');
+        \\equal(computed.color, style.color);
+        \\style.backgroundColor = 'currentcolor';
+        \\equal(computed.backgroundColor, computed.color);
+        \\style.borderColor = 'color(display-p3 120% none -0.2 / none)';
+        \\equal(computed.borderTopColor, 'color(display-p3 1.2 none -0.2 / none)');
+        \\style.setProperty('--tone', 'lab(50% -40% 20%)');
+        \\style.color = 'var(--tone)';
+        \\equal(style.color, 'var(--tone)');
+        \\equal(computed.color, 'lab(50 -50 25)');
+        \\style.setProperty('--tone', 'color(xyz 0.2 0.3 0.4)');
+        \\equal(computed.backgroundColor, 'color(xyz-d65 0.2 0.3 0.4)');
+        \\var ancestor = target.parentNode;
+        \\ancestor.style.fontSize = '20px'; style.fontSize = 'inherit';
+        \\style.color = 'oklch(calc(50% + sign(1em - 10px) * 10%) 0.1 30)';
+        \\equal(computed.color, 'oklch(0.6 0.1 30)');
+        \\ancestor.style.fontSize = '8px';
+        \\equal(computed.color, 'oklch(0.4 0.1 30)');
+        \\equal(computed.backgroundColor, computed.color);
+        \\equal(style.color.indexOf('1em') >= 0, true);
+        \\var saved = style.color;
+        \\style.color = 'oklch(0.5 0.2 30%)'; equal(style.color, saved);
+        \\style.color = 'hwb(none 40% none)';
+        \\equal(computed.color, 'hwb(none 40% none)');
+    );
+}
+
 test "CSS color calculations recompute font dependencies and preserve missing components" {
     try checkInlineStyle(
         \\var ancestor = target.parentNode;
@@ -235,6 +289,28 @@ test "CSS color calculations recompute font dependencies and preserve missing co
         \\style.color = 'rgb(calc(infinity), calc(0 / 0), calc(-infinity))';
         \\equal(computed.color, 'rgb(255, 0, 0)');
         \\equal(CSS.supports('color', 'rgb(calc(2px) 0 0)'), false);
+    );
+}
+
+test "CSS mixes retain symbolic inheritance compute font units and invalidate held views" {
+    try checkInlineStyle(
+        \\var ancestor = target.parentNode, computed = getComputedStyle(target);
+        \\ancestor.style.color = 'red'; ancestor.style.fontSize = '20px';
+        \\ancestor.style.backgroundColor = 'color-mix(in srgb, currentcolor, rgb(calc(1em / 1px) 0 0))';
+        \\style.fontSize = '40px'; style.color = 'blue'; style.backgroundColor = 'inherit';
+        \\equal(computed.backgroundColor, 'color(srgb 0.03921569 0 0.5)');
+        \\ancestor.style.fontSize = '40px';
+        \\equal(computed.backgroundColor, 'color(srgb 0.07843137 0 0.5)');
+        \\style.color = 'color-mix(in srgb, currentcolor, blue)';
+        \\equal(computed.color, 'color(srgb 0.5 0 0.5)');
+        \\ancestor.style.color = 'lime'; equal(computed.color, 'color(srgb 0 0.5 0.5)');
+        \\equal(computed.backgroundColor, 'color(srgb 0.07843137 0.25 0.25)');
+        \\style.borderColor = 'color-mix(in srgb, currentcolor 20%, transparent)';
+        \\equal(computed.borderTopColor, 'color(srgb 0 0.5 0.5 / 0.2)');
+        \\style.color = 'lab(calc(50 * 3) 0 0 / calc(-1 + 2))';
+        \\equal(style.color, 'lab(calc(150) 0 0 / calc(1))'); equal(computed.color, 'lab(100 0 0)');
+        \\equal(CSS.supports('color','color-mix(in oklch longer hue, red, currentcolor)'),true);
+        \\equal(CSS.supports('color','color-mix(in srgb longer hue, red, blue)'),false);
     );
 }
 

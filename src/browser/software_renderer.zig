@@ -81,6 +81,114 @@ fn imageSurfacePixels(surface: *z2d.Surface) ![]z2d.pixel.RGBA {
     };
 }
 
+fn roundedRectCoverage(x: i32, y: i32, left: i32, top: i32, right: i32, bottom: i32, radius_value: f64) f64 {
+    if (x < left or x >= right or y < top or y >= bottom) return 0;
+    const radius = @min(radius_value, @as(f64, @floatFromInt(@min(right - left, bottom - top))) / 2);
+    if (radius <= 0.5) return 1;
+    var covered: f64 = 0;
+    for ([_]f64{ 0.25, 0.75 }) |sy| for ([_]f64{ 0.25, 0.75 }) |sx| {
+        const px = @as(f64, @floatFromInt(x)) + sx;
+        const py = @as(f64, @floatFromInt(y)) + sy;
+        const dx = px - std.math.clamp(px, @as(f64, @floatFromInt(left)) + radius, @as(f64, @floatFromInt(right)) - radius);
+        const dy = py - std.math.clamp(py, @as(f64, @floatFromInt(top)) + radius, @as(f64, @floatFromInt(bottom)) - radius);
+        if (dx * dx + dy * dy <= radius * radius) covered += 0.25;
+    };
+    return covered;
+}
+
+fn imageClipCoverage(item: anytype, x: i32, y: i32, left: i32, top: i32, right: i32, bottom: i32, zoom: f32) f64 {
+    if (comptime @hasField(@TypeOf(item), "clip_radius")) {
+        if (item.clip_radius > 0) return roundedRectCoverage(x, y, left, top, right, bottom, item.clip_radius * zoom);
+    }
+    return 1;
+}
+
+test "linear gradient pixels agree across direct transformed and layer rendering" {
+    const allocator = std.testing.allocator;
+    var bounds = DisplayCompositor.init(allocator);
+    defer bounds.deinit();
+    var renderer = Renderer.init(allocator, allocator, std.testing.io, &bounds);
+    var item = ImageDisplayItem{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 101,
+        .y2 = 3,
+        .source_width = 1,
+        .source_height = 1,
+        .pixels = &.{},
+        .gradient = (try @import("../document/gradient_line.zig").Linear.init(allocator, "linear-gradient(to right, transparent, red)", .{}, 101, 3)).?,
+    };
+    defer item.deinit(allocator);
+    var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 101, 3);
+    defer surface.deinit(allocator);
+    const pixels = try imageSurfacePixels(&surface);
+    for (0..3) |route| {
+        @memset(pixels, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+        var context = z2d.Context.init(std.testing.io, allocator, &surface);
+        defer context.deinit();
+        switch (route) {
+            0 => try renderer.drawDisplayItemZ2dContext(&context, .{ .image = item }, 0, 1),
+            1 => try renderer.drawDisplayItemZ2dContextWithTransform(&context, .{ .image = item }, 0, 0, 1),
+            2 => try renderer.drawDisplayItemZ2dContextForLayer(&context, .{ .image = item }, 0, 0, 1),
+            else => unreachable,
+        }
+        try std.testing.expectEqual(z2d.pixel.RGBA{ .r = 255, .g = 127, .b = 127, .a = 255 }, pixels[151]);
+    }
+    item.tiling = .{ .width = 20, .height = 3, .offset_x = 10, .repeat_x = false };
+    @memset(pixels, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+    var context = z2d.Context.init(std.testing.io, allocator, &surface);
+    defer context.deinit();
+    try renderer.drawDisplayItemZ2dContext(&context, .{ .image = item }, 0, 1);
+    try std.testing.expectEqual(z2d.pixel.RGBA{ .r = 255, .g = 255, .b = 255, .a = 255 }, pixels[5]);
+    try std.testing.expect(pixels[20].g < 130 and pixels[20].g > 110);
+    try std.testing.expectEqual(z2d.pixel.RGBA{ .r = 255, .g = 255, .b = 255, .a = 255 }, pixels[30]);
+}
+
+test "rounded gradient image clipping preserves previously painted content" {
+    const allocator = std.testing.allocator;
+    var commands: std.ArrayList(DisplayItem) = .empty;
+    defer commands.deinit(allocator);
+    defer DisplayItem.freeItems(allocator, commands.items);
+    try @import("render/replaced_paint.zig").appendBackgroundImageBox(&commands, allocator, .{
+        .pixels = &.{},
+        .source_width = 1,
+        .source_height = 1,
+        .size = .cover,
+        .repeat = .{ .x = true, .y = true },
+        .position = "0 0",
+        .attachment = .scroll,
+        .gradient_source = "linear-gradient(red)",
+        .border_radius = 8,
+    }, 0, 0, 20, 20, .{}, 400, 300, 1, null);
+    var bounds = DisplayCompositor.init(allocator);
+    defer bounds.deinit();
+    var renderer = Renderer.init(allocator, allocator, std.testing.io, &bounds);
+    var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 20, 20);
+    defer surface.deinit(allocator);
+    const pixels = try imageSurfacePixels(&surface);
+    const blue = z2d.pixel.RGBA{ .r = 0, .g = 0, .b = 255, .a = 255 };
+    for (0..2) |source_kind| {
+        var command = commands.items[0];
+        if (source_kind == 1) {
+            command.image.gradient = null;
+            command.image.pixels = &.{ 255, 0, 0, 255 };
+        }
+        for (0..3) |route| {
+            @memset(pixels, blue);
+            var context = z2d.Context.init(std.testing.io, allocator, &surface);
+            defer context.deinit();
+            switch (route) {
+                0 => try renderer.drawDisplayItemZ2dContext(&context, command, 0, 1),
+                1 => try renderer.drawDisplayItemZ2dContextWithTransform(&context, command, 0, 0, 1),
+                2 => try renderer.drawDisplayItemZ2dContextForLayer(&context, command, 0, 0, 1),
+                else => unreachable,
+            }
+            try std.testing.expectEqual(blue, pixels[0]);
+            try std.testing.expectEqual(z2d.pixel.RGBA{ .r = 255, .g = 0, .b = 0, .a = 255 }, pixels[210]);
+        }
+    }
+}
+
 fn compositeStraightImagePixel(
     source: []const u8,
     opacity: f64,
@@ -755,6 +863,12 @@ pub const Renderer = struct {
         const dest_width = dest_right - dest_left;
         const dest_height = dest_bottom - dest_top;
         if (dest_width <= 0 or dest_height <= 0) return;
+        if (comptime @hasField(@TypeOf(image_item), "gradient")) {
+            if (image_item.gradient != null) {
+                try drawGradient(context, image_item, zoom, dest_left, dest_top, dest_right, dest_bottom);
+                return;
+            }
+        }
         if (image_item.source_width <= 0 or image_item.source_height <= 0) return;
         if (!display_commands.rgbaPixelBufferComplete(
             image_item.source_width,
@@ -819,7 +933,7 @@ pub const Renderer = struct {
                         const dst_idx = row_base + @as(usize, @intCast(x));
                         dest_pixels[dst_idx] = compositeStraightImagePixel(
                             pixels[src_idx..][0..4],
-                            opacity,
+                            opacity * imageClipCoverage(image_item, x, y, dest_left, dest_top, dest_right, dest_bottom, zoom),
                             dest_pixels[dst_idx],
                         ) orelse continue;
                     }
@@ -861,7 +975,7 @@ pub const Renderer = struct {
                 const a = pixels[src_idx + 3];
                 if (a == 0) continue;
 
-                const alpha_f = @as(f64, @floatFromInt(a)) * image_item.opacity;
+                const alpha_f = @as(f64, @floatFromInt(a)) * image_item.opacity * imageClipCoverage(image_item, x, y, dest_left, dest_top, dest_right, dest_bottom, zoom);
                 const alpha = std.math.clamp(@as(i32, @intFromFloat(alpha_f + 0.5)), 0, 255);
                 if (alpha == 0) continue;
 
@@ -878,6 +992,45 @@ pub const Renderer = struct {
                 context.lineTo(@floatFromInt(x), @floatFromInt(y + 1)) catch continue;
                 context.closePath() catch continue;
                 context.fill() catch continue;
+            }
+        }
+    }
+
+    fn gradientCoordinate(pixel: i32, start: i32, size: i32, tile: ?display_commands.ImageTiling, horizontal: bool, zoom: f32) ?f64 {
+        if (tile) |tiling| {
+            const length = display_commands.DisplayItem.scaleLayoutPx(if (horizontal) tiling.width else tiling.height, zoom);
+            if (length <= 0) return null;
+            const offset = display_commands.DisplayItem.scaleLayoutPx(if (horizontal) tiling.offset_x else tiling.offset_y, zoom);
+            const origin: i64 = @as(i64, offset) + if (tiling.attachment == .fixed) @as(i64, 0) else start;
+            const relative = @as(f64, @floatFromInt(@as(i64, pixel) - origin)) + 0.5;
+            const extent: f64 = @floatFromInt(length);
+            if (if (horizontal) tiling.repeat_x else tiling.repeat_y) return @mod(relative, extent) / extent;
+            return if (relative >= 0 and relative < extent) relative / extent else null;
+        }
+        return (@as(f64, @floatFromInt(@as(i64, pixel) - start)) + 0.5) / @as(f64, @floatFromInt(size));
+    }
+
+    fn drawGradient(context: *z2d.Context, item: ImageDisplayItem, zoom: f32, left: i32, top: i32, right: i32, bottom: i32) !void {
+        const gradient = item.gradient.?;
+        const surface = switch (context.surface.*) {
+            .image_surface_rgba => |*value| value,
+            else => return error.UnsupportedSurfaceType,
+        };
+        const start_x = @max(0, left);
+        const start_y = @max(0, top);
+        const end_x = @min(surface.width, right);
+        const end_y = @min(surface.height, bottom);
+        const pixel_width = if (item.tiling) |tile| display_commands.DisplayItem.scaleLayoutPx(tile.width, zoom) else right - left;
+        const footprint = gradient.width / @as(f64, @floatFromInt(@max(pixel_width, 1)));
+        var y = start_y;
+        while (y < end_y) : (y += 1) {
+            const sy = gradientCoordinate(y, top, bottom - top, item.tiling, false, zoom) orelse continue;
+            var x = start_x;
+            while (x < end_x) : (x += 1) {
+                const sx = gradientCoordinate(x, left, right - left, item.tiling, true, zoom) orelse continue;
+                const sample = gradient.sample(sx, sy, footprint);
+                const index = @as(usize, @intCast(y)) * @as(usize, @intCast(surface.width)) + @as(usize, @intCast(x));
+                surface.buf[index] = compositeStraightImagePixel(&.{ sample.r, sample.g, sample.b, sample.a }, item.opacity * imageClipCoverage(item, x, y, left, top, right, bottom, zoom), surface.buf[index]) orelse continue;
             }
         }
     }
@@ -1046,32 +1199,10 @@ pub const Renderer = struct {
                 ),
             );
             const width_usize: usize = @intCast(width);
-            const sample_offsets = [_]f64{ 0.25, 0.75 };
             for (0..@as(usize, @intCast(height))) |row| {
                 for (0..width_usize) |column| {
-                    var covered: u8 = 0;
-                    for (sample_offsets) |sample_y| {
-                        for (sample_offsets) |sample_x| {
-                            const x = @as(f64, @floatFromInt(column)) + sample_x;
-                            const y = @as(f64, @floatFromInt(row)) + sample_y;
-                            if (x < @as(f64, @floatFromInt(left)) or x >= @as(f64, @floatFromInt(right)) or
-                                y < @as(f64, @floatFromInt(top)) or y >= @as(f64, @floatFromInt(bottom))) continue;
-                            const nearest_x = std.math.clamp(
-                                x,
-                                @as(f64, @floatFromInt(left)) + radius,
-                                @as(f64, @floatFromInt(right)) - radius,
-                            );
-                            const nearest_y = std.math.clamp(
-                                y,
-                                @as(f64, @floatFromInt(top)) + radius,
-                                @as(f64, @floatFromInt(bottom)) - radius,
-                            );
-                            const dx = x - nearest_x;
-                            const dy = y - nearest_y;
-                            if (radius <= 0.5 or dx * dx + dy * dy <= radius * radius) covered += 1;
-                        }
-                    }
-                    const alpha: u8 = @intCast((@as(u16, rounded.color.a) * covered + 2) / 4);
+                    const coverage = roundedRectCoverage(@intCast(column), @intCast(row), left, top, right, bottom, radius);
+                    const alpha: u8 = @intFromFloat(@round(@as(f64, @floatFromInt(rounded.color.a)) * coverage));
                     mask_pixels[row * width_usize + column] = .{ .r = alpha, .g = alpha, .b = alpha, .a = alpha };
                 }
             }

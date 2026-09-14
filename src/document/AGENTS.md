@@ -83,7 +83,9 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
 
 - `css_math.zig` evaluates bounded typed calculations with explicit unit and
   percentage contexts. Lengths and colors share it; layout-dependent units
-  must not be guessed during declaration admission.
+  must not be guessed during declaration admission. Its optional transient
+  `css_math_tree.zig` output simplifies specified calculations without resolving
+  relative units; do not add a second expression parser for serialization.
 - `css_nesting.zig` lowers nested selectors into bounded owned temporary
   source. The shared selector compiler owns the resulting AST. Preserve parent
   list specificity and declaration/rule source order during lowering.
@@ -111,12 +113,11 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   the Element's string owner, never borrowed from replaceable rule/attribute
   text. Inherited Text values borrow stable ancestor computed storage;
   used-value validation belongs in the focused helper/layout owner.
-- Conditional parsing receives an explicit media environment. Root and iframe
-  callers must rebuild source-backed rule/keyframe generations when width,
-  height, zoom, or forced-colors environment changes. Inspection reparses its
-  retained sources before publication; see the
-  [inspection publication contract](../../docs/architecture/document-and-rendering.md#inspection-stylesheet-ownership)
-  before changing its separate publication/restyle phases.
+- Root, iframe and inspection callers select retained rule/keyframe programs
+  when width, height, zoom, or preferences change. Keep sheet media and nested
+  conditions composed; see the
+  [retained stylesheet contract](../../docs/architecture/document-and-rendering.md#retained-stylesheet-ownership)
+  before changing source retirement or separate publication/restyle phases.
 - Descendant selectors receive ancestors in document-root-to-parent order.
   `:has` caches are ephemeral synchronous borrows and selector-relevant
   changes invalidate ancestor matches.
@@ -139,12 +140,21 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   only after cascade and owned by the Element.
 - `background_image.zig`, `object_fit.zig`, `length.zig`, `easing.zig`, and
   related helpers stay pure of Browser/network/native state.
+- `css_gradient.zig` borrows linear-gradient syntax and serializes values;
+  `gradient_line.zig` owns copied used stops. Compute font units before
+  inheritance, retain currentcolor until the receiving element, and resolve
+  percentage stops against the gradient line only when its box exists.
 - `css_position.zig` shares single-layer axis grammar and serialization with
   background paint. Resolve using the caller's font, zoom and actual image
   dimensions; image position percentages may have a negative basis.
-- `color.zig` shares named sRGB values and currentcolor resolution between
-  native paint and resolved CSSOM readback. Keep background/border currentcolor
-  symbolic through inheritance; the color property depends on its parent.
+- `color.zig` shares absolute color grammar, original-space serialization and
+  currentcolor resolution between native paint and CSSOM. `color_space.zig` owns
+  pure conversion and bounded sRGB gamut mapping. `color_mix.zig` owns borrowed
+  mix syntax and weights; `color_interpolation.zig` owns scalar conversion,
+  missing-component handling and interpolation shared with animations. Preserve modern coordinates
+  and missing components independently of the RGBA8 paint projection. Keep
+  nested background/border currentcolor symbolic through inheritance; color depends
+  on its parent.
 
 ## Parser structure
 
@@ -192,11 +202,17 @@ The document pipeline is split by ownership and algorithm boundaries:
   declaration precedence. Its sink interface serves both stylesheet maps and
   `css_declaration_block.zig`, the independently owned ordered inline block.
   Stage CSSOM edits before Element publication; preserve pending substitutions
-  through cloning instead of reparsing serialized text. Raw style writes must
+  and nested color precision through cloning instead of reparsing serialized text. Raw style writes must
   use attribute map mutation APIs so their revision invalidates the block.
-- `css_stylesheet.zig` owns inspection's source and provenance snapshots.
-  Selections use the native parser and borrow those snapshots. Retire selected
-  rules/keyframes before replacing their source; this is not live CSSOM identity.
+- `css_stylesheet.zig` owns source, provenance and compiled conditional programs
+  shared by Frame and inspection. Its selection builder registers all active
+  sheets before resolving layer order; do not append independently ranked
+  single-sheet selections into a document. Selections clone executable data into
+  their destination allocator. Retire selections before the source that their
+  keyframe names borrow; this is not live CSSOM identity.
+- `css_layers.zig` owns decoded layer declarations and temporary per-origin
+  trees. Published rules retain scalar ranks only; see the
+  [retained stylesheet contract](../../docs/architecture/document-and-rendering.md#retained-stylesheet-ownership).
 - `media_query.zig` owns allocation-free media condition/range evaluation over
   borrowed preludes and an explicit environment. Keep it independent of DOM,
   native windows, and stylesheet storage; callers own environment invalidation.

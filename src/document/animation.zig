@@ -120,11 +120,11 @@ pub const PixelAnimation = struct {
     }
 };
 
-/// Native sRGB transition values use premultiplied-alpha interpolation, then
-/// return straight RGBA8 for painting. Invisible endpoint RGB cannot tint a fade.
+/// Scalar color tracks preserve their endpoints through premultiplied-alpha
+/// sampling. Legacy pairs interpolate in sRGB; modern colors use Oklab.
 pub const ColorAnimation = struct {
-    start_value: CssColor,
-    end_value: CssColor,
+    start_value: css_color.Absolute,
+    end_value: css_color.Absolute,
     current_frame: u32,
     total_frames: u32,
     easing_function: EasingFunction,
@@ -140,6 +140,11 @@ pub const ColorAnimation = struct {
         frames: u32,
         easing_function: EasingFunction,
     ) ColorAnimation {
+        return initAbsoluteWithEasing(css_color.Absolute.fromColor(start), css_color.Absolute.fromColor(end), frames, easing_function);
+    }
+
+    /// Endpoints are copied scalar values and may outlive their source strings.
+    pub fn initAbsoluteWithEasing(start: css_color.Absolute, end: css_color.Absolute, frames: u32, easing_function: EasingFunction) ColorAnimation {
         return .{
             .start_value = start,
             .end_value = end,
@@ -149,35 +154,20 @@ pub const ColorAnimation = struct {
         };
     }
 
-    fn interpolateChannel(start: u8, end: u8, progress: f64) u8 {
-        const start_float: f64 = @floatFromInt(start);
-        const end_float: f64 = @floatFromInt(end);
-        const interpolated = start_float + (end_float - start_float) * progress;
-        return @intFromFloat(@round(std.math.clamp(interpolated, 0.0, 255.0)));
-    }
-
-    fn interpolateColor(start: u8, end: u8, start_alpha: u8, end_alpha: u8, progress: f64) u8 {
-        const a: f64 = @floatFromInt(start_alpha);
-        const b: f64 = @floatFromInt(end_alpha);
-        const alpha = a + (b - a) * progress;
-        if (alpha <= 0) return 0;
-        const channel = (@as(f64, @floatFromInt(start)) * a * (1 - progress) + @as(f64, @floatFromInt(end)) * b * progress) / alpha;
-        return @intFromFloat(@round(std.math.clamp(channel, 0, 255)));
-    }
-
-    pub fn getValue(self: ColorAnimation) CssColor {
+    pub fn getAbsolute(self: ColorAnimation) css_color.Absolute {
         if (self.progress_override == null and (self.total_frames == 0 or self.current_frame >= self.total_frames)) return self.end_value;
         const progress = self.progress_override orelse (@as(f64, @floatFromInt(self.current_frame)) /
             @as(f64, @floatFromInt(self.total_frames)));
-        const eased_progress = self.easing_function.apply(progress);
-        if (eased_progress == 0) return self.start_value;
-        if (eased_progress == 1) return self.end_value;
-        return .{
-            .r = interpolateColor(self.start_value.r, self.end_value.r, self.start_value.a, self.end_value.a, eased_progress),
-            .g = interpolateColor(self.start_value.g, self.end_value.g, self.start_value.a, self.end_value.a, eased_progress),
-            .b = interpolateColor(self.start_value.b, self.end_value.b, self.start_value.a, self.end_value.a, eased_progress),
-            .a = interpolateChannel(self.start_value.a, self.end_value.a, eased_progress),
-        };
+        const eased = self.easing_function.apply(progress);
+        if (eased == 0) return self.start_value;
+        if (eased == 1) return self.end_value;
+        const legacy = self.start_value.legacy and self.end_value.legacy;
+        const sample = css_color.interpolation.sample(self.start_value.coordinates, self.end_value.coordinates, eased, .{ .space = if (legacy) .srgb else .oklab });
+        return css_color.Absolute.fromCoordinates(sample, legacy);
+    }
+
+    pub fn getValue(self: ColorAnimation) CssColor {
+        return self.getAbsolute().color;
     }
 
     pub fn advance(self: *ColorAnimation) bool {
@@ -257,10 +247,7 @@ pub const Animation = union(enum) {
         return switch (self) {
             .numeric => |track| std.fmt.allocPrint(allocator, "{d}", .{track.getValue()}),
             .pixel => |track| std.fmt.allocPrint(allocator, "{d}px", .{@max(track.getValue(), 0)}),
-            .color => |track| blk: {
-                const value = track.getValue();
-                break :blk (css_color.Absolute{ .color = value, .alpha = @round(@as(f64, @floatFromInt(value.a)) / 255 * 1000) / 1000 }).serialize(allocator);
-            },
+            .color => |track| track.getAbsolute().serialize(allocator),
             .transform => |track| std.fmt.allocPrint(allocator, "translate({d}px, {d}px)", .{ track.getValue().x, track.getValue().y }),
         };
     }
@@ -319,7 +306,7 @@ pub const Animation = union(enum) {
                 animation.numeric.easing_function = animation.numeric.easing_function.reversed();
             },
             .color => |*animation| {
-                std.mem.swap(CssColor, &animation.start_value, &animation.end_value);
+                std.mem.swap(css_color.Absolute, &animation.start_value, &animation.end_value);
                 animation.easing_function = animation.easing_function.reversed();
             },
             .transform => |*animation| {
@@ -418,6 +405,24 @@ test "numeric and color animations apply easing before interpolation" {
         CssColor{ .r = 255, .g = 0, .b = 0, .a = 205 },
         color.getValue(),
     );
+}
+
+test "modern color animations retain Oklab coordinates and precise alpha" {
+    var modern = ColorAnimation.initAbsoluteWithEasing(css_color.parseAbsolute("oklab(0.2 0.1 -0.1 / 0.2)").?, css_color.parseAbsolute("oklab(0.8 -0.1 0.1 / 0.8)").?, 2, .linear);
+    _ = modern.advance();
+    const result = modern.getAbsolute();
+    try std.testing.expectEqual(.oklab, result.coordinates.space);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.68), result.coordinates.components[0].?, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, -0.06), result.coordinates.components[1].?, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), result.alpha, 0.000001);
+    const text = try (Animation{ .color = modern }).serialize(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("oklab(0.68 -0.06 0.06 / 0.5)", text);
+    modern.progress_override = 1;
+    try std.testing.expectEqual(modern.end_value, modern.getAbsolute());
+    var mixed = ColorAnimation.initAbsoluteWithEasing(css_color.parseAbsolute("red").?, css_color.parseAbsolute("color(srgb 0 0 1)").?, 2, .linear);
+    _ = mixed.advance();
+    try std.testing.expectEqual(.oklab, mixed.getAbsolute().coordinates.space);
 }
 
 test "pixel animation retains units and produces layout values" {

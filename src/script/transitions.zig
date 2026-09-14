@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const parser = @import("../document/parser.zig");
+const colors = @import("../document/color.zig");
 
 const NumericAnimation = parser.NumericAnimation;
 const PixelAnimation = parser.PixelAnimation;
@@ -139,8 +140,8 @@ pub fn startOpacityAnimation(
 pub fn startBackgroundColorAnimation(
     allocator: std.mem.Allocator,
     elem: *parser.Element,
-    start: parser.CssColor,
-    end: parser.CssColor,
+    start: colors.Absolute,
+    end: colors.Absolute,
     frames: u32,
     easing_function: EasingFunction,
 ) !void {
@@ -148,7 +149,7 @@ pub fn startBackgroundColorAnimation(
         elem.animations = std.StringHashMap(Animation).init(allocator);
     }
     const animation = Animation{
-        .color = ColorAnimation.initWithEasing(start, end, frames, easing_function),
+        .color = ColorAnimation.initAbsoluteWithEasing(start, end, frames, easing_function),
     };
     try elem.animations.?.put("background-color", animation);
 }
@@ -240,13 +241,44 @@ pub fn currentAnimatedOpacity(elem: *const parser.Element) ?f64 {
     };
 }
 
-pub fn currentAnimatedBackgroundColor(elem: *const parser.Element) ?parser.CssColor {
+/// Copy the current scalar sample so interruption does not quantize endpoints.
+pub fn currentAnimatedBackgroundColor(elem: *const parser.Element) ?colors.Absolute {
     const animations = elem.animations orelse return null;
     const animation = animations.get("background-color") orelse return null;
     return switch (animation) {
-        .color => |color| color.getValue(),
+        .color => |color| color.getAbsolute(),
         .numeric, .pixel, .transform => null,
     };
+}
+
+/// Synchronous legacy style-assignment context. The caller may supply its new
+/// foreground; otherwise sample the last published style before invalidation.
+pub fn resolveColor(elem: *const parser.Element, source: []const u8, foreground: ?[]const u8) ?colors.Absolute {
+    var context = colors.Context{};
+    if (elem.style) |*styles| {
+        if (styles.getPtr("font-size")) |field| context.font_size = @import("../document/length.zig").parsePixel(field.lastValue().*) orelse 16;
+        if (styles.getPtr("color")) |field| context.current_color = colors.parseAbsolute(field.lastValue().*);
+    }
+    if (foreground) |value| context.current_color = colors.parseWithContext(value, context) orelse context.current_color;
+    return colors.parseWithContext(source, context);
+}
+
+test "interrupted modern color transitions retain unquantized samples" {
+    const allocator = std.testing.allocator;
+    var node = parser.Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer node.deinit(allocator);
+    const element = &node.element;
+    try startBackgroundColorAnimation(allocator, element, colors.parseAbsolute("oklab(.2 .1 0 / .2)").?, colors.parseAbsolute("oklab(.8 -.1 0 / .8)").?, 2, .linear);
+    _ = element.animations.?.getPtr("background-color").?.advance();
+    const before = currentAnimatedBackgroundColor(element).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.68), before.coordinates.components[0].?, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), before.alpha, 0.000001);
+    try startBackgroundColorAnimation(allocator, element, before, colors.parseAbsolute("oklab(.9 0 0)").?, 2, .linear);
+    try std.testing.expectEqualDeep(before, currentAnimatedBackgroundColor(element).?);
+    _ = element.animations.?.getPtr("background-color").?.advance();
+    const after = currentAnimatedBackgroundColor(element).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8266666667), after.coordinates.components[0].?, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), after.alpha, 0.000001);
 }
 
 pub fn currentAnimatedTransform(elem: *const parser.Element) ?parser.Translation {

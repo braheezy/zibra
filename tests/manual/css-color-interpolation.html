@@ -1,0 +1,104 @@
+<!-- How to verify: expect green PASS. Compare the labeled sRGB and linear-light
+     mixtures, the two hue paths, and the paused animation swatches. Toggle the
+     theme and font size, then Reset; the inherited mix should update each time. -->
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CSS color mixing and interpolation</title>
+<style>
+body { margin:24px; font:16px sans-serif; background:white; color:#17202a; }
+.row { display:flex; flex-wrap:wrap; gap:16px; }
+.sample { width:144px; }
+.swatch { width:144px; height:64px; margin:8px 0; background:red; }
+#srgb { background:color-mix(in srgb,red,blue); }
+#linear { background:color-mix(in srgb-linear,red,blue); }
+#oklab { background:color-mix(red,blue); }
+#short { background:color-mix(in hsl,hsl(350 100% 50%),hsl(10 100% 50%)); }
+#long { background:color-mix(in hsl longer hue,hsl(350 100% 50%),hsl(10 100% 50%)); }
+#alpha { background:color-mix(in srgb,transparent,blue); }
+#parent { color:var(--tone); font-size:20px; background-color:color-mix(in srgb,currentcolor,rgb(calc(1em / 1px) 0 0)); }
+#live { color:blue; font-size:40px; background:inherit; }
+@keyframes modern { from { background:oklab(.2 0 0); } to { background:oklab(.8 0 0); } }
+@keyframes legacy { from { background:black; } to { background:white; } }
+#modern { animation:modern 2s linear -1s both paused; }
+#legacy { animation:legacy 2s linear -1s both paused; }
+</style><style id="theme">:root { --tone:red; }</style></head><body>
+<h1 id="status">Checking color interpolation</h1>
+<p>The same endpoints produce different mixtures in different color spaces.</p>
+<div class="row">
+<div class="sample">sRGB<div id="srgb" class="swatch"></div></div>
+<div class="sample">Linear light<div id="linear" class="swatch"></div></div>
+<div class="sample">Oklab<div id="oklab" class="swatch"></div></div>
+<div class="sample">Shorter hue<div id="short" class="swatch"></div></div>
+<div class="sample">Longer hue<div id="long" class="swatch"></div></div>
+<div class="sample">Transparent to blue<div id="alpha" class="swatch"></div></div>
+</div>
+<p>Live inheritance and two animations paused halfway:</p>
+<div class="row">
+<div class="sample">Inherited mixture<div id="parent"><div id="live" class="swatch"></div></div></div>
+<div class="sample">Modern Oklab<div id="modern" class="swatch"></div></div>
+<div class="sample">Legacy sRGB<div id="legacy" class="swatch"></div></div>
+</div>
+<button id="toggle">Toggle theme and font</button><button id="reset">Reset</button>
+<p id="details"></p>
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+  var results=[], alternate=false;
+  function element(id){return document.getElementById(id);}
+  function equal(a,b){if(a!==b)throw Error(String(a)+' != '+String(b));}
+  function color(id){return getComputedStyle(element(id)).backgroundColor;}
+  function check(name,fn){try{fn();results.push({name:name,status:0});}catch(e){results.push({name:name,status:1,message:String(e)});}}
+  function setTheme(changed){
+    alternate=changed;
+    element('theme').textContent=changed?':root{--tone:lime}':':root{--tone:red}';
+    element('parent').style.fontSize=changed?'40px':'20px';
+  }
+  check('specified calculations simplify without applying computed channel ranges',function(){
+    var style=element('srgb').style;
+    style.borderColor='lab(calc(50 * 3) 0 0 / calc(-1 + 2))';
+    equal(style.borderTopColor,'lab(calc(150) 0 0 / calc(1))');
+    equal(getComputedStyle(element('srgb')).borderTopColor,'lab(100 0 0)');
+    style.borderColor='color-mix(in srgb,red calc(20% * 2),currentcolor)';
+    equal(style.borderTopColor,'color-mix(in srgb, red calc(40%), currentcolor)');
+    equal(CSS.supports('color','color-mix(in oklch longer hue,red,blue)'),true);
+    equal(CSS.supports('color','color-mix(in srgb longer hue,red,blue)'),false);
+  });
+  check('space selection hue paths and premultiplied alpha reach computed colors',function(){
+    equal(color('srgb'),'color(srgb 0.5 0 0.5)');
+    equal(color('linear'),'color(srgb-linear 0.5 0 0.5)');
+    equal(color('short'),'color(srgb 1 0 0)');
+    equal(color('long'),'color(srgb 0 1 1)');
+    equal(color('alpha'),'color(srgb 0 0 1 / 0.5)');
+    equal(color('oklab').indexOf('oklab('),0);
+  });
+  check('missing components and zero or partial mix percentages resolve precisely',function(){
+    var style=element('srgb').style;
+    style.borderColor='color-mix(in srgb,color(srgb none .2 none / none),blue)';
+    equal(getComputedStyle(element('srgb')).borderTopColor,'color(srgb 0 0.1 1)');
+    style.borderColor='color-mix(in srgb,red 0%,blue 0%)';
+    equal(getComputedStyle(element('srgb')).borderTopColor,'color(srgb 0.5 0 0.5 / 0)');
+    style.borderColor='color-mix(in srgb,red 20%,blue 30%)';
+    equal(getComputedStyle(element('srgb')).borderTopColor,'color(srgb 0.4 0 0.6 / 0.5)');
+  });
+  check('inherited mixes use the receiving foreground and the originating font size',function(){
+    var computed=getComputedStyle(element('live'));
+    equal(computed.backgroundColor,'color(srgb 0.03921569 0 0.5)');
+    setTheme(true); equal(computed.backgroundColor,'color(srgb 0.07843137 0 0.5)');
+    element('live').style.color='inherit';
+    equal(computed.backgroundColor,'color(srgb 0.07843137 0.5 0)');
+    setTheme(false); equal(computed.backgroundColor,'color(srgb 0.53921569 0 0)');
+    element('live').style.color='blue';
+  });
+  check('paused keyframes preserve modern coordinates and legacy interpolation',function(){
+    equal(color('modern'),'oklab(0.5 0 0)');
+    equal(color('legacy'),'rgb(128, 128, 128)');
+    element('modern').style.animationDelay='-3s'; equal(color('modern'),'oklab(0.8 0 0)');
+    element('modern').style.animationDelay='-1s';
+  });
+  element('toggle').addEventListener('click',function(){setTheme(!alternate);});
+  element('reset').addEventListener('click',function(){setTheme(false);});
+  var failed=results.filter(function(r){return r.status!==0;});
+  element('status').textContent=failed.length?'FAIL: '+failed[0].name:'PASS: CSS color interpolation';
+  element('status').style.color=failed.length?'red':'green';
+  element('details').textContent=failed.map(function(r){return r.message;}).join('; ');
+  if(typeof completion_callback==='function')completion_callback(results,{status:0});
+});
+</script></body></html>

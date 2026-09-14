@@ -27,6 +27,40 @@ pub const Case = struct {
 
 const existing_cases = [_]Case{
     .{
+        .name = "css-cascade-layers-narrow-display-list",
+        .mode = .display_list,
+        .fixture = "tests/pipeline/css-cascade-layers.html",
+        .golden = "tests/golden/pipeline/css-cascade-layers-narrow.display-list.txt",
+        .viewport = "400x400",
+    },
+    .{
+        .name = "css-cascade-layers-wide-display-list",
+        .mode = .display_list,
+        .fixture = "tests/pipeline/css-cascade-layers.html",
+        .golden = "tests/golden/pipeline/css-cascade-layers-wide.display-list.txt",
+        .viewport = "800x600",
+    },
+    .{
+        .name = "css-stylesheet-media-narrow-layout",
+        .mode = .layout,
+        .fixture = "tests/pipeline/css-stylesheet-media.html",
+        .golden = "tests/golden/pipeline/css-stylesheet-media-narrow.layout.txt",
+        .viewport = "400x400",
+    },
+    .{
+        .name = "css-stylesheet-media-wide-layout",
+        .mode = .layout,
+        .fixture = "tests/pipeline/css-stylesheet-media.html",
+        .golden = "tests/golden/pipeline/css-stylesheet-media-wide.layout.txt",
+        .viewport = "800x600",
+    },
+    .{
+        .name = "css-linear-gradients-display-list",
+        .mode = .display_list,
+        .fixture = "tests/pipeline/css-linear-gradients.html",
+        .golden = "tests/golden/pipeline/css-linear-gradients.display-list.txt",
+    },
+    .{
         .name = "box-model-style",
         .mode = .style,
         .fixture = "tests/pipeline/box-model.html",

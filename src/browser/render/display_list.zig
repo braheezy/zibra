@@ -204,7 +204,7 @@ pub const CompositedLayer = struct {
 };
 
 pub const ImageDisplayItem = struct {
-    /// Visible bitmap destination. For fitted `<img>` content this may be
+    /// Visible image destination. For fitted `<img>` content this may be
     /// smaller than its element box; `hit_rect` retains the replaced box.
     x1: i32,
     y1: i32,
@@ -213,6 +213,12 @@ pub const ImageDisplayItem = struct {
     source_width: i32,
     source_height: i32,
     pixels: []const u8,
+    /// Generated images own copied scalar stops instead of borrowing pixels.
+    /// Every materialization must clone this owner before its source retires.
+    gradient: ?@import("../../document/gradient_line.zig").Linear = null,
+    /// Rounded background clip in layout pixels, sampled without an offscreen
+    /// surface. Zero retains the ordinary rectangular image clip.
+    clip_radius: f64 = 0,
     /// Optional half-open source-pixel crop. CSS backgrounds and fitted
     /// `<img>` content use this when their bitmap is clipped by the box.
     source_rect: ?ImageSourceRect = null,
@@ -226,6 +232,18 @@ pub const ImageDisplayItem = struct {
     tiling: ?ImageTiling = null,
     opacity: f64 = 1.0,
     source: ?DisplayItemSource = null,
+
+    /// Preserve ordinary pixel borrows while independently cloning generated
+    /// paint data. RasterSnapshot additionally copies external pixel buffers.
+    pub fn clone(self: ImageDisplayItem, allocator: std.mem.Allocator) !ImageDisplayItem {
+        var copy = self;
+        if (self.gradient) |gradient| copy.gradient = try gradient.clone(allocator);
+        return copy;
+    }
+
+    pub fn deinit(self: ImageDisplayItem, allocator: std.mem.Allocator) void {
+        if (self.gradient) |gradient| gradient.deinit(allocator);
+    }
 };
 
 pub const ImageTiling = struct {
@@ -1013,6 +1031,15 @@ pub const DisplayItem = union(enum) {
                 zoom,
             ),
             .image => |image_item| image: {
+                if (image_item.clip_radius > 0 and image_item.hit_rect == null) {
+                    break :image image_item.opacity > 0 and pointInRoundedRect(x, y, .{
+                        .x1 = image_item.x1,
+                        .y1 = image_item.y1,
+                        .x2 = image_item.x2,
+                        .y2 = image_item.y2,
+                        .radius = image_item.clip_radius,
+                    }, zoom);
+                }
                 const bounds = image_item.hit_rect orelse Rect{
                     .left = image_item.x1,
                     .top = image_item.y1,
@@ -1240,6 +1267,7 @@ pub const DisplayItem = union(enum) {
             },
             .transform => |transform_item| freeList(allocator, transform_item.children),
             .canvas => |canvas_item| if (canvas_item.owns_pixels) allocator.free(canvas_item.pixels),
+            .image => |image_item| image_item.deinit(allocator),
             else => {},
         }
     }

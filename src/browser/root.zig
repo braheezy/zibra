@@ -74,6 +74,8 @@ const replaced_sizing = @import("render/replaced_sizing.zig");
 const document_loader = @import("document_loader.zig");
 const dom_focus = @import("../document/focus.zig");
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
+const frame_styles = @import("frame_styles.zig");
+const stylesheet = @import("../document/css_stylesheet.zig");
 const js_module = @import("../script/js.zig");
 pub const JsRenderContext = @import("js_context.zig").JsRenderContext;
 const script_tasks = @import("script_tasks.zig");
@@ -2905,18 +2907,12 @@ pub const Browser = struct {
                 std.log.warn("Failed to load iframes: {}", .{err});
             };
 
-            // Note: We use self.allocator directly for CSS parsing instead of an arena
-            // because the CSS rules need to live as long as the Tab (for re-rendering)
-
-            // Load and parse author stylesheets. Rules borrow their property
-            // strings from these buffers, so stage both collections and commit
-            // them to the frame together.
-            var new_css_texts = std.ArrayList([]const u8).empty;
+            // Stage source programs and executable selections together;
+            // keyframe names borrow the retained stylesheet source.
+            var new_stylesheets = std.ArrayList(frame_styles.Source).empty;
             defer {
-                for (new_css_texts.items) |css_text| {
-                    self.allocator.free(css_text);
-                }
-                new_css_texts.deinit(self.allocator);
+                for (new_stylesheets.items) |*source| source.deinit();
+                new_stylesheets.deinit(self.allocator);
             }
 
             var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
@@ -2945,7 +2941,7 @@ pub const Browser = struct {
                 frame,
                 node_list.items,
                 &resources,
-                &new_css_texts,
+                &new_stylesheets,
                 &all_rules,
                 &all_keyframes,
             );
@@ -2960,18 +2956,16 @@ pub const Browser = struct {
             for (frame.keyframes.items) |*rule| rule.deinit(self.allocator);
             frame.keyframes.deinit(self.allocator);
 
-            for (frame.css_texts.items) |old_css_text| {
-                self.allocator.free(old_css_text);
-            }
-            frame.css_texts.deinit(self.allocator);
+            for (frame.stylesheets.items) |*source| source.deinit();
+            frame.stylesheets.deinit(self.allocator);
 
             frame.default_rules_count = default_rules_count;
             frame.rules = all_rules;
             all_rules = .empty;
             frame.keyframes = all_keyframes;
             all_keyframes = .empty;
-            frame.css_texts = new_css_texts;
-            new_css_texts = .empty;
+            frame.stylesheets = new_stylesheets;
+            new_stylesheets = .empty;
             frame.stylesheets_dirty = false;
 
             // Apply all stylesheet rules and inline styles (sorted by cascade order)
@@ -3152,10 +3146,8 @@ pub const Browser = struct {
         for (frame.keyframes.items) |*rule| rule.deinit(self.allocator);
         frame.keyframes.clearRetainingCapacity();
 
-        for (frame.css_texts.items) |css_text| {
-            self.allocator.free(css_text);
-        }
-        frame.css_texts.clearRetainingCapacity();
+        for (frame.stylesheets.items) |*source| source.deinit();
+        frame.stylesheets.clearRetainingCapacity();
 
         frame.html_sources.clear();
 
@@ -3343,10 +3335,10 @@ pub const Browser = struct {
             std.log.warn("Failed to load iframe subdocuments: {}", .{err});
         };
 
-        var new_css_texts = std.ArrayList([]const u8).empty;
+        var new_stylesheets = std.ArrayList(frame_styles.Source).empty;
         defer {
-            for (new_css_texts.items) |css_text| self.allocator.free(css_text);
-            new_css_texts.deinit(self.allocator);
+            for (new_stylesheets.items) |*source| source.deinit();
+            new_stylesheets.deinit(self.allocator);
         }
 
         var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
@@ -3371,7 +3363,7 @@ pub const Browser = struct {
             frame,
             node_list.items,
             &resources,
-            &new_css_texts,
+            &new_stylesheets,
             &all_rules,
             &all_keyframes,
         );
@@ -3382,14 +3374,14 @@ pub const Browser = struct {
         frame.rules.deinit(self.allocator);
         for (frame.keyframes.items) |*rule| rule.deinit(self.allocator);
         frame.keyframes.deinit(self.allocator);
-        frame.css_texts.deinit(self.allocator);
+        frame.stylesheets.deinit(self.allocator);
         frame.default_rules_count = default_rules_count;
         frame.rules = all_rules;
         all_rules = .empty;
         frame.keyframes = all_keyframes;
         all_keyframes = .empty;
-        frame.css_texts = new_css_texts;
-        new_css_texts = .empty;
+        frame.stylesheets = new_stylesheets;
+        new_stylesheets = .empty;
         frame.stylesheets_dirty = false;
 
         try parser.styleWithKeyframes(
@@ -3825,10 +3817,10 @@ pub const Browser = struct {
             std.log.warn("Failed to load nested iframe subdocuments: {}", .{err});
         };
 
-        var new_css_texts = std.ArrayList([]const u8).empty;
+        var new_stylesheets = std.ArrayList(frame_styles.Source).empty;
         defer {
-            for (new_css_texts.items) |css_text| self.allocator.free(css_text);
-            new_css_texts.deinit(self.allocator);
+            for (new_stylesheets.items) |*source| source.deinit();
+            new_stylesheets.deinit(self.allocator);
         }
 
         var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
@@ -3853,7 +3845,7 @@ pub const Browser = struct {
             frame,
             node_list.items,
             &resources,
-            &new_css_texts,
+            &new_stylesheets,
             &all_rules,
             &all_keyframes,
         );
@@ -3861,14 +3853,14 @@ pub const Browser = struct {
         frame.rules.deinit(self.allocator);
         for (frame.keyframes.items) |*rule| rule.deinit(self.allocator);
         frame.keyframes.deinit(self.allocator);
-        frame.css_texts.deinit(self.allocator);
+        frame.stylesheets.deinit(self.allocator);
         frame.default_rules_count = default_rules_count;
         frame.rules = all_rules;
         all_rules = .empty;
         frame.keyframes = all_keyframes;
         all_keyframes = .empty;
-        frame.css_texts = new_css_texts;
-        new_css_texts = .empty;
+        frame.stylesheets = new_stylesheets;
+        new_stylesheets = .empty;
         frame.stylesheets_dirty = false;
 
         try parser.styleWithKeyframes(
@@ -4164,19 +4156,18 @@ pub const Browser = struct {
     }
 
     /// Rebuild an author stylesheet generation from the currently attached
-    /// DOM. Rules and their borrowed text buffers are staged and transferred
-    /// together, so removing a `<link>` retires its rules without creating a
-    /// dangling CSS string borrow.
+    /// DOM. Source programs and executable selections are staged together;
+    /// removing a link retires its selection before its borrowed source.
     fn replaceFrameStylesheets(
         self: *Browser,
         frame: *Frame,
         nodes: []*Node,
         resources: *DocumentResourceBatch,
     ) !void {
-        var new_css_texts = std.ArrayList([]const u8).empty;
+        var new_stylesheets = std.ArrayList(frame_styles.Source).empty;
         defer {
-            for (new_css_texts.items) |css_text| self.allocator.free(css_text);
-            new_css_texts.deinit(self.allocator);
+            for (new_stylesheets.items) |*source| source.deinit();
+            new_stylesheets.deinit(self.allocator);
         }
 
         var new_rules = std.ArrayList(CSSParser.CSSRule).empty;
@@ -4197,29 +4188,29 @@ pub const Browser = struct {
             frame,
             nodes,
             resources,
-            &new_css_texts,
+            &new_stylesheets,
             &new_rules,
             &new_keyframes,
         );
 
-        // Rules borrow the old CSS buffers, so destroy them before freeing the
-        // buffers and then atomically install the staged generation.
+        // Retire executable keyframe names before their source programs, then
+        // atomically install the staged generation.
         for (frame.rules.items) |*rule| {
             if (rule.owned) rule.deinit(self.allocator);
         }
         frame.rules.deinit(self.allocator);
         for (frame.keyframes.items) |*rule| rule.deinit(self.allocator);
         frame.keyframes.deinit(self.allocator);
-        for (frame.css_texts.items) |css_text| self.allocator.free(css_text);
-        frame.css_texts.deinit(self.allocator);
+        for (frame.stylesheets.items) |*source| source.deinit();
+        frame.stylesheets.deinit(self.allocator);
 
         frame.default_rules_count = self.default_style_sheet_rules.len;
         frame.rules = new_rules;
         new_rules = .empty;
         frame.keyframes = new_keyframes;
         new_keyframes = .empty;
-        frame.css_texts = new_css_texts;
-        new_css_texts = .empty;
+        frame.stylesheets = new_stylesheets;
+        new_stylesheets = .empty;
         frame.stylesheets_dirty = false;
         if (frame.current_node) |*root| parser.dirtyStyleSubtree(root);
         frame.markDocumentStyleDirty();
@@ -4232,18 +4223,8 @@ pub const Browser = struct {
         if (!frame.stylesheets_dirty) return;
         const root = if (frame.current_node) |*node| node else return;
         const page_url = frame.current_url orelse return;
-        var nodes = std.ArrayList(*Node).empty;
+        var nodes = try frame_styles.collectOwners(self.allocator, root);
         defer nodes.deinit(self.allocator);
-        try parser.treeToList(self.allocator, root, &nodes);
-        var count: usize = 0;
-        for (nodes.items) |node| {
-            if (node.* != .element) continue;
-            const tag = node.element.tag;
-            if (!std.mem.eql(u8, tag, "style") and !std.mem.eql(u8, tag, "link")) continue;
-            nodes.items[count] = node;
-            count += 1;
-        }
-        nodes.items.len = count;
         var resources = try self.fetchDocumentResources(frame, page_url, nodes.items);
         defer resources.deinit();
         try self.replaceFrameStylesheets(frame, nodes.items, &resources);
@@ -4290,9 +4271,6 @@ pub const Browser = struct {
         if (!scripts_started) frame.resources_dirty = true;
     }
 
-    /// Parse one owned document stylesheet into staged frame storage. The
-    /// caller retains ownership of `css_text` on error and transfers it to
-    /// `css_texts` only after this function succeeds.
     fn frameMediaEnvironment(frame: *const Frame) CSSParser.MediaEnvironment {
         return .{
             .prefers_dark = frame.tab.accessibility.prefers_dark,
@@ -4302,53 +4280,30 @@ pub const Browser = struct {
         };
     }
 
+    /// Copy and compile one stylesheet into staged storage. The caller keeps
+    /// css_text on failure; success consumes it after publishing every owner.
     fn appendDocumentStylesheetRules(
         self: *Browser,
         css_text: []const u8,
         source_url: ?Url,
         referrer_policy: url_module.ReferrerPolicy,
         media: CSSParser.MediaEnvironment,
-        css_texts: *std.ArrayList([]const u8),
-        rules: *std.ArrayList(CSSParser.CSSRule),
-        keyframes: *std.ArrayList(CSSParser.KeyframesRule),
+        source_index: usize,
+        owner: *Node,
+        stylesheets: *std.ArrayList(frame_styles.Source),
+        builder: *stylesheet.SelectionBuilder,
     ) !void {
-        var css_parser = try CSSParser.initWithMedia(self.allocator, css_text, media);
-        defer css_parser.deinit(self.allocator);
-
-        var parsed_keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;
-        var parsed_keyframes_owned = true;
-        defer {
-            if (parsed_keyframes_owned) {
-                for (parsed_keyframes.items) |*rule| rule.deinit(self.allocator);
-            }
-            parsed_keyframes.deinit(self.allocator);
-        }
-
-        const parsed_rules = try css_parser.parseWithKeyframes(self.allocator, &parsed_keyframes);
-        var parsed_rules_owned = true;
-        defer {
-            if (parsed_rules_owned) {
-                for (parsed_rules) |*rule| rule.deinit(self.allocator);
-            }
-            self.allocator.free(parsed_rules);
-        }
-        if (source_url) |url| {
-            for (parsed_rules) |*rule| {
-                rule.source_url = try url.toOwnedString(self.allocator);
-                rule.referrer_policy = referrer_policy;
-            }
-        }
-
-        // Reserve both destinations before transferring either half of the
-        // generation. Every parsed rule borrows from css_text.
-        try css_texts.ensureUnusedCapacity(self.allocator, 1);
-        try rules.ensureUnusedCapacity(self.allocator, parsed_rules.len);
-        try keyframes.ensureUnusedCapacity(self.allocator, parsed_keyframes.items.len);
-        css_texts.appendAssumeCapacity(css_text);
-        for (parsed_rules) |rule| rules.appendAssumeCapacity(rule);
-        for (parsed_keyframes.items) |rule| keyframes.appendAssumeCapacity(rule);
-        parsed_rules_owned = false;
-        parsed_keyframes_owned = false;
+        const base_url = if (source_url) |url| try url.toOwnedString(self.allocator) else null;
+        defer if (base_url) |base| self.allocator.free(base);
+        var source = try frame_styles.Source.init(self.allocator, css_text, .{
+            .base_url = base_url,
+            .referrer_policy = referrer_policy,
+        }, source_index, owner);
+        errdefer source.deinit();
+        try stylesheets.ensureUnusedCapacity(self.allocator, 1);
+        try builder.append(source.sheet, media, frame_styles.mediaAttribute(owner));
+        stylesheets.appendAssumeCapacity(source);
+        self.allocator.free(css_text);
     }
 
     /// Load author stylesheets in DOM order. Inline `<style>` text is copied
@@ -4359,33 +4314,38 @@ pub const Browser = struct {
         frame: *Frame,
         nodes: []*Node,
         resources: *DocumentResourceBatch,
-        css_texts: *std.ArrayList([]const u8),
+        stylesheets: *std.ArrayList(frame_styles.Source),
         rules: *std.ArrayList(CSSParser.CSSRule),
         keyframes: *std.ArrayList(CSSParser.KeyframesRule),
     ) !void {
+        var builder = stylesheet.SelectionBuilder.init(self.allocator);
+        defer builder.deinit();
+        var source_index: usize = 0;
         for (nodes) |node| {
             const element = switch (node.*) {
                 .element => |*value| value,
                 .text => continue,
             };
 
+            if (!std.mem.eql(u8, element.tag, "style") and !std.mem.eql(u8, element.tag, "link")) continue;
+            const index = source_index;
+            source_index += 1;
+
             if (std.mem.eql(u8, element.tag, "style")) {
                 const css_text = (try parser.collectInlineStyleText(self.allocator, node)) orelse continue;
                 var css_text_owned = true;
                 defer if (css_text_owned) self.allocator.free(css_text);
 
-                self.appendDocumentStylesheetRules(
+                try self.appendDocumentStylesheetRules(
                     css_text,
                     null,
                     .default,
                     frameMediaEnvironment(frame),
-                    css_texts,
-                    rules,
-                    keyframes,
-                ) catch |err| {
-                    std.log.warn("Failed to parse inline stylesheet: {}", .{err});
-                    continue;
-                };
+                    index,
+                    node,
+                    stylesheets,
+                    &builder,
+                );
                 css_text_owned = false;
                 continue;
             }
@@ -4420,20 +4380,21 @@ pub const Browser = struct {
             var css_text_owned = true;
             defer if (css_text_owned) self.allocator.free(css_text);
 
-            self.appendDocumentStylesheetRules(
+            try self.appendDocumentStylesheetRules(
                 css_text,
                 completed.final_url orelse completed.resource_url,
                 css_response.referrer_policy,
                 frameMediaEnvironment(frame),
-                css_texts,
-                rules,
-                keyframes,
-            ) catch |err| {
-                std.log.warn("Failed to parse stylesheet {s}: {}", .{ href, err });
-                continue;
-            };
+                index,
+                node,
+                stylesheets,
+                &builder,
+            );
             css_text_owned = false;
         }
+        var selection = try builder.finish();
+        defer selection.deinit();
+        try selection.appendTo(rules, keyframes);
     }
 
     fn scheduleInlineScriptTask(
@@ -4687,70 +4648,25 @@ pub const Browser = struct {
         thread.detach();
     }
 
-    /// Reparse one frame's retained author stylesheets under its current media
-    /// environment. The replacement is staged before the old rule generation
-    /// retires; computed style is then dirtied so newly active/inactive rules
-    /// participate in the next style pass.
+    /// Select retained author programs under the current media environment.
+    /// Failure preserves the installed generation and pending attribute revisions.
     pub fn rebuildFrameStyleRules(self: *Browser, frame: *Frame) !void {
-        const default_rules_count = self.default_style_sheet_rules.len;
-
-        var new_rules = std.ArrayList(CSSParser.CSSRule).empty;
-        var new_keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;
-        defer {
-            for (new_rules.items) |*rule| {
-                if (rule.owned) rule.deinit(self.allocator);
-            }
-            new_rules.deinit(self.allocator);
-            for (new_keyframes.items) |*rule| rule.deinit(self.allocator);
-            new_keyframes.deinit(self.allocator);
-        }
-
-        for (self.default_style_sheet_rules) |rule| {
-            try new_rules.append(self.allocator, rule);
-        }
-
-        for (frame.css_texts.items) |css_text| {
-            var css_parser = try CSSParser.initWithMedia(
-                self.allocator,
-                css_text,
-                frameMediaEnvironment(frame),
-            );
-            defer css_parser.deinit(self.allocator);
-
-            const parsed_rules = css_parser.parseWithKeyframes(self.allocator, &new_keyframes) catch |err| {
-                std.log.warn("Failed to parse stylesheet on rebuild: {}", .{err});
-                continue;
-            };
-            var parsed_rules_owned = true;
-            defer {
-                if (parsed_rules_owned) {
-                    for (parsed_rules) |*rule| rule.deinit(self.allocator);
-                }
-                self.allocator.free(parsed_rules);
-            }
-
-            try new_rules.ensureUnusedCapacity(self.allocator, parsed_rules.len);
-            for (parsed_rules) |rule| {
-                new_rules.appendAssumeCapacity(rule);
-            }
-            parsed_rules_owned = false;
-        }
-
+        const root = if (frame.current_node) |*node| node else return;
+        var pending = try frame_styles.select(self.allocator, root, frame.stylesheets.items, self.default_style_sheet_rules, frameMediaEnvironment(frame));
+        defer pending.deinit();
         for (frame.rules.items) |*rule| {
             if (rule.owned) rule.deinit(self.allocator);
         }
         frame.rules.deinit(self.allocator);
         for (frame.keyframes.items) |*rule| rule.deinit(self.allocator);
         frame.keyframes.deinit(self.allocator);
-        frame.rules = new_rules;
-        new_rules = .empty;
-        frame.keyframes = new_keyframes;
-        new_keyframes = .empty;
-        frame.default_rules_count = default_rules_count;
-        if (frame.current_node) |*root| parser.dirtyStyleSubtree(root);
-        // A resize may predate this document's initial style pass. Rebuilding
-        // its media rules must invalidate the phase guard as well as the DOM
-        // fields, even when the new Frame was already published clean.
+        frame.rules = pending.rules;
+        pending.rules = .empty;
+        frame.keyframes = pending.keyframes;
+        pending.keyframes = .empty;
+        pending.commitRevisions(frame.stylesheets.items);
+        frame.default_rules_count = self.default_style_sheet_rules.len;
+        parser.dirtyStyleSubtree(root);
         frame.markDocumentStyleDirty();
     }
 

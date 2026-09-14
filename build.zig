@@ -202,6 +202,36 @@ const WptFixture = struct {
 
 const wpt_fixtures = [_]WptFixture{
     .{
+        .fixture = "tests/manual/css-cascade-layers.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-cascade-layers.jsonl",
+    },
+    .{
+        .fixture = "tests/manual/css-stylesheet-media.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-stylesheet-media.jsonl",
+    },
+    .{
+        .fixture = "tests/manual/css-linear-gradients.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-linear-gradients.jsonl",
+    },
+    .{
+        .fixture = "tests/manual/css-color-interpolation.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-color-interpolation.jsonl",
+    },
+    .{
+        .fixture = "tests/manual/css-modern-colors.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-modern-colors.jsonl",
+    },
+    .{
         .fixture = "tests/manual/css-completion.html",
         .status = "PASS",
         .timeout_ms = 10_000,
@@ -350,6 +380,23 @@ const wpt_fixtures = [_]WptFixture{
     },
 };
 
+fn linkSdl(io: std.Io, sdk: *sdl, artifact: *std.Build.Step.Compile) void {
+    // SDL2_ttf does not re-export SDL2 symbols on every platform/linker.
+    sdk.link(io, artifact, .static, sdl.Library.SDL2);
+    sdk.link(io, artifact, .static, sdl.Library.SDL2_ttf);
+    if (artifact.rootModuleTarget().os.tag != .macos) return;
+
+    // The SDK links SDL_ttf dynamically on macOS. Its dylib records its own
+    // dependencies; pkg-config would add SDL2 a second time through a different
+    // search path, producing duplicate Mach-O load commands on some Zig builds.
+    for (artifact.root_module.link_objects.items) |*object| switch (object.*) {
+        .system_lib => |*library| {
+            if (std.mem.eql(u8, library.name, "SDL2_ttf")) library.use_pkg_config = .no;
+        },
+        else => {},
+    };
+}
+
 pub fn build(b: *std.Build) !void {
     const test_filter = b.option([]const u8, "test-filter", "Run unit tests whose names contain this substring");
     const target = b.standardTargetOptions(.{});
@@ -375,10 +422,7 @@ pub fn build(b: *std.Build) !void {
         .use_llvm = use_llvm,
     });
 
-    // SDL2_ttf uses SDL2, but does not make SDL2's symbols available to this
-    // executable on every linker/platform. Link both libraries explicitly.
-    sdk.link(io, exe, .static, sdl.Library.SDL2);
-    sdk.link(io, exe, .static, sdl.Library.SDL2_ttf);
+    linkSdl(io, sdk, exe);
     b.installArtifact(exe);
 
     const zg = b.dependency("zg", .{});
@@ -495,8 +539,7 @@ pub fn build(b: *std.Build) !void {
         if (suite.dependencies == .full) {
             // Browser input tests exercise real frame activation paths, whose
             // lazy code generation reaches the renderer and font modules.
-            sdk.link(io, unit_tests, .static, sdl.Library.SDL2);
-            sdk.link(io, unit_tests, .static, sdl.Library.SDL2_ttf);
+            linkSdl(io, sdk, unit_tests);
         }
         const unit_tests_run = b.addRunArtifact(unit_tests);
         suite_step.dependOn(&unit_tests_run.step);

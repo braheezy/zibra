@@ -627,6 +627,13 @@ fn computedLonghand(allocator: std.mem.Allocator, element: *parser.Element, prop
     if (element.animations) |animations| if (animations.get(property)) |track| return try track.serialize(allocator);
     const raw = field.get().*;
     if (@import("../document/css_properties.zig").get(property)) |metadata| {
+        if (metadata.serialization == .image) {
+            const foreground = styles.getPtr("color") orelse return null;
+            if (foreground.dirty) return null;
+            if (try @import("../document/css_gradient.zig").serialize(allocator, raw, .{
+                .current_color = @import("../document/color.zig").parseAbsolute(foreground.get().*),
+            }, .resolved)) |gradient| return gradient;
+        }
         if (metadata.serialization == .color) {
             const foreground = styles.getPtr("color") orelse return null;
             if (foreground.dirty) return null;

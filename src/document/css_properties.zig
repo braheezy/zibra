@@ -10,7 +10,7 @@ pub const Property = struct {
     default_value: []const u8,
     /// Primitive value family after shorthand expansion. Color keywords stay
     /// specified in declaration blocks and resolve for computed-style readback.
-    serialization: enum { tokens, length, color, position } = .tokens,
+    serialization: enum { tokens, length, color, position, image } = .tokens,
 };
 
 /// Static metadata for a canonical lowercase longhand name; no storage is owned.
@@ -106,7 +106,7 @@ pub const computed = svgProperties() ++ [_]Property{
     .{ .name = "overflow", .default_value = "visible" },
     .{ .name = "outline", .default_value = "none" },
     .{ .name = "background-color", .default_value = "transparent", .serialization = .color },
-    .{ .name = "background-image", .default_value = "none" },
+    .{ .name = "background-image", .default_value = "none", .serialization = .image },
     .{ .name = "background-size", .default_value = "auto" },
     .{ .name = "background-repeat", .default_value = "repeat" },
     .{ .name = "background-position", .default_value = "0% 0%", .serialization = .position },

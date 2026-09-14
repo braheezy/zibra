@@ -1,6 +1,7 @@
 //! Scalar CSS cascade ordering. Selectors supply specificity; stylesheet
 //! callers retain source order. This module owns no DOM or declaration data.
 const std = @import("std");
+const layers = @import("css_layers.zig");
 
 /// Independent counts prevent lower-specificity atoms from carrying into a
 /// higher category. Saturation applies to each category separately.
@@ -35,6 +36,7 @@ pub const Level = enum { user_agent, hint, author, important_author, important_u
 pub const Context = struct {
     origin: Origin = .author,
     inline_style: bool = false,
+    layer_order: usize = layers.unlayered,
     specificity: Specificity = .{},
     source_order: usize = 0,
 };
@@ -44,6 +46,7 @@ pub const Context = struct {
 pub const Key = struct {
     level: Level,
     inline_style: bool = false,
+    layer_order: usize = layers.unlayered,
     specificity: Specificity = .{},
     source_order: usize = 0,
 
@@ -53,6 +56,7 @@ pub const Key = struct {
                 if (context.origin == .user_agent) .important_user_agent else .important_author
             else if (context.origin == .user_agent) .user_agent else .author,
             .inline_style = context.inline_style,
+            .layer_order = context.layer_order,
             .specificity = context.specificity,
             .source_order = context.source_order,
         };
@@ -63,6 +67,9 @@ pub const Key = struct {
         if (level != .eq) return level;
         const inline_style = std.math.order(@intFromBool(self.inline_style), @intFromBool(other.inline_style));
         if (inline_style != .eq) return inline_style;
+        const important = self.level == .important_author or self.level == .important_user_agent;
+        const layer = if (important) std.math.order(other.layer_order, self.layer_order) else std.math.order(self.layer_order, other.layer_order);
+        if (layer != .eq) return layer;
         const specificity = self.specificity.order(other.specificity);
         if (specificity != .eq) return specificity;
         return std.math.order(self.source_order, other.source_order);
@@ -73,6 +80,22 @@ pub const Key = struct {
         return if (previous) |key| self.order(key) != .lt else true;
     }
 };
+
+test "CSS cascade layer order precedes specificity and reverses for important declarations" {
+    const first = Context{ .layer_order = 0, .specificity = .{ .ids = 10 }, .source_order = 99 };
+    const last = Context{ .layer_order = 7 };
+    const outside = Context{};
+    const inline_style = Context{ .inline_style = true };
+    try std.testing.expectEqual(.lt, Key.from(first, false).order(Key.from(last, false)));
+    try std.testing.expectEqual(.lt, Key.from(last, false).order(Key.from(outside, false)));
+    try std.testing.expectEqual(.gt, Key.from(first, true).order(Key.from(last, true)));
+    try std.testing.expectEqual(.gt, Key.from(last, true).order(Key.from(outside, true)));
+    try std.testing.expectEqual(.lt, Key.from(first, true).order(Key.from(inline_style, true)));
+    try std.testing.expectEqual(.gt, Key.from(first, true).order(Key.from(inline_style, false)));
+    try std.testing.expectEqual(.gt, Key.from(.{ .origin = .user_agent, .layer_order = 0 }, true).order(Key.from(inline_style, true)));
+    try std.testing.expectEqual(.gt, Key.from(.{ .origin = .user_agent, .layer_order = 0 }, true).order(Key.from(.{ .origin = .user_agent }, true)));
+    try std.testing.expectEqual(.gt, Key.from(first, false).order(Key.from(.{ .layer_order = 0, .source_order = 100 }, false)));
+}
 
 test "CSS cascade compares origin importance inline attachment specificity and source independently" {
     const many = Specificity{ .classes = 100_000, .types = 100_000 };

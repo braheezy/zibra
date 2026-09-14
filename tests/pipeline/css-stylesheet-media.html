@@ -1,0 +1,13 @@
+<!doctype html>
+<style>
+body { margin:0; }
+main { width:300px; }
+div { width:40px; height:20px; background:green; }
+</style>
+<style media="print">div { width:200px; height:100px; background:red; }</style>
+<style media="(min-width:600px)">
+#inline { width:80px; }
+@media(min-height:500px) { #inline { height:30px; } }
+</style>
+<link rel="stylesheet" media="screen and (min-width:600px)" href="css-stylesheet-media.css">
+<main><div id="inline"></div><div id="linked"></div></main>

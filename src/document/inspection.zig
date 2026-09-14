@@ -29,17 +29,6 @@ const SelectedRules = struct {
         for (self.keyframes.items) |*rule| rule.deinit(self.allocator);
         self.keyframes.deinit(self.allocator);
     }
-
-    fn append(self: *SelectedRules, sheet: stylesheet.Sheet, media: CSSParser.MediaEnvironment) !void {
-        var selection = try sheet.select(self.allocator, media);
-        errdefer selection.deinit();
-        try self.rules.ensureUnusedCapacity(self.allocator, selection.rules.len);
-        try self.keyframes.ensureUnusedCapacity(self.allocator, selection.keyframes.len);
-        self.rules.appendSliceAssumeCapacity(selection.rules);
-        self.keyframes.appendSliceAssumeCapacity(selection.keyframes);
-        self.allocator.free(selection.rules);
-        self.allocator.free(selection.keyframes);
-    }
 };
 
 pub const Page = struct {
@@ -91,7 +80,9 @@ pub const Page = struct {
             if (node.* != .element or !std.mem.eql(u8, node.element.tag, "style")) continue;
             const css_text = (try parser.collectInlineStyleText(allocator, node)) orelse continue;
             errdefer allocator.free(css_text);
-            try page.appendRules(css_text, true, .{});
+            try page.appendRules(css_text, true, .{
+                .media = if (node.element.attributes) |attrs| attrs.get("media") else null,
+            });
         }
         try page.finish();
         return page;
@@ -182,10 +173,15 @@ pub const Page = struct {
     fn selectSheets(self: *Page, media: CSSParser.MediaEnvironment, replacement_index: ?usize, replacement: ?stylesheet.Sheet) !SelectedRules {
         var selected = SelectedRules{ .allocator = self.allocator };
         errdefer selected.deinit();
+        var builder = stylesheet.SelectionBuilder.init(self.allocator);
+        defer builder.deinit();
         for (self.sheets.items, 0..) |sheet, index| {
             const current = if (replacement_index != null and replacement_index.? == index) replacement.? else sheet;
-            try selected.append(current, media);
+            try builder.append(current, media, current.metadata.media);
         }
+        var selection = try builder.finish();
+        defer selection.deinit();
+        try selection.appendTo(&selected.rules, &selected.keyframes);
         return selected;
     }
 
@@ -227,7 +223,10 @@ pub const Page = struct {
                 const css_text = (try parser.collectInlineStyleText(self.allocator, node)) orelse continue;
                 var text_owned = true;
                 errdefer if (text_owned) self.allocator.free(css_text);
-                try self.appendRules(css_text, true, .{ .base_url = document_base });
+                try self.appendRules(css_text, true, .{
+                    .base_url = document_base,
+                    .media = if (element.attributes) |attrs| attrs.get("media") else null,
+                });
                 text_owned = false;
                 continue;
             }
@@ -253,6 +252,7 @@ pub const Page = struct {
             try self.appendRules(fetched.text, true, .{
                 .base_url = fetched.source_url,
                 .referrer_policy = fetched.referrer_policy,
+                .media = attrs.get("media"),
             });
             text_owned = false;
         }

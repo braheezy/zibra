@@ -85,3 +85,26 @@ test "animation longhand edits retain elapsed time and important declarations ov
     try std.testing.expect(element.css_animation == null);
     try std.testing.expectEqual(@as(u32, 0), element.animations.?.count());
 }
+
+test "color-mix keyframes retain scalar endpoints and refresh foreground and font dependencies" {
+    var sheet = try Sheet.init(allocator, "@keyframes mix {from {background-color:color-mix(in oklab,currentcolor,oklab(calc(1em / 100px) 0 0))} to {background-color:oklab(0.8 0 0)}}", .{});
+    defer sheet.deinit();
+    var selected = try sheet.select(allocator, .{});
+    var selected_alive = true;
+    defer if (selected_alive) selected.deinit();
+    var root = dom.Node{ .element = try dom.Element.init(allocator, "div", null) };
+    defer root.deinit(allocator);
+    root.element.attributes = @import("../document/attributes.zig").Map.init(allocator);
+    const element = &root.element;
+    try element.attributes.?.put("style", "font-size:20px;color:oklab(.4 0 0);animation:mix 2s linear -1s both paused");
+    try dom.styleWithKeyframes(allocator, &root, selected.rules, selected.keyframes);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.55), element.animations.?.get("background-color").?.color.getAbsolute().coordinates.components[0].?, 0.000001);
+    try element.attributes.?.put("style", "font-size:40px;color:oklab(.8 0 0);animation:mix 2s linear -1s both paused");
+    dom.dirtyStyleForElement(element);
+    try dom.styleWithKeyframes(allocator, &root, selected.rules, selected.keyframes);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.7), element.animations.?.get("background-color").?.color.getAbsolute().coordinates.components[0].?, 0.000001);
+    selected.deinit();
+    selected_alive = false;
+    // No source-backed string survives inside a sampled track.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.7), element.animations.?.get("background-color").?.color.getAbsolute().coordinates.components[0].?, 0.000001);
+}

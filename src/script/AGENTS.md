@@ -22,7 +22,9 @@ queued work and shutdown are documented in
   not merely the evaluation callback. See the thread-lifetime contract below.
 - `runtime/bootstrap.js` defines the page-visible DOM, traversal, event, timer,
   canvas, XHR, cookie, and messaging shims over `__native`; Zig loads it with
-  `@embedFile` before evaluating page code.
+  `@embedFile` before evaluating page code. Style/link media reflection uses
+  the ordinary attribute mutation path; preserve the native media revision so
+  synchronous style reads can reselect retained sheets without resource fetching.
 - `runtime/css_style.js` supplies cached inline-style views and argument
   conversion. `css_style_bindings.zig` queries/mutates the Element's native
   ordered block through synchronous handle borrows. Preserve staged publication,
@@ -31,6 +33,8 @@ queued work and shutdown are documented in
   ancestor style work and copies values before returning to Kiesel. Its
   longhand accessors come from the property registry; color primitives resolve
   with the native color owner while inline views keep specified keywords.
+  Gradient readback resolves currentcolor on the receiving element; retain
+  unquantized operands in declaration/computed owners independently of CSSOM text.
   The same domain exposes the Realm's `CSS.supports` namespace function.
   JavaScript handles overload selection/string conversion; native feature
   queries share `@supports` evaluation and must not mutate or flush the DOM.
@@ -88,7 +92,8 @@ queued work and shutdown are documented in
   borrowed source or Kiesel value and never decide terminal results, browser
   deadlines, process health, or manifest expectations.
 - `native_bindings.zig` installs comptime binding tables; `transitions.zig`
-  parses and starts typed DOM transitions.
+  parses and starts typed DOM transitions. Color endpoints and interruption
+  samples retain scalar color-space coordinates through the shared color owner.
 
 ## Local contracts
 

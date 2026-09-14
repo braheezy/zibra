@@ -1,0 +1,93 @@
+<!-- How to verify: expect green PASS. The first row contains matching green
+     swatches; the palette below uses OKLCH. Toggle the theme and font size to
+     check live colors, then Reset. No red fallback swatches should remain in
+     the first row; the later Display P3 red swatch is intentional. -->
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Modern CSS colors</title>
+<style>
+body { margin:24px; font:16px sans-serif; }
+.row { display:flex; gap:12px; flex-wrap:wrap; }
+.swatch { width:100px; height:64px; background:red; margin:6px 0; }
+.lab { background:lab(46.2775% -47.5621 48.5837); }
+.lch { background:lch(46.2775% 67.9892 134.3912); }
+.oklab { background:oklab(51.975% -0.1403 0.10768); }
+.oklch { background:oklch(51.975% 0.17686 142.495); }
+.p3 { background:color(display-p3 0.21604 0.49418 0.13151); }
+.hwb { background:hwb(120 0% 49.8039%); }
+.light { background:oklch(88% 0.08 250); }
+.medium { background:oklch(65% 0.18 250); }
+.dark { background:oklch(40% 0.1 250); }
+.wide { background:color(display-p3 1 0 0); }
+#brand { color:var(--brand); background:currentcolor; }
+#font { font-size:20px; }
+#relative { font-size:inherit; color:oklab(calc(1em / 40px) 0 0); background:currentcolor; }
+@keyframes gray { from {background:oklab(50% 0 0)} to {background:color(srgb-linear .5 .5 .5)} }
+#animated { animation:gray 2s linear -1s both paused; }
+</style>
+<style id="theme">:root { --brand:oklch(65% 0.18 250); }</style>
+</head><body>
+<h1 id="status">Checking modern CSS colors</h1>
+<p>Lab, LCH, Oklab, OKLCH, Display P3 and HWB: matching sRGB green.</p>
+<div class="row"><div class="swatch lab"></div><div class="swatch lch"></div><div class="swatch oklab"></div><div class="swatch oklch"></div><div class="swatch p3"></div><div class="swatch hwb"></div></div>
+<p>OKLCH palette and Display P3 red mapped into the native sRGB framebuffer.</p>
+<div class="row"><div class="swatch light"></div><div class="swatch medium"></div><div class="swatch dark"></div><div class="swatch wide"></div></div>
+<p>Live theme, font-dependent calculation, and paused animation:</p>
+<div class="row"><div id="brand" class="swatch"></div><div id="font"><div id="relative" class="swatch"></div></div><div id="animated" class="swatch"></div></div>
+<button id="toggle">Toggle theme and font</button><button id="reset">Reset</button>
+<p id="details"></p>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var results = [], theme = document.getElementById('theme');
+  var brand = document.getElementById('brand'), relative = document.getElementById('relative');
+  var font = document.getElementById('font'), animated = document.getElementById('animated');
+  function equal(a,b) { if (a !== b) throw Error(String(a) + ' != ' + String(b)); }
+  function check(name,fn) { try { fn(); results.push({name:name,status:0}); } catch(e) { results.push({name:name,status:1,message:String(e)}); } }
+  check('modern color feature queries and specified/computed serialization agree',function() {
+    equal(CSS.supports('color','oklch(60% 0.2 30)'),true);
+    equal(CSS.supports('color','color(display-p3 1 0 0)'),true);
+    equal(CSS.supports('color','lab(50% 20deg 0)'),false);
+    brand.style.borderColor='color(xyz 10% 20% 30% / none)';
+    equal(getComputedStyle(brand).borderTopColor,'color(xyz-d65 0.1 0.2 0.3 / none)');
+    brand.style.borderColor='oklab(0.5 none none)';
+    equal(getComputedStyle(brand).borderTopColor,'oklab(0.5 none none)');
+  });
+  var alternate = false;
+  function setTheme(changed) {
+    alternate=changed;
+    theme.textContent = changed ? ':root{--brand:oklch(70% .14 150)}' : ':root{--brand:oklch(65% .18 250)}';
+    font.style.fontSize=changed ? '10px' : '20px';
+  }
+  check('stylesheet replacement updates custom properties and currentcolor',function() {
+    var computed = getComputedStyle(brand);
+    equal(computed.backgroundColor,'oklch(0.65 0.18 250)');
+    setTheme(true);
+    equal(computed.backgroundColor,'oklch(0.7 0.14 150)');
+    setTheme(false);
+    equal(computed.backgroundColor,'oklch(0.65 0.18 250)');
+  });
+  check('relative-unit color calculations invalidate with inherited font size',function() {
+    var computed=getComputedStyle(relative);
+    equal(computed.color,'oklab(0.5 0 0)');
+    font.style.fontSize='10px'; equal(computed.color,'oklab(0.25 0 0)');
+    font.style.fontSize='20px'; equal(computed.backgroundColor,'oklab(0.5 0 0)');
+  });
+  check('modern keyframe endpoints preserve Oklab interpolation coordinates',function() {
+    var midpoint=getComputedStyle(animated).backgroundColor;
+    equal(midpoint.indexOf('oklab('),0);
+    var channels=midpoint.match(/[+-]?(?:\d*\.)?\d+(?:e[+-]?\d+)?/gi).map(Number);
+    equal(Math.abs(channels[0]-0.64685026299)<0.000001,true);
+    equal(Math.abs(channels[1])<0.000001 && Math.abs(channels[2])<0.000001,true);
+    animated.style.animationDelay='-3s';
+    equal(getComputedStyle(animated).backgroundColor,'color(srgb-linear 0.5 0.5 0.5)');
+    animated.style.animationDelay='-1s';
+  });
+  document.getElementById('toggle').addEventListener('click',function(){setTheme(!alternate);});
+  document.getElementById('reset').addEventListener('click',function(){setTheme(false);});
+  var failed=results.filter(function(r){return r.status !== 0;});
+  var status=document.getElementById('status');
+  status.textContent=failed.length ? 'FAIL: '+failed[0].name : 'PASS: modern CSS colors';
+  status.style.color=failed.length ? 'red' : 'green';
+  document.getElementById('details').textContent=failed.map(function(r){return r.message;}).join('; ');
+  if (typeof completion_callback === 'function') completion_callback(results,{status:0});
+});
+</script></body></html>

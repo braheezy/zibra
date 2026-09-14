@@ -35,6 +35,7 @@ The nested [`render/AGENTS.md`](render/AGENTS.md) adds rendering-specific rules.
 | `presentation_worker.zig` | Raster runner, worker-only surfaces/cache, completed-result transfer, and joined teardown |
 | `tab.zig` | Serialized page work, render-phase orchestration, focus/accessibility state, and Frame-tree coordination |
 | `frame.zig` | One document generation: DOM/style/layout/display ownership, child Frames, hit testing, and default actions |
+| `frame_styles.zig` | Attached stylesheet source/program owners, generation-bound owner ordinals and transactional media selection |
 | `content_security_policy.zig` | Frame-owned response policy list, source parsing, and destination-specific URL checks |
 | `history.zig` | Pointer-free owning joint root/iframe session history and traversal preparation |
 | `tab_animation.zig` | CSS track advancement, SVG timeline sampling, and compositor-versus-layout/paint phase classification |
@@ -115,6 +116,8 @@ into either leaf module.
   Network loading of new resources happens after the host call returns.
 - Retain stylesheet source order when publishing or rebuilding rule generations.
   Style application compares explicit cascade keys; never pre-sort by specificity.
+  Use one shared stylesheet selection builder per generation so layer ranks
+  account for every active sheet, including statement-only sheets.
 - Each Frame owns its URL, decoded HTML, stylesheet source/rule/keyframe
   generation, layout pointer, display list, and child Frames. Raw parent,
   frame-element, focus/hover, and layout pointers borrow that generation.

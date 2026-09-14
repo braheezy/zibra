@@ -1,0 +1,40 @@
+# Modern absolute colors: grammar, computed values, and native sRGB painting.
+# Keep upstream PASS expectations. Relative-color/mixing and CSSOM APIs are separate slices.
+tests:
+  - css/css-color/parsing/color-valid-hwb.html
+  - css/css-color/parsing/color-invalid-hwb.html
+  - css/css-color/parsing/color-computed-hwb.html
+  - css/css-color/parsing/color-valid-lab.html
+  - css/css-color/parsing/color-invalid-lab.html
+  - css/css-color/parsing/color-computed-lab.html
+  - css/css-color/parsing/color-valid-color-function.html
+  - css/css-color/parsing/color-invalid-color-function.html
+  - css/css-color/parsing/color-computed-color-function.html
+reftests:
+  - css/css-color/hwb-001.html
+  - css/css-color/hwb-002.html
+  - css/css-color/hwb-003.html
+  - css/css-color/lab-001.html
+  - css/css-color/lab-004.html
+  - css/css-color/lab-005.html
+  - css/css-color/lch-001.html
+  - css/css-color/lch-004.html
+  - css/css-color/lch-005.html
+  - css/css-color/lch-009.html
+  - css/css-color/oklab-001.html
+  - css/css-color/oklab-004.html
+  - css/css-color/oklab-005.html
+  - css/css-color/oklab-009.html
+  - css/css-color/oklch-001.html
+  - css/css-color/oklch-004.html
+  - css/css-color/oklch-005.html
+  - css/css-color/oklch-009.html
+  - css/css-color/srgb-linear-001.html
+  - css/css-color/display-p3-001.html
+  - css/css-color/display-p3-linear-001.html
+  - css/css-color/a98rgb-001.html
+  - css/css-color/prophoto-rgb-001.html
+  - css/css-color/rec2020-001.html
+  - css/css-color/xyz-001.html
+crashtests:
+  - css/css-color/crashtests/stop-color-invalid-rgb.html

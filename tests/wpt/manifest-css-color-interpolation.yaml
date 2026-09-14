@@ -1,0 +1,29 @@
+# Specified calculations, color-mix(), and native color interpolation.
+# Retain upstream expectations and separate unsupported animation APIs.
+tests:
+  - css/css-color/parsing/color-valid-color-mix-function.html
+  - css/css-color/parsing/color-invalid-color-mix-function.html
+  - css/css-color/parsing/color-computed-color-mix-function.html
+  - css/css-color/parsing/color-mix-out-of-gamut.html
+  - css/css-color/color-mix-missing-components.html
+  - css/css-color/parsing/color-valid-rgb.html
+  - css/css-color/parsing/color-computed-rgb.html
+  - css/css-color/parsing/color-valid-hsl.html
+  - css/css-color/parsing/color-computed-hsl.html
+  - css/css-color/parsing/color-valid-hwb.html
+  - css/css-color/parsing/color-computed-hwb.html
+  - css/css-color/parsing/color-valid-lab.html
+  - css/css-color/parsing/color-computed-lab.html
+  - css/css-color/parsing/color-valid-color-function.html
+  - css/css-color/parsing/color-computed-color-function.html
+reftests:
+  - css/css-color/color-mix-basic-001.html
+  - css/css-color/color-mix-non-srgb-001.html
+  - css/css-color/color-mix-currentcolor-001.html
+  - css/css-color/color-mix-currentcolor-002.html
+  - css/css-color/color-mix-currentcolor-003.html
+  - css/css-color/color-mix-currentcolor-nested-for-color-property.html
+  - css/css-color/color-mix-percents-01.html
+  - css/css-color/color-mix-percents-02.html
+crashtests:
+  - css/css-color/crashtests/stop-color-invalid-rgb.html

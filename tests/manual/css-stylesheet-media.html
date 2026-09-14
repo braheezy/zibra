@@ -1,0 +1,58 @@
+<!-- How to verify: expect green PASS, a green tile, and a green responsive bar.
+     Toggle linked media to remove/restore the tile's image and green text.
+     Resize below/above 600px: the bar changes between 150px and 300px while
+     the image remains visible. Print-only rules must never turn the page red. -->
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Retained stylesheet media</title>
+<style>
+body { margin:24px; font:16px sans-serif; background:white; color:#17202a; }
+#target { width:120px; height:80px; margin:16px 0; color:black; background:#eee; }
+#responsive { width:300px; height:20px; margin:16px 0; background:green; }
+@media(max-width:600px) { #responsive { width:150px; } }
+</style>
+<style id="print" media="print">#target { width:150px; color:purple; background:red; }</style>
+<link id="linked" rel="stylesheet" media="not all" href="stylesheet-media/site.css">
+</head><body>
+<h1 id="status">Checking stylesheet media</h1>
+<p>Linked stylesheet: green tile and text. Print-only styles stay inactive.</p>
+<div id="target"><span id="child">Linked sheet</span></div>
+<button id="toggle">Toggle linked media</button>
+<p>Responsive bar: 150px below 600px, 300px above.</p><div id="responsive"></div>
+<p id="details"></p>
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+  var results=[], active=true;
+  var target=document.getElementById('target'), linked=document.getElementById('linked');
+  var print=document.getElementById('print'), held=getComputedStyle(target);
+  function equal(a,b){if(a!==b)throw Error(String(a)+' != '+String(b));}
+  function check(name,fn){try{fn();results.push({name:name,status:0});}catch(e){results.push({name:name,status:1,message:String(e)});}}
+  check('nonmatching sheets stay inactive',function(){
+    equal(held.color,'rgb(0, 0, 0)'); equal(target.getBoundingClientRect().width,120);
+  });
+  check('style media reflection changes a held computed view',function(){
+    print.media='screen'; equal(print.getAttribute('media'),'screen');
+    equal(held.color,'rgb(128, 0, 128)'); equal(target.getBoundingClientRect().width,150);
+  });
+  check('linked media activates source-order rules and relative images',function(){
+    linked.media='all'; equal(held.color,'rgb(0, 128, 0)');
+    equal(getComputedStyle(document.getElementById('child')).color,'rgb(0, 128, 0)');
+    equal(target.getBoundingClientRect().width,240);
+    equal(held.backgroundImage.indexOf('tile.ppm')>=0,true);
+  });
+  check('removal and empty media lists apply immediately',function(){
+    linked.media='print'; equal(held.color,'rgb(128, 0, 128)');
+    linked.removeAttribute('media'); equal(linked.media,''); equal(held.color,'rgb(0, 128, 0)');
+    linked.media='none'; print.removeAttribute('media'); equal(held.color,'rgb(128, 0, 128)');
+    print.media='print'; equal(held.color,'rgb(0, 0, 0)');
+    linked.media=' /**/ '; equal(held.color,'rgb(0, 128, 0)');
+  });
+  document.getElementById('toggle').addEventListener('click',function(){
+    active=!active; linked.media=active?'all':'print';
+  });
+  var failed=results.filter(function(r){return r.status!==0;});
+  document.getElementById('status').textContent=failed.length?'FAIL: stylesheet media':'PASS: stylesheet media';
+  document.getElementById('status').style.color=failed.length?'red':'green';
+  document.getElementById('details').textContent=failed.map(function(r){return r.message;}).join('; ');
+  if(typeof completion_callback==='function')completion_callback(results,{status:0});
+});
+</script></body></html>

@@ -17,6 +17,9 @@ tiers and baseline policy.
 | --- | --- |
 | [`acid1-box-model.html`](acid1-box-model.html) | Acid1-inspired nested box spacing, borders, backgrounds, and visual compatibility baseline |
 | [`dump-pipeline.html`](dump-pipeline.html) | Shared style, layout, and display-list inspection input |
+| [`css-stylesheet-media.html`](css-stylesheet-media.html) | Retained style/link media, live computed reads, inherited color, relative linked images and resize |
+| [`css-cascade-layers.html`](css-cascade-layers.html) | Named/nested layer precedence, important reversal, paused keyframes and live media/order edits |
+| [`css-linear-gradients.html`](css-linear-gradients.html) | Linear/repeating backgrounds, color-space interpolation, hard stops/hints, alpha, tiles, inherited currentcolor/font changes and CSSOM mutation |
 | [`dump-dom.html`](dump-dom.html) | Isolated HTML parser/DOM dump input |
 | [`html-fragments.html`](html-fragments.html) | Context-sensitive dynamic markup, inert scripts, removed-node retention, and listener identity across adjacent/outer insertion |
 | [`character-data.html`](character-data.html) | Text edits reflow live layout, preserve literal entities, and repair Range endpoints across splitting and normalization |
@@ -55,6 +58,8 @@ tiers and baseline policy.
 | [`css-colors.html`](css-colors.html) | Named and resolved colors, currentcolor inheritance, live CSSOM readback, variables and matching native background paint |
 | [`css-supports.html`](css-supports.html) | CSS.supports overloads, boolean and selector queries, conditional styling and matching media-dependent bars |
 | [`css-completion.html`](css-completion.html) | Font-dependent color math, nested-selector invalidation, paused animation fill edits, and shared sticky paint/scroll/geometry |
+| [`css-modern-colors.html`](css-modern-colors.html) | Modern color spaces, native gamut mapping, live theme/font updates, and modern keyframe endpoints |
+| [`css-color-interpolation.html`](css-color-interpolation.html) | Specified calculations, color mixing, hue paths, inherited currentcolor, and precise paused animations |
 | [`selector-sequences.html`](selector-sequences.html) | Concatenated tag/class/ID selectors and specificity |
 | [`generated-pseudo-elements.html`](generated-pseudo-elements.html) | Private `:before`/`::after` generated boxes, before/authored/after layout order, and DOM-child transparency |
 | [`has-selectors.html`](has-selectors.html) | Strict-descendant `:has` matching and recomputation |

@@ -1,8 +1,8 @@
 //! Shared paint leaves for backgrounds and replaced controls.
 //!
 //! Functions append owning display-command containers where required but do
-//! not own layout objects. Pixel slices and command provenance remain borrowed
-//! from the current document generation until a raster snapshot copies them.
+//! not own layout objects. External pixels and provenance borrow the current
+//! generation; generated gradients own scalar stops copied again at snapshot.
 
 const std = @import("std");
 const parser = @import("../../document/parser.zig");
@@ -22,12 +22,16 @@ pub const BackgroundImagePaint = struct {
     position: []const u8,
     font_size: f64 = 16,
     attachment: display_list.ImageTiling.Attachment,
+    gradient_source: ?[]const u8 = null,
+    foreground: []const u8 = "black",
+    border_radius: f64 = 0,
 };
 
 pub fn backgroundImagePaint(element: *const parser.Element) ?BackgroundImagePaint {
-    const installed = element.background_image orelse return null;
-    const data = installed.data orelse return null;
     const styles = if (element.style) |*style_map| style_map else return null;
+    const image_value = styleValue(styles, "background-image") orelse "none";
+    const gradient = if (@import("../../document/css_gradient.zig").parse(image_value) != null) image_value else null;
+    const data = if (gradient == null) (element.background_image orelse return null).data orelse return null else null;
     const size = if (styleValue(styles, "background-size")) |value|
         background_image.parseSize(value) orelse background_image.Size.automatic()
     else
@@ -37,9 +41,12 @@ pub fn backgroundImagePaint(element: *const parser.Element) ?BackgroundImagePain
     else
         background_image.Repeat{ .x = true, .y = true };
     return .{
-        .pixels = data.image.rawBytes(),
-        .source_width = @intCast(data.image.width),
-        .source_height = @intCast(data.image.height),
+        .pixels = if (data) |image| image.image.rawBytes() else &.{},
+        .source_width = if (data) |image| @intCast(image.image.width) else 1,
+        .source_height = if (data) |image| @intCast(image.image.height) else 1,
+        .gradient_source = gradient,
+        .foreground = styleValue(styles, "color") orelse "black",
+        .border_radius = @import("box_model.zig").parseCssPixelRadius(styleValue(styles, "border-radius") orelse "0px"),
         .size = size,
         .repeat = repeat,
         .position = styleValue(styles, "background-position") orelse "0% 0%",
@@ -124,7 +131,7 @@ pub fn appendBackgroundImageBox(
     const fixed = paint.attachment == .fixed;
     const positioning_width = if (fixed) viewport_width else @max(width -| border.left -| border.right, 0);
     const positioning_height = if (fixed) viewport_height else @max(height -| border.top -| border.bottom, 0);
-    const resolved = background_image.resolveSize(
+    const resolved = if (paint.gradient_source != null) background_image.resolveGeneratedSize(paint.size, positioning_width, positioning_height, css_scale) else background_image.resolveSize(
         paint.size,
         positioning_width,
         positioning_height,
@@ -143,6 +150,15 @@ pub fn appendBackgroundImageBox(
         paint.font_size,
     );
 
+    const gradient = if (paint.gradient_source) |input|
+        try @import("../../document/gradient_line.zig").Linear.init(allocator, input, .{
+            .font_size = paint.font_size,
+            .current_color = @import("../../document/color.zig").parseAbsolute(paint.foreground),
+        }, @as(f64, @floatFromInt(resolved.width)) / css_scale, @as(f64, @floatFromInt(resolved.height)) / css_scale)
+    else
+        null;
+    errdefer if (gradient) |owned| owned.deinit(allocator);
+    if (paint.gradient_source != null and gradient == null) return;
     try commands.append(allocator, .{ .image = .{
         .x1 = x,
         .y1 = y,
@@ -151,6 +167,8 @@ pub fn appendBackgroundImageBox(
         .source_width = paint.source_width,
         .source_height = paint.source_height,
         .pixels = paint.pixels,
+        .gradient = gradient,
+        .clip_radius = paint.border_radius * css_scale,
         .tiling = .{
             .width = resolved.width,
             .height = resolved.height,
@@ -211,6 +229,30 @@ pub fn appendEditorClip(destination: *std.ArrayList(DisplayItem), allocator: std
 fn styleValue(style_map: *const parser.StyleMap, property: []const u8) ?[]const u8 {
     const field = @constCast(style_map).getPtr(property) orelse return null;
     return field.get().*;
+}
+
+fn roundedGradientAllocationCheck(allocator: std.mem.Allocator) !void {
+    var commands: std.ArrayList(DisplayItem) = .empty;
+    defer commands.deinit(allocator);
+    defer DisplayItem.freeItems(allocator, commands.items);
+    try appendBackgroundImageBox(&commands, allocator, .{
+        .pixels = &.{},
+        .source_width = 1,
+        .source_height = 1,
+        .size = .cover,
+        .repeat = .{ .x = true, .y = true },
+        .position = "0 0",
+        .attachment = .scroll,
+        .gradient_source = "linear-gradient(red, blue)",
+        .border_radius = 8,
+    }, 0, 0, 20, 20, .{}, 400, 300, 2, null);
+    try std.testing.expectEqual(@as(usize, 1), commands.items.len);
+    try std.testing.expect(commands.items[0] == .image);
+    try std.testing.expectEqual(@as(f64, 16), commands.items[0].image.clip_radius);
+}
+
+test "rounded gradient background publication releases every partial owner on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, roundedGradientAllocationCheck, .{});
 }
 
 test "background image paint resolves size and fractional source crop" {

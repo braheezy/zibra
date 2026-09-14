@@ -1,0 +1,4 @@
+#target { width:240px; color:green; background-image:url(tile.ppm); }
+@media screen {
+  @supports (border-radius:8px) { #target { border-radius:8px; } }
+}

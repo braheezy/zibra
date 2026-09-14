@@ -218,13 +218,21 @@ fragment actions do not resend retained POST metadata.
 
 ## Stylesheet and dynamic-resource generations
 
-A Frame's stylesheet texts, parsed rules, and named keyframes are one owner
-generation. Structural ranges and keyframe names borrow those texts; compiled
-declaration maps independently own their normalized names/values. Stage and validate
-the complete replacement before retiring the old generation.
+A Frame's `stylesheets` own shared `css_stylesheet.Sheet` programs and attached
+source ordinals through `frame_styles.Source`. The active rules/keyframes are a
+separate selection; their keyframe names borrow the retained source. Stage the
+complete replacement before retiring old selections, then old source programs.
+External sheets retain their final URL and response referrer policy in every
+selection, including after viewport and media-attribute changes.
+The shared selection builder registers active cascade layers across all sheets
+before resolving normal/important precedence. A replacement or media change can
+change layer order even when it changes no executable declaration, so every
+selection rebuilds these temporary per-origin trees. Published rules retain
+scalar ranks; neither layer names nor tree pointers escape the staging owner.
 
-Media-environment changes rebuild all retained author sheets on the serialized
-render path, then dirty both computed style and the Frame document phase guard.
+Media-environment changes reselect compiled author programs on the serialized
+render path without recompiling selectors/declarations, then dirty both computed
+style and the Frame document phase guard.
 This also applies when the resize preceded a new Frame's first style pass;
 dirty DOM fields alone must never reach layout through a clean document gate.
 Root media width/height are native content-viewport dimensions divided by
@@ -249,6 +257,15 @@ fetch stylesheets but must not queue scripts or load iframe documents; the
 general resource-dirty flag remains pending for the post-callback worker pass.
 Every replacement dirties computed style and the Frame phase guard. Computed
 Element strings are interned independently of the replaced CSS generation.
+
+Style/link `media` mutations increment the Element attribute map's scalar media
+revision and use the ordinary render request. The protected style pass compares
+source revisions and reselects the retained programs without fetching resources.
+Absent/empty lists apply to all media; sheet media and nested `@media` conditions
+both restrict applicability. Structural refresh still rebuilds full source
+programs, and can refetch sheets; media-only selection does not change that flag.
+See the [retained stylesheet contract](document-and-rendering.md#retained-stylesheet-ownership).
+
 
 ## Images and background images
 

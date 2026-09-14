@@ -191,7 +191,7 @@ test "resource refresh adds and removes live linked stylesheet generations" {
     frame.resources_dirty = true;
     try test_browser.refreshFrameResources(&frame);
     try std.testing.expectEqual(@as(usize, 0), frame.rules.items.len);
-    try std.testing.expectEqual(@as(usize, 0), frame.css_texts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), frame.stylesheets.items.len);
 
     // Model an attached createElement/innerHTML result. A data URL keeps the
     // test deterministic while still exercising the browser's linked-sheet
@@ -211,8 +211,23 @@ test "resource refresh adds and removes live linked stylesheet generations" {
     frame.resources_dirty = true;
     try test_browser.refreshFrameResources(&frame);
     try std.testing.expectEqual(@as(usize, 1), frame.rules.items.len);
-    try std.testing.expectEqual(@as(usize, 1), frame.css_texts.items.len);
+    try std.testing.expectEqual(@as(usize, 1), frame.stylesheets.items.len);
     try std.testing.expectEqualStrings("green", frame.rules.items[0].properties.get("color").?.value);
+
+    // Media selection preserves the loaded program and external URL through
+    // inactive and active generations, without entering the resource loader.
+    const retained_program = frame.stylesheets.items[0].sheet.rules.ptr;
+    const retained_url = frame.stylesheets.items[0].sheet.options().base_url.?;
+    const attached_link = &head.element.children.items[0];
+    try attached_link.element.attributes.?.put("media", "print");
+    try test_browser.rebuildFrameStyleRules(&frame);
+    try std.testing.expectEqual(@as(usize, 0), frame.rules.items.len);
+    try std.testing.expect(frame.document.dirty);
+    try std.testing.expect(attached_link.element.attributes.?.orderedRemove("media"));
+    try test_browser.rebuildFrameStyleRules(&frame);
+    try std.testing.expectEqual(@as(usize, 1), frame.rules.items.len);
+    try std.testing.expectEqual(retained_program, frame.stylesheets.items[0].sheet.rules.ptr);
+    try std.testing.expectEqualStrings(retained_url, frame.rules.items[0].source_url.?);
 
     // A detached link is absent from the next staged generation. Its old
     // rules are destroyed before their stylesheet backing buffer is freed.
@@ -222,7 +237,7 @@ test "resource refresh adds and removes live linked stylesheet generations" {
     frame.resources_dirty = true;
     try test_browser.refreshFrameResources(&frame);
     try std.testing.expectEqual(@as(usize, 0), frame.rules.items.len);
-    try std.testing.expectEqual(@as(usize, 0), frame.css_texts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), frame.stylesheets.items.len);
 }
 
 test "parallel stylesheet fetches are applied in DOM source order" {
@@ -273,7 +288,7 @@ test "parallel stylesheet fetches are applied in DOM source order" {
     frame.resources_dirty = true;
     try test_browser.refreshFrameResources(&frame);
 
-    try std.testing.expectEqual(@as(usize, 2), frame.css_texts.items.len);
+    try std.testing.expectEqual(@as(usize, 2), frame.stylesheets.items.len);
     try std.testing.expectEqual(@as(usize, 2), frame.rules.items.len);
     try std.testing.expectEqualStrings("red", frame.rules.items[0].properties.get("color").?.value);
     try std.testing.expectEqualStrings("green", frame.rules.items[1].properties.get("color").?.value);

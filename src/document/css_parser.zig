@@ -44,12 +44,20 @@ const Combinator = selector_mod.Combinator;
 pub const CSSParser = @This();
 
 pub const cascade = @import("css_cascade.zig");
+const layers = @import("css_layers.zig");
 pub const Specificity = cascade.Specificity;
 pub const MatchContext = selector_mod.MatchContext;
 pub const HasMatchCache = selector_mod.HasMatchCache;
 
-/// Explicit browsing-context values used while parsing conditional rules.
+/// Explicit browsing-context values used to select conditional rules.
 pub const MediaEnvironment = media_query.Environment;
+
+/// One retained @media condition. Queries borrow stylesheet source; a parent
+/// index always precedes its child in the same compiled stylesheet.
+pub const MediaCondition = struct {
+    query: []const u8,
+    parent: ?usize,
+};
 
 pub const Declaration = css_declarations.Declaration;
 pub const DeclarationMap = css_declarations.Map;
@@ -70,10 +78,29 @@ pub const Keyframe = struct {
 pub const KeyframesRule = struct {
     name: []const u8,
     frames: []Keyframe,
+    /// Index into a retained stylesheet's conditions; null is unconditional.
+    media_condition: ?usize = null,
+    layer: layers.Reference = .none,
+    origin: cascade.Origin = .author,
 
     pub fn deinit(self: *KeyframesRule, allocator: std.mem.Allocator) void {
         for (self.frames) |*frame| frame.deinit();
         allocator.free(self.frames);
+    }
+
+    /// Copies frame declarations into allocator; the name still borrows source.
+    pub fn clone(self: KeyframesRule, allocator: std.mem.Allocator) !KeyframesRule {
+        const frames = try allocator.alloc(Keyframe, self.frames.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (frames[0..initialized]) |*frame| frame.deinit();
+            allocator.free(frames);
+        }
+        for (self.frames, 0..) |frame, i| {
+            frames[i] = .{ .offset = frame.offset, .properties = try frame.properties.cloneWithAllocator(allocator) };
+            initialized += 1;
+        }
+        return .{ .name = self.name, .frames = frames, .media_condition = self.media_condition, .layer = self.layer, .origin = self.origin };
     }
 
     pub fn frameAt(self: *const KeyframesRule, offset: f64) ?*const Keyframe {
@@ -94,6 +121,10 @@ in_has: bool = false,
 /// Feature queries reject unsupported members even in forgiving logical lists.
 strict_support: bool = false,
 group_depth: usize = 0,
+retained_conditions: ?*std.ArrayList(MediaCondition) = null,
+media_condition: ?usize = null,
+layer_program: ?*layers.Program = null,
+layer_declaration: ?usize = null,
 
 pub fn init(allocator: std.mem.Allocator, string: []const u8, prefers_dark: bool) !*CSSParser {
     return initWithMedia(allocator, string, .{ .prefers_dark = prefers_dark });
@@ -719,11 +750,26 @@ pub const CSSRule = struct {
     /// Independent source URL owner for external-sheet resource provenance.
     source_url: ?[]u8 = null,
     referrer_policy: @import("referrer.zig").Policy = .default,
+    /// Index into a retained stylesheet's conditions; absent in active selections.
+    media_condition: ?usize = null,
+    layer: layers.Reference = .none,
+
+    /// Creates an independent selector, declaration and URL owner in allocator.
+    pub fn clone(self: CSSRule, allocator: std.mem.Allocator) !CSSRule {
+        var copy = self;
+        copy.selector = try self.selector.clone(allocator);
+        errdefer copy.selector.deinit(allocator);
+        copy.properties = try self.properties.cloneWithAllocator(allocator);
+        errdefer copy.properties.deinit();
+        copy.source_url = if (self.source_url) |source| try allocator.dupe(u8, source) else null;
+        copy.owned = true;
+        return copy;
+    }
 
     /// Rules must remain in stylesheet source order. The ordinal is local to
     /// the current rule generation and carries no source or DOM ownership.
     pub fn cascadeContext(self: CSSRule, source_order: usize) cascade.Context {
-        return .{ .origin = self.origin, .specificity = self.selector.specificity(), .source_order = source_order };
+        return .{ .origin = self.origin, .layer_order = self.layer.order(), .specificity = self.selector.specificity(), .source_order = source_order };
     }
 
     pub fn deinit(self: *CSSRule, allocator: std.mem.Allocator) void {
@@ -739,7 +785,7 @@ pub const CSSRule = struct {
 };
 
 /// Parse a full CSS file into a list of selector rules, discarding keyframes.
-/// Browser document loading uses `parseWithKeyframes` to retain both products.
+/// Shared Sheet owners use `parseRetained` to compile conditional branches too.
 pub fn parse(self: *CSSParser, allocator: std.mem.Allocator) ![]CSSRule {
     var keyframes = std.ArrayList(KeyframesRule).empty;
     defer {
@@ -749,6 +795,28 @@ pub fn parse(self: *CSSParser, allocator: std.mem.Allocator) ![]CSSRule {
     return self.parseWithKeyframes(allocator, &keyframes);
 }
 
+/// Compile every supported media branch once. Rules/keyframes own their
+/// executable data; names and condition queries borrow the input. Failure
+/// rolls back rules, keyframes, conditions and layer declarations. This does
+/// not create CSSOM rule identities.
+pub fn parseRetained(
+    self: *CSSParser,
+    allocator: std.mem.Allocator,
+    keyframes: *std.ArrayList(KeyframesRule),
+    conditions: *std.ArrayList(MediaCondition),
+    layer_program: *layers.Program,
+) ![]CSSRule {
+    const previous = self.retained_conditions;
+    const previous_layers = self.layer_program;
+    self.retained_conditions = conditions;
+    self.layer_program = layer_program;
+    defer {
+        self.retained_conditions = previous;
+        self.layer_program = previous_layers;
+    }
+    return self.parseWithKeyframes(allocator, keyframes);
+}
+
 /// Parse selector rules and append named keyframes to caller-owned storage.
 /// Rules own their data; keyframe names borrow the stylesheet input buffer.
 pub fn parseWithKeyframes(
@@ -756,10 +824,21 @@ pub fn parseWithKeyframes(
     allocator: std.mem.Allocator,
     keyframes: *std.ArrayList(KeyframesRule),
 ) ![]CSSRule {
+    var local_layers = layers.Program.init(allocator);
+    defer local_layers.deinit();
+    const own_layers = self.layer_program == null;
+    if (own_layers) self.layer_program = &local_layers;
+    defer {
+        if (own_layers) self.layer_program = null;
+    }
+    const layers_start = self.layer_program.?.declarations.items.len;
     const keyframes_start = keyframes.items.len;
+    const conditions_start = if (self.retained_conditions) |conditions| conditions.items.len else 0;
     errdefer {
         for (keyframes.items[keyframes_start..]) |*rule| rule.deinit(allocator);
         keyframes.shrinkRetainingCapacity(keyframes_start);
+        if (self.retained_conditions) |conditions| conditions.shrinkRetainingCapacity(conditions_start);
+        self.layer_program.?.truncate(layers_start);
     }
     var rules = std.ArrayList(CSSRule).empty;
     errdefer {
@@ -772,13 +851,28 @@ pub fn parseWithKeyframes(
     var input = rule_syntax.RuleIterator{ .input = self.string, .pos = self.pos, .top_level = self.top_level };
     defer self.pos = input.pos;
     while (input.next()) |rule| {
-        if (rule.block == null) continue;
         if (rule.name != null) {
             try self.appendAtRule(allocator, &rules, keyframes, rule, null, &.{});
         } else self.appendQualifiedRule(allocator, &rules, keyframes, rule, null) catch |err| {
             if (err == error.OutOfMemory) return err;
             // Structural parsing has already retired the complete bad rule.
             // Selector admission cannot consume any subsequent rule's source.
+        };
+    }
+    if (own_layers and local_layers.declarations.items.len > 0) {
+        var registry = layers.Registry.init(allocator);
+        defer registry.deinit();
+        const ids = try local_layers.register(allocator, &registry, &.{});
+        defer allocator.free(ids);
+        const orders = try registry.orders(allocator);
+        defer allocator.free(orders);
+        for (rules.items) |*rule| switch (rule.layer) {
+            .declaration => |index| rule.layer = .{ .ordered = orders[ids[index].?] },
+            else => {},
+        };
+        for (keyframes.items[keyframes_start..]) |*rule| switch (rule.layer) {
+            .declaration => |index| rule.layer = .{ .ordered = orders[ids[index].?] },
+            else => {},
         };
     }
     return rules.toOwnedSlice(allocator);
@@ -793,27 +887,44 @@ fn appendAtRule(
     parent_source: ?[]const u8,
     parents: []const Selector,
 ) anyerror!void {
-    if (rule.block == null or self.group_depth >= 64) return;
+    if (self.group_depth >= 64) return;
     const name = rule.name.?.slice(self.string);
+    var layer = self.layer_declaration;
+    const is_layer = css_syntax.identifierEquals(name, "layer");
+    if (is_layer) {
+        layer = self.layer_program.?.parse(rule.prelude.slice(self.string), rule.block != null, self.layer_declaration, self.media_condition) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return;
+        };
+    }
+    if (rule.block == null) return;
     if (css_syntax.identifierEquals(name, "keyframes")) {
         var keyframe_rule = parseKeyframesRule(allocator, self.string, rule) catch |err| {
             if (err == error.OutOfMemory) return err;
             return;
         };
+        keyframe_rule.media_condition = self.media_condition;
+        keyframe_rule.layer = if (self.layer_declaration) |index| .{ .declaration = index } else .none;
         keyframes.append(allocator, keyframe_rule) catch |err| {
             keyframe_rule.deinit(allocator);
             return err;
         };
         return;
     }
-    const active = if (css_syntax.identifierEquals(name, "media"))
-        media_query.matches(rule.prelude.slice(self.string), self.media)
-    else if (css_syntax.identifierEquals(name, "supports"))
+    var condition = self.media_condition;
+    const active = if (is_layer) true else if (css_syntax.identifierEquals(name, "media")) media: {
+        if (self.retained_conditions) |conditions| {
+            condition = conditions.items.len;
+            try conditions.append(allocator, .{ .query = rule.prelude.slice(self.string), .parent = self.media_condition });
+            break :media true;
+        }
+        break :media media_query.matches(rule.prelude.slice(self.string), self.media);
+    } else if (css_syntax.identifierEquals(name, "supports"))
         try supports.matches(allocator, rule.prelude.slice(self.string), supportsSelector)
     else
         false;
     if (!active) return;
-    var child = CSSParser{ .string = rule.block.?.slice(self.string), .pos = 0, .media = self.media, .top_level = false, .group_depth = self.group_depth + 1 };
+    var child = CSSParser{ .string = rule.block.?.slice(self.string), .pos = 0, .media = self.media, .top_level = false, .group_depth = self.group_depth + 1, .retained_conditions = self.retained_conditions, .media_condition = condition, .layer_program = self.layer_program, .layer_declaration = layer };
     if (parent_source) |source| {
         try child.appendStyleContents(allocator, rules, keyframes, source, parents);
     } else {
@@ -839,17 +950,17 @@ fn appendQualifiedRule(self: *CSSParser, allocator: std.mem.Allocator, rules: *s
         for (selectors) |*sel| sel.deinit(allocator);
         allocator.free(selectors);
     }
-    var block = CSSParser{ .string = rule.block.?.slice(self.string), .pos = 0, .media = self.media, .group_depth = self.group_depth + 1 };
+    var block = CSSParser{ .string = rule.block.?.slice(self.string), .pos = 0, .media = self.media, .group_depth = self.group_depth + 1, .retained_conditions = self.retained_conditions, .media_condition = self.media_condition, .layer_program = self.layer_program, .layer_declaration = self.layer_declaration };
     try block.appendStyleContents(allocator, rules, keyframes, source, selectors);
 }
 
-fn appendDeclarations(allocator: std.mem.Allocator, rules: *std.ArrayList(CSSRule), parents: []const Selector, properties: *DeclarationMap) !void {
+fn appendDeclarations(allocator: std.mem.Allocator, rules: *std.ArrayList(CSSRule), parents: []const Selector, properties: *DeclarationMap, media_condition: ?usize, layer_declaration: ?usize) !void {
     try rules.ensureUnusedCapacity(allocator, parents.len);
     for (parents) |parent| {
         var selector_copy = try parent.clone(allocator);
         errdefer selector_copy.deinit(allocator);
         const map = try properties.clone();
-        rules.appendAssumeCapacity(.{ .selector = selector_copy, .properties = map, .owned = true });
+        rules.appendAssumeCapacity(.{ .selector = selector_copy, .properties = map, .owned = true, .media_condition = media_condition, .layer = if (layer_declaration) |index| .{ .declaration = index } else .none });
     }
 }
 
@@ -863,9 +974,12 @@ fn appendStyleContents(self: *CSSParser, allocator: std.mem.Allocator, rules: *s
         .rule => |rule| {
             if (rule.name) |name| {
                 const keyword = name.slice(self.string);
-                if (!css_syntax.identifierEquals(keyword, "media") and !css_syntax.identifierEquals(keyword, "supports") and !css_syntax.identifierEquals(keyword, "keyframes")) continue;
+                // Only the block form is a nested group rule. A statement
+                // inside a style rule must not establish global layer order.
+                if (css_syntax.identifierEquals(keyword, "layer") and rule.block == null) continue;
+                if (!css_syntax.identifierEquals(keyword, "media") and !css_syntax.identifierEquals(keyword, "supports") and !css_syntax.identifierEquals(keyword, "keyframes") and !css_syntax.identifierEquals(keyword, "layer")) continue;
             }
-            if (properties.count() != 0) try appendDeclarations(allocator, rules, parents, &properties);
+            if (properties.count() != 0) try appendDeclarations(allocator, rules, parents, &properties, self.media_condition, self.layer_declaration);
             properties.deinit();
             properties = DeclarationMap.init(allocator);
             if (rule.name != null) {
@@ -875,7 +989,7 @@ fn appendStyleContents(self: *CSSParser, allocator: std.mem.Allocator, rules: *s
             };
         },
     };
-    if (properties.count() != 0 or rules.items.len == rules_start) try appendDeclarations(allocator, rules, parents, &properties);
+    if (properties.count() != 0 or rules.items.len == rules_start) try appendDeclarations(allocator, rules, parents, &properties, self.media_condition, self.layer_declaration);
 }
 
 test "selector lists preserve member specificity declarations and nested commas" {

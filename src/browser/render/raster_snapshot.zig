@@ -76,9 +76,10 @@ pub const RasterSnapshot = struct {
                 break :blk .{ .glyph = copy };
             },
             .image => |image_item| blk: {
-                var copy = image_item;
+                var copy = try image_item.clone(self.allocator);
+                errdefer copy.deinit(self.allocator);
                 copy.source = null;
-                copy.pixels = try self.clonePixelBuffer(image_item.pixels);
+                copy.pixels = if (image_item.gradient == null) try self.clonePixelBuffer(image_item.pixels) else &.{};
                 break :blk .{ .image = copy };
             },
             .canvas => |canvas_item| blk: {
@@ -164,6 +165,32 @@ test "raster snapshots preserve transform scroll attachment" {
         display.ScrollAttachment.frame_viewport,
         snapshot.items[0].transform.scroll_attachment,
     );
+}
+
+fn gradientSnapshotAllocationCheck(allocator: std.mem.Allocator) !void {
+    const gradient = (try @import("../../document/gradient_line.zig").Linear.init(allocator, "linear-gradient(to right in oklab, red, blue)", .{}, 100, 20)).?;
+    const original = [1]DisplayItem{.{ .image = .{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 100,
+        .y2 = 20,
+        .source_width = 1,
+        .source_height = 1,
+        .pixels = &.{},
+        .gradient = gradient,
+    } }};
+    defer gradient.deinit(allocator);
+    const retained = try @import("retained_commands.zig").cloneList(allocator, &original);
+    defer DisplayItem.freeList(allocator, retained);
+    var snapshot = try RasterSnapshot.clone(allocator, retained);
+    defer snapshot.deinit();
+    try std.testing.expect(original[0].image.gradient.?.stops.ptr != retained[0].image.gradient.?.stops.ptr);
+    try std.testing.expect(retained[0].image.gradient.?.stops.ptr != snapshot.items[0].image.gradient.?.stops.ptr);
+    try std.testing.expectEqual(gradient.sample(0.5, 0.5, 1), snapshot.items[0].image.gradient.?.sample(0.5, 0.5, 1));
+}
+
+test "gradient retained and raster copies clean up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, gradientSnapshotAllocationCheck, .{});
 }
 
 /// A one-child dst_in command is a list-level mask for already-painted

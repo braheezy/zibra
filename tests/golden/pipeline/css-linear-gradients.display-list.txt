@@ -1,0 +1,8 @@
+linear-gradient stops=2 repeating=false space=oklab hue=shorter width=108 height=28
+image x1=13 y1=18 x2=125 y2=50 source_width=1 source_height=1 tile_width=108 tile_height=28 tile_x=2 tile_y=2 repeat_x=false repeat_y=false attachment=scroll opacity=1
+quad x1=13 y1=18 x2=125 y2=18 x3=123 y3=20 x4=15 y4=20 color=#000000ff
+quad x1=125 y1=18 x2=125 y2=50 x3=123 y3=48 x4=123 y4=20 color=#000000ff
+quad x1=125 y1=50 x2=13 y2=50 x3=15 y3=48 x4=123 y4=48 color=#000000ff
+quad x1=13 y1=50 x2=13 y2=18 x3=15 y3=20 x4=15 y4=48 color=#000000ff
+linear-gradient stops=4 repeating=true space=srgb hue=shorter width=40 height=20
+image x1=13 y1=50 x2=213 y2=90 source_width=1 source_height=1 tile_width=80 tile_height=40 tile_x=120 tile_y=0 repeat_x=true repeat_y=true attachment=scroll opacity=1

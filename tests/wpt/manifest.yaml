@@ -15,6 +15,34 @@ directories:
   - selection
   - uievents
 tests:
+  # Cascade layers across retained sheets, important order and nested groups.
+  - css/css-cascade/layer-basic.html
+  - css/css-cascade/layer-important.html
+  - css/css-nesting/nesting-layer.html
+  # Live style media and retained conditional programs.
+  - html/semantics/document-metadata/the-style-element/style_media.html
+  - html/semantics/document-metadata/the-style-element/style_media_change.html
+  # Single-layer linear-gradient grammar, interpolation and generated paint.
+  - css/css-images/gradient/color-stops-parsing.html
+  - css/css-images/parsing/gradient-interpolation-method-valid.html
+  - css/css-images/parsing/gradient-interpolation-method-invalid.html
+  - css/css-images/parsing/gradient-interpolation-method-computed.html
+  # Calculation serialization, color-mix, missing operands and extended gamut.
+  - css/css-color/parsing/color-valid-color-mix-function.html
+  - css/css-color/parsing/color-invalid-color-mix-function.html
+  - css/css-color/parsing/color-computed-color-mix-function.html
+  - css/css-color/parsing/color-mix-out-of-gamut.html
+  - css/css-color/color-mix-missing-components.html
+  # Modern absolute color values and native conversion references.
+  - css/css-color/parsing/color-valid-hwb.html
+  - css/css-color/parsing/color-invalid-hwb.html
+  - css/css-color/parsing/color-computed-hwb.html
+  - css/css-color/parsing/color-valid-lab.html
+  - css/css-color/parsing/color-invalid-lab.html
+  - css/css-color/parsing/color-computed-lab.html
+  - css/css-color/parsing/color-valid-color-function.html
+  - css/css-color/parsing/color-invalid-color-function.html
+  - css/css-color/parsing/color-computed-color-function.html
   - css/css-nesting/nested-error-recovery.html
   # CSS calculation, nesting, animation and sticky capability coverage.
   - css/css-animations/parsing/animation-fill-mode-valid.html
@@ -147,6 +175,63 @@ tests:
   - css/cssom-view/offsetTopLeft-empty-inline-offset.html
   - css/cssom-view/offsetTopLeft-leading-space-inline.html
 reftests:
+  - css/css-cascade/layer-stylesheet-sharing.html
+  - css/css-cascade/layer-stylesheet-sharing-important.html
+  - css/css-conditional/at-media-001.html
+  - css/css-conditional/at-media-002.html
+  # Single-layer linear-gradient grammar, interpolation and generated paint.
+  - css/css-images/linear-gradient-1.html
+  - css/css-images/linear-gradient-2.html
+  - css/css-images/linear-gradient-non-square.html
+  - css/css-images/linear-gradient-calc-em-units.html
+  - css/css-images/multiple-position-color-stop-linear.html
+  - css/css-images/normalization-linear.html
+  - css/css-images/normalization-linear-2.html
+  - css/css-images/normalization-linear-degenerate.html
+  - css/css-images/gradients-with-border.html
+  - css/css-images/gradient/gradient-eval-001.html
+  - css/css-images/gradient/gradient-eval-002.html
+  - css/css-images/gradient/gradient-eval-003.html
+  - css/css-images/gradient/gradient-eval-004.html
+  - css/css-images/gradient/gradient-eval-005.html
+  - css/css-images/gradient/gradient-single-stop-001.html
+  - css/css-images/gradient/gradient-single-stop-longer-hue-oklch.html
+  - css/css-images/gradient/gradient-analogous-missing-components-001.html
+  - css/css-images/gradient/gradient-to-transparent.html
+  - css/css-images/gradient-refcrash.html
+  - css/css-color/color-mix-non-srgb-001.html
+  - css/css-color/color-mix-currentcolor-001.html
+  - css/css-color/color-mix-currentcolor-002.html
+  - css/css-color/color-mix-currentcolor-003.html
+  - css/css-color/color-mix-currentcolor-nested-for-color-property.html
+  - css/css-color/color-mix-percents-01.html
+  - css/css-color/color-mix-percents-02.html
+  # Modern absolute color values and native conversion references.
+  - css/css-color/hwb-001.html
+  - css/css-color/hwb-002.html
+  - css/css-color/hwb-003.html
+  - css/css-color/lab-001.html
+  - css/css-color/lab-004.html
+  - css/css-color/lab-005.html
+  - css/css-color/lch-001.html
+  - css/css-color/lch-004.html
+  - css/css-color/lch-005.html
+  - css/css-color/lch-009.html
+  - css/css-color/oklab-001.html
+  - css/css-color/oklab-004.html
+  - css/css-color/oklab-005.html
+  - css/css-color/oklab-009.html
+  - css/css-color/oklch-001.html
+  - css/css-color/oklch-004.html
+  - css/css-color/oklch-005.html
+  - css/css-color/oklch-009.html
+  - css/css-color/srgb-linear-001.html
+  - css/css-color/display-p3-001.html
+  - css/css-color/display-p3-linear-001.html
+  - css/css-color/a98rgb-001.html
+  - css/css-color/prophoto-rgb-001.html
+  - css/css-color/rec2020-001.html
+  - css/css-color/xyz-001.html
   - css/css-position/sticky/position-sticky-stacking-context.html
   # CSS calculation, nesting, animation and sticky capability coverage.
   - css/css-nesting/nesting-basic.html
@@ -267,6 +352,10 @@ reftests:
   - css/filter-effects/svg-unknown-input-001.html
   - css/filter-effects/svg-empty-element-with-filter-001.html
 crashtests:
+  - css/css-cascade/layer-statement-copy-crash.html
+  - css/css-cascade/layer-namespace-sandwich-crash.html
+  # Single-layer linear-gradient grammar, interpolation and generated paint.
+  - css/css-images/gradient-nan-crash.html
   # CSS calculation, nesting, animation and sticky capability coverage.
   - css/css-nesting/pseudo-where-crash.html
   - css/css-nesting/implicit-parent-insertion-crash.html

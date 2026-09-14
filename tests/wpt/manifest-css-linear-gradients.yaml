@@ -1,0 +1,29 @@
+# Single-layer linear gradients: syntax, interpolation, sizing and crash safety.
+# Related radial/conic assertions remain visible as missing capability.
+tests:
+  - css/css-images/gradient/color-stops-parsing.html
+  - css/css-images/parsing/gradient-interpolation-method-valid.html
+  - css/css-images/parsing/gradient-interpolation-method-invalid.html
+  - css/css-images/parsing/gradient-interpolation-method-computed.html
+reftests:
+  - css/css-images/linear-gradient-1.html
+  - css/css-images/linear-gradient-2.html
+  - css/css-images/linear-gradient-non-square.html
+  - css/css-images/linear-gradient-calc-em-units.html
+  - css/css-images/multiple-position-color-stop-linear.html
+  - css/css-images/normalization-linear.html
+  - css/css-images/normalization-linear-2.html
+  - css/css-images/normalization-linear-degenerate.html
+  - css/css-images/gradients-with-border.html
+  - css/css-images/gradient/gradient-eval-001.html
+  - css/css-images/gradient/gradient-eval-002.html
+  - css/css-images/gradient/gradient-eval-003.html
+  - css/css-images/gradient/gradient-eval-004.html
+  - css/css-images/gradient/gradient-eval-005.html
+  - css/css-images/gradient/gradient-single-stop-001.html
+  - css/css-images/gradient/gradient-single-stop-longer-hue-oklch.html
+  - css/css-images/gradient/gradient-analogous-missing-components-001.html
+  - css/css-images/gradient/gradient-to-transparent.html
+  - css/css-images/gradient-refcrash.html
+crashtests:
+  - css/css-images/gradient-nan-crash.html

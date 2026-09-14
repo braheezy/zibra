@@ -1,0 +1,80 @@
+<!-- How to verify: expect PASS and six green tiles. Toggle media: the last
+     tile turns blue, then green on the next click. Toggle layer order: the
+     first tile turns blue, then green. Resize below 600px: tiles narrow.
+     The important, inline, nested and paused-animation tiles stay green. -->
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CSS cascade layers</title>
+<style id="conditional" media="print">@layer media-high;</style>
+<style id="order">@layer reset, components, utilities;</style>
+<style>
+body {margin:24px; font:16px sans-serif; background:white; color:#17202a}
+h1 {font-size:28px}
+.tile {width:320px; height:38px; margin:8px 0; padding:8px; color:white}
+@media(max-width:600px) {.tile{width:240px}}
+@layer utilities {
+  .normal {background:green}
+  #inline {background:red!important}
+}
+@layer components {
+  #normal {background:blue}
+  #nested {background:green}
+}
+@layer reset {
+  @layer first { #important {background:green!important} }
+  @layer last { #important {background:red!important} }
+  .nest { @layer parts {background:red} }
+}
+@layer media-low, media-high, animation-low, animation-high;
+@layer media-low {#media{background:blue}}
+@layer media-high {#media{background:green}}
+@layer animation-high {@keyframes signal {from,to {background-color:green}}}
+@layer animation-low {@keyframes signal {from,to {background-color:red}}}
+#animated {animation:signal 1s paused}
+</style>
+<style>@layer components.child {#nested{background:red}}</style>
+</head><body>
+<h1 id="status">Checking cascade layers</h1>
+<p>Layer precedence before specificity, including live stylesheet changes.</p>
+<div id="normal" class="tile normal">Normal declarations</div>
+<div id="important" class="tile">Reversed important order</div>
+<div id="inline" class="tile" style="background:green!important">Inline important</div>
+<div id="nested" class="tile nest">Parent above nested layers</div>
+<div id="animated" class="tile">Paused keyframe selection</div>
+<div id="media" class="tile">Conditional layer order</div>
+<button id="toggle-media">Toggle media</button>
+<button id="toggle-order">Toggle layer order</button>
+<p id="details"></p>
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+  var results=[], media=false, reversed=false;
+  var conditional=document.getElementById('conditional'), order=document.getElementById('order');
+  function color(id){return getComputedStyle(document.getElementById(id)).backgroundColor;}
+  function equal(a,b){if(a!==b)throw Error(String(a)+' != '+String(b));}
+  function check(name,fn){try{fn();results.push({name:name,status:0});}catch(e){results.push({name:name,status:1,message:String(e)});}}
+  check('normal layer order wins before specificity',function(){equal(color('normal'),'rgb(0, 128, 0)');});
+  check('important layers reverse, inline important wins',function(){
+    equal(color('important'),'rgb(0, 128, 0)');equal(color('inline'),'rgb(0, 128, 0)');
+  });
+  check('later child layers remain below their parent',function(){equal(color('nested'),'rgb(0, 128, 0)');});
+  check('keyframe names follow layer order',function(){equal(color('animated'),'rgb(0, 128, 0)');});
+  check('live media establishes and removes layer order',function(){
+    conditional.media='all';equal(color('media'),'rgb(0, 0, 255)');
+    conditional.media='print';equal(color('media'),'rgb(0, 128, 0)');
+  });
+  check('stylesheet edits rebuild layer order',function(){
+    order.textContent='@layer reset, utilities, components;';equal(color('normal'),'rgb(0, 0, 255)');
+    order.textContent='@layer reset, components, utilities;';equal(color('normal'),'rgb(0, 128, 0)');
+  });
+  document.getElementById('toggle-media').addEventListener('click',function(){
+    media=!media;conditional.media=media?'all':'print';
+  });
+  document.getElementById('toggle-order').addEventListener('click',function(){
+    reversed=!reversed;order.textContent=reversed?'@layer reset, utilities, components;':'@layer reset, components, utilities;';
+  });
+  var failed=results.filter(function(r){return r.status!==0;});
+  document.getElementById('status').textContent=failed.length?'FAIL: cascade layers':'PASS: cascade layers';
+  document.getElementById('status').style.color=failed.length?'red':'green';
+  document.getElementById('details').textContent=failed.map(function(r){return r.message;}).join('; ');
+  if(typeof completion_callback==='function')completion_callback(results,{status:0});
+});
+</script></body></html>

@@ -547,6 +547,9 @@ See the [inline declaration ownership contract](document-and-rendering.md#docume
 for raw attribute revisions and publication. The legacy whole `Node.style`
 assignment still enters `style_set` to preserve its immediate transition-start
 behavior; its raw replacement uses the shared native grammar on the next read.
+Its background-color transitions copy absolute floating-point samples, including
+an interrupted transition's current sample, into Element-owned color tracks.
+No source strings or computed-field pointers survive in those tracks.
 
 Computed readback flushes before resolving the target, even when only an
 ancestor was dirty, so inherited variables and root-relative font sizes are

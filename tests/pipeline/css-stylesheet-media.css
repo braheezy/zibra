@@ -1,0 +1,2 @@
+#linked { width:100px; height:40px; }
+@media (min-height:500px) { #linked { width:120px; } }

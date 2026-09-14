@@ -66,6 +66,55 @@ class Handler(BaseHTTPRequestHandler):
                 first.content='no-referrer'; first.remove();
                 setTimeout(function() {{ completion_callback(results,{{status:0}}); }},0);
                 </script>"""
+        elif path == "/media-page":
+            body = """<!doctype html>
+                <style>#target {color:black; width:100px; height:20px}</style>
+                <style id=inline media=print>#target {color:red}</style>
+                <link id=linked rel=stylesheet media=print href='/media-redirect'>
+                <div id=target></div>
+                <script>
+                window.addEventListener('load',function() {
+                var results=[];
+                function check(name,value) {results.push({name:name,status:value?0:1});}
+                function mark(path) {var x=new XMLHttpRequest();x.open('GET',path,false);x.send();}
+                var target=document.getElementById('target');
+                var inline=document.getElementById('inline');
+                var linked=document.getElementById('linked');
+                var held=getComputedStyle(target);
+                check('print sheets inactive', held.color === 'rgb(0, 0, 0)');
+                mark('/media-before');
+                inline.media='screen';
+                check('inline media reflected and live', inline.getAttribute('media') === 'screen' && held.color === 'rgb(255, 0, 0)');
+                linked.media='all';
+                check('linked media activates retained sheet', held.color === 'rgb(0, 128, 0)');
+                check('linked geometry flush sees new selection', target.getBoundingClientRect().width === 80);
+                linked.media='print';
+                check('linked media deactivates', held.color === 'rgb(255, 0, 0)');
+                linked.removeAttribute('media');
+                check('removing media activates', linked.media === '' && held.color === 'rgb(0, 128, 0)');
+                linked.media=null;
+                check('media DOMString null', linked.media === 'null' && held.color === 'rgb(255, 0, 0)');
+                linked.media=undefined;
+                check('media DOMString undefined', linked.media === 'undefined');
+                var threw=false;
+                try { linked.media=Symbol(); } catch(e) { threw=e instanceof TypeError; }
+                check('media rejects Symbol before mutation', threw && linked.media === 'undefined');
+                linked.setAttribute('media',' /**/ ');
+                check('empty media list activates', held.color === 'rgb(0, 128, 0)');
+                inline.removeAttribute('media');
+                linked.media='none';
+                check('removed inline media applies', held.color === 'rgb(255, 0, 0)');
+                mark('/media-after');
+                completion_callback(results,{status:0});
+                });
+                </script>"""
+        elif path == "/media-redirect":
+            status, body = 302, ""
+            headers = [("Location", "/assets/media.css")]
+        elif path == "/assets/media.css":
+            mime = "text/css"
+            headers = [("Referrer-Policy", "no-referrer")]
+            body = "#target {color:green;width:80px;background-image:url(media-background.ppm)}"
         elif path in ("/before.js", "/none.js", "/override.js"):
             mime, body = "text/javascript", "/* request policy probe */"
         elif path == "/sheet-redirect":
@@ -155,6 +204,25 @@ class ReferrerLoadingTests(unittest.TestCase):
         self.assertEqual(len(child), 1)
         self.assertEqual(parse_qs(urlsplit(child[0][0]).query)["value"], [origin + "/page?private=1"])
         self.assertIsNone(child[0][1])
+
+    def test_stylesheet_media_changes_preserve_provenance_without_refetch(self):
+        origin = f"http://127.0.0.1:{self.server.server_port}"
+        result = _invoke([BROWSER, "--wpt-test", origin + "/media-page", "--wpt-timeout-ms", "10000"], 20)
+        self.assertIsNone(result.infrastructure_error, result.stderr)
+        record = json.loads(result.stdout)
+        self.assertEqual(record["status"], "PASS", result.stdout + result.stderr)
+        paths = [path for path, _ in self.server.requests]
+        self.assertIn("/assets/media.css", paths)
+        # Parser/lifecycle refreshes can load the initial sheets more than once.
+        # Delimit the stable-document mutation turn; no-store makes any refetch
+        # within that turn observable even when a network cache exists.
+        self.assertIn("/media-after", paths)
+        during = paths[paths.index("/media-before") + 1:]
+        self.assertNotIn("/media-redirect", during, self.server.requests)
+        self.assertNotIn("/assets/media.css", during, self.server.requests)
+        self.assertIn("/assets/media-background.ppm", during)
+        self.assertNotIn("/media-background.ppm", paths)
+        self.assertIsNone(dict(self.server.requests)["/assets/media-background.ppm"])
 
 
 if __name__ == "__main__":

@@ -1509,6 +1509,14 @@ Object.defineProperty(Node.prototype, "title", {
   set: function(value) { this.setAttribute('title', value == null ? '' : value.toString()); },
   enumerable: true, configurable: true
 });
+Object.defineProperty(Node.prototype, "media", {
+  get: function() { return this.getAttribute('media') || ''; },
+  set: function(value) {
+    if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol to DOMString');
+    this.setAttribute('media', String(value));
+  },
+  enumerable: true, configurable: true
+});
 Object.defineProperty(Node.prototype, "value", {
   get: function() {
     if (this.__value !== undefined) return this.__value;

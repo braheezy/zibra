@@ -4818,11 +4818,11 @@ test "native style_set starts a background-color transition from computed color"
         .color => |color| {
             try std.testing.expectEqual(
                 parser.CssColor{ .r = 255, .g = 0, .b = 0, .a = 128 },
-                color.start_value,
+                color.start_value.color,
             );
             try std.testing.expectEqual(
                 parser.CssColor{ .r = 0, .g = 0, .b = 255, .a = 255 },
-                color.end_value,
+                color.end_value.color,
             );
             try std.testing.expectEqual(@as(u32, 30), color.total_frames);
             try std.testing.expectApproxEqAbs(
@@ -6295,7 +6295,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                 }
                 if (old_background_color == null) {
                     if (style_map.getPtr("background-color")) |field| {
-                        old_background_color = parser.parseCssColor(field.lastValue().*);
+                        old_background_color = transitions.resolveColor(e, field.lastValue().*, null);
                     }
                 }
                 if (old_transform == null) {
@@ -6373,7 +6373,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                             }
                         } else if (std.ascii.eqlIgnoreCase(transition.property, "background-color")) {
                             if (new_style.get("background-color")) |new_color_str| {
-                                const new_color = parser.parseCssColor(new_color_str);
+                                const new_color = transitions.resolveColor(e, new_color_str, new_style.get("color"));
                                 if (new_color != null and old_background_color != null and
                                     !std.meta.eql(old_background_color.?, new_color.?))
                                 {

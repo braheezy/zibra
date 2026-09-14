@@ -1,0 +1,4 @@
+rect x1=13 y1=18 x2=93 y2=38 color=#008000ff
+rect x1=13 y1=38 x2=93 y2=58 color=#008000ff
+rect x1=13 y1=58 x2=93 y2=78 color=#008000ff
+rect x1=13 y1=78 x2=93 y2=98 color=#008000ff

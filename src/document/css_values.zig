@@ -10,7 +10,7 @@ pub const max_bytes = 1024 * 1024;
 
 /// Normalize implemented primitive families after shorthand expansion. The
 /// result borrows input/static storage or belongs to allocator. Named colors
-/// retain their keyword; numeric colors serialize in sRGB, without changing
+/// retain their keyword; modern colors retain their color space, without changing
 /// custom-property data or case-sensitive identifiers.
 pub fn primitive(allocator: std.mem.Allocator, property: []const u8, input: []const u8) ![]const u8 {
     if (std.mem.startsWith(u8, property, "animation-") and !std.mem.eql(u8, property, "animation-name")) {
@@ -19,6 +19,7 @@ pub fn primitive(allocator: std.mem.Allocator, property: []const u8, input: []co
     for (@import("css_properties.zig").computed) |entry| {
         if (!std.mem.eql(u8, entry.name, property)) continue;
         switch (entry.serialization) {
+            .image => if (try @import("css_gradient.zig").serialize(allocator, input, .{}, .retained)) |gradient| return gradient,
             .tokens => {},
             .length => if (std.mem.eql(u8, input, "0")) {
                 return "0px";
@@ -29,9 +30,7 @@ pub fn primitive(allocator: std.mem.Allocator, property: []const u8, input: []co
             },
             .color => {
                 if (input.len == 0 or (input[0] != '#' and std.mem.indexOfScalar(u8, input, '(') == null)) return input;
-                if (@import("color.zig").hasRelativeUnits(input)) return input;
-                const color = @import("color.zig").parseAbsolute(input) orelse return input;
-                return color.serialize(allocator);
+                return try @import("color.zig").normalizeSpecified(allocator, input) orelse input;
             },
         }
         break;

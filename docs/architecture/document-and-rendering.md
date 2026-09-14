@@ -177,12 +177,51 @@ serialization is selected by the property registry after shorthand expansion.
 Custom values and pending substitutions preserve spelling, case and interior
 trivia. Token boundaries use comments rather than invented whitespace.
 
-`color.zig` owns finite absolute RGB/HSL grammar and specified serialization.
-Function aliases share comma/space/slash rules and HSL hue units. Alpha remains
-precise until conversion to paint's RGBA8; missing HSL components stay explicit
-in specified values and resolve to zero for absolute painting. Color math,
-relative colors, wider color spaces and color-scheme-dependent colors require
-their own computation/interpolation contracts.
+`color.zig` owns absolute color grammar and specified/computed serialization.
+It covers named/hex/RGB/HSL, HWB, Lab/LCH, Oklab/OKLCH and predefined `color()`
+spaces. Modern coordinates retain their tagged space, floating-point components
+and missing-component bits separately from the RGBA8 paint projection. Alpha
+remains precise through CSSOM; missing components become zero only for absolute
+painting. Numbers, percentages, hue units and nested calculations use the shared
+tokenizer/math evaluator. Relative-unit expressions stay symbolic until style
+supplies the font context and registers dependencies.
+
+`color_space.zig` owns allocation-free transfer functions, XYZ/white-point
+adaptation, Lab/Oklab conversion and bounded sRGB gamut mapping. Conversion
+preserves extended coordinates until the paint boundary. The renderer still
+uses an SDR sRGB RGBA8 framebuffer; wide-gamut colors use CSS Color 4 binary
+search with local MINDE, capped at 64 iterations. Non-finite/unrepresentable
+transforms fall back to bounded channel clipping without changing CSSOM values.
+Rec.2020 uses the draft's display-referred BT.1886 transfer function.
+`color_mix.zig` parses borrowed mix operands and normalizes percentages, bounded
+to 32 operands per mix and 64 nested colors. `color_interpolation.zig` converts
+floating-point coordinates, carries analogous missing components, applies
+shorter/longer/increasing/decreasing hue paths and premultiplies non-hue channels
+by alpha. Multi-color mixes combine operands in order. The default mix space is
+Oklab; explicit supported spaces retain their identity through nested mixing.
+Only the paint projection is gamut-mapped. Relative colors, custom profiles and
+color-scheme-dependent functions remain unsupported. CSS linear gradients share
+the interpolation owner; SVG gradient sampling remains its own consumer.
+
+`css_gradient.zig` parses one linear/repeating-linear background, bounded to
+1024 expanded stops/hints, 1 MiB and 64 component levels. It borrows source and
+owns only serialized output. Declaration admission, shorthand expansion and
+feature queries use this grammar. Font-relative lengths and color operands
+compute before inheritance, with dependencies on the element/root font fields;
+currentcolor stays symbolic until the receiving element supplies its foreground.
+Retained operands keep fractional legacy channels independently of CSSOM text.
+
+`gradient_line.zig` owns an independently allocated slice of used scalar stops.
+It resolves angles/corner geometry and percentage positions against the actual
+gradient line, expands/fixes stops, applies hints and repeats, and samples the
+shared premultiplied interpolation owner. Gradients have no intrinsic size or
+ratio: automatic background-size axes independently fill the positioning area.
+Paint resolves colors before publication and retains no stylesheet/DOM strings
+in the used value. Raster samples device-pixel centers inside the ordinary
+background tile/clip, without allocating an element-sized bitmap. Modern
+participation defaults to Oklab; legacy-only stops retain sRGB compatibility.
+Radial/conic gradients, multiple image layers and image-valued animation are
+separate capabilities.
 
 `css_position.zig` owns the single-layer one-to-four-component position grammar,
 canonical axis order and used offsets. Parsed offsets borrow the normalized
@@ -283,15 +322,18 @@ the containing document's CSP and cookie context; see
 [referrer policy](navigation-and-network.md#referrer-policy).
 
 `css_cascade.zig` owns the scalar ordering key: implemented origin/importance
-level, inline attachment, independent ID/class/type specificity, then rule
+level, inline attachment, layer rank, independent ID/class/type specificity, then rule
 source ordinal. Specificity saturates within each count without carrying into
 another. Rule arrays remain in source order throughout Browser and inspection
 publication; no caller may pre-sort them by specificity. Background URL/referrer
 selection uses the same key as declaration selection. Inline attachment beats
 all stylesheet specificity at equal origin/importance. Normal UA declarations,
 HTML hints, author rules, important author rules and important UA rules occupy
-separate levels. Layers, user sheets and further animation/transition cascade
-levels are not represented by numeric bands.
+separate levels. Between inline attachment and specificity, normal declarations
+compare layer ranks in ascending precedence and important declarations reverse
+that order. Unlayered declarations form the implicit last layer. Inline important
+declarations still outrank layered author important declarations. User sheets,
+rollback keywords and further animation/transition levels remain separate work.
 
 Stylesheet rules carry their cascade origin independently of source ownership.
 Browser and isolated inspection mark their default sheet as user-agent rules;
@@ -319,12 +361,21 @@ root's computed font size; the root's own font-size uses the initial 16px.
 Descendants subscribe to that root field, and computed values consumed by
 layout contain pixel dimensions even inside functions. `css_math.zig` evaluates
 bounded typed `calc`, `min`, `max`, `clamp`, `abs` and `sign` expressions for
-lengths and RGB/HSL components. Numbers, percentages, lengths and angles remain
+lengths and supported absolute-color components. Numbers, percentages, lengths and angles remain
 distinct unless the caller supplies a percentage hint. Times also retain their
 dimension; animation declarations preserve `s`/`ms`, while style computes times
 to seconds with the element's font context. An indefinite length
 percentage basis stays unresolved. Color channel ranges clamp only after
 calculation; missing components retain their modern CSSOM representation.
+The same math parser can emit a transient, 512-node `css_math_tree.zig` tree
+for specified serialization. It folds constant arithmetic, canonicalizes units,
+combines like terms and preserves functions and relative units that still need
+context. Excessive serialization trees preserve validated source rather than
+truncating it. Modern color channels retain specified calculations and apply
+ranges at computation. Nested legacy mix operands retain fractional RGB text
+in declaration/computed storage so they do not quantize before mixing. CSSOM
+property, shorthand and cssText presentation serializes those operands using
+canonical legacy RGB. Cloning copies the retained values, not CSSOM text.
 Font-dependent color calculations remain specified until style supplies the
 computed font size and registers the dependency. Size-container units need a
 layout-aware container contract and are not admitted by guessing a width.
@@ -343,8 +394,10 @@ Longhand/keyframe changes for the same name resample at the retained elapsed
 time; removing/changing the name retires the prior tracks. Paused and completed
 fills remain visible without requesting more frames. The Tab worker advances
 active timelines and invalidates the appropriate paint or layout owner when
-an effect disappears. Color interpolation premultiplies alpha and returns
-straight RGBA8 to paint. Playback remains a single, frame-driven animation with
+an effect disappears. Color tracks own copied floating-point coordinates and
+legacy-space identity, without source or DOM pointers. Legacy endpoint pairs
+use premultiplied sRGB; modern participation uses Oklab. CSSOM samples preserve
+coordinates and alpha while paint receives straight RGBA8. Playback remains a single, frame-driven animation with
 endpoint interpolation; multiple effects, intermediate keyframe segments,
 wall-clock timelines, animation events and WAAPI are separate work.
 
@@ -354,20 +407,55 @@ subscribe to their parent's version so newly introduced names also invalidate
 them. Heap storage keeps this publisher stable when its owning Node moves;
 structural mutation still clears the graph before moving Node storage.
 
-## Inspection stylesheet ownership
+## Retained stylesheet ownership
 
-`css_stylesheet.Sheet` owns copies of CSS source and optional serialized base URL,
-plus cascade origin and referrer policy. It uses Zibra's native CSS parser.
-`Sheet.init` copies inputs; `Sheet.select` parses them for an explicit media
-context and returns owning rule/keyframe containers. Selectors/declarations own
-their strings, keyframe names borrow that Sheet, and each rule owns its copied
-URL provenance. Retire all selections
-before their source Sheet. Media reselection currently reparses retained source;
-there is no persistent syntax tree or stable CSSOM rule identity.
+`css_stylesheet.Sheet` is the source/program owner shared by Browser Frames and
+inspection. It copies CSS text, optional serialized base URL and sheet-level
+media, plus cascade origin and referrer policy. Construction compiles supported
+selector/declaration and keyframe branches once, including inactive `@media`
+branches. Media conditions retain source-borrowing queries and parent indices;
+`@supports` is evaluated at compile time against static engine capabilities.
+Each Sheet also owns a `css_layers.Program`: ordered layer declarations with
+decoded, case-sensitive name segments, parent declaration indices and optional
+media conditions. Invalid preludes roll back the whole declaration list; names
+and conditional queries never borrow movable parser storage.
+
+`SelectionBuilder` appends active sheets in document order and builds independent
+`css_layers.Registry` trees for each origin. Named siblings reopen; every
+anonymous declaration is unique, including identical cached sheets. Only active
+sheet/media/supports branches establish order. Nested layers stay grouped under
+their parents, with the parent's own declarations in its implicit last sublayer.
+All sheets must register before finalizing ranks: a later sheet can add children
+to an earlier layer. Compiled references are sheet-local declaration IDs;
+staged references are registry IDs; published rules/keyframes contain only scalar
+ranks. The temporary trees copy names and retire before selections. Each append
+rolls back cloned rules, keyframes and registry links together on failure.
+Keyframe name collisions use normal origin/layer/source order.
+
+`Sheet.select` is the single-sheet convenience wrapper. Document callers use one
+builder for the complete generation. The live Browser supplies each current media
+attribute; inspection uses the copied option. Conditions are evaluated for an
+explicit environment. Selectors/declarations and URL provenance are independent
+owners in each selection; keyframe names borrow the Sheet. Retire every selection
+before its source. `Selection.appendTo` reserves both destination lists before
+moving either container, so allocation failure cannot publish half a selection.
+These programs are flattened executable rules, not a lossless authored rule tree
+or stable CSSOM identity. They do not preserve declaration duplicates/order for
+future stylesheet CSSOM serialization.
+
+`browser/frame_styles.zig` owns attached source provenance: each compiled Sheet
+has an ordinal among the generation's style/link elements and the media-attribute
+revision used in its selection. It retains no Node pointer. Structural mutation
+invalidates that generation before owner ordinals are reused; owner lookup
+borrows the attached DOM only synchronously. Media changes stage a complete
+selection and revision list, then publish both together. Failed selection leaves
+installed rules and source revisions unchanged. `Frame.renderStyle` checks
+attribute revisions inside the protected style phase, including synchronous
+computed-style/geometry reads. Media-only changes fetch no stylesheet resources.
 
 `inspection.Page` owns these sheets, their active selections and its DOM.
 `reselectMedia` and `replaceStylesheet` require a final-address DOM and retired
-layout/display consumers. They stage every fallible parse/selection allocation
+layout/display consumers. They stage every fallible compilation/selection allocation
 before clearing style dependencies, dirtying the DOM and installing the new
 generation. Staging failure leaves installed rules, media and computed values
 unchanged. Replacement retires old executable containers before their source.
@@ -542,13 +630,18 @@ order, with member-specific specificity. Map tables and selector storage are
 independent owners; compiled declarations own their normalized strings.
 An invalid member rejects the whole ordinary list before any rule is published.
 
-`color.zig` owns all 148 named sRGB colors, transparent, absolute RGB/HSL
-parsing, and synchronous currentcolor resolution. The style map stores the
+`color.zig` owns all 148 named sRGB colors, transparent, absolute color-space
+parsing and synchronous currentcolor resolution. The style map stores the
 resolved inherited foreground for `color: currentcolor` and registers the
-ordinary checked parent dependency. Other color longhands keep currentcolor
-symbolic, including when inherited explicitly, so paint and CSSOM resolve it
+ordinary checked parent dependency, including currentcolor nested in a mix.
+Other color longhands keep currentcolor symbolic, including when inherited
+explicitly or nested in a mix, so paint and CSSOM resolve it
 against the receiving element's foreground. Declaration blocks keep their
-specified keyword spelling. CSSOM copies serialized colors with alpha precision;
+specified keyword spelling. Font-dependent operands and mix percentages compute
+before inheritance, without resolving symbolic currentcolor against the parent.
+Keyframe mixtures resolve with the animated element's foreground and subscribe
+to the relevant color/font fields before creating scalar tracks.
+CSSOM copies serialized colors with alpha precision;
 paint projects them to RGBA8 before accessibility remapping and composition.
 Root/body canvas-background selection tests CSS alpha before RGBA8 rounding,
 so transparent colors allow body propagation while tiny nonzero alpha does not.
@@ -584,11 +677,11 @@ top-level queries recover at the next comma. Condition recursion is bounded.
 Absolute lengths and em/rem resolve to CSS pixels; media em/rem use the initial
 16px font, never the styled root font. Comparisons share the existing small
 zoom-normalization tolerance for lengths so equality and strict/inclusive
-complements agree. Source-backed rules and keyframes still rebuild as a unit
-when either viewport axis or zoom changes. This does not add `matchMedia`,
-style/link `media` attribute handling, CSSOM media serialization, or new device
-features such as resolution/aspect-ratio; font-metric/viewport units and CSS
-math in media values remain unsupported.
+complements agree. Retained rules and keyframes reselect as a unit when either viewport axis or zoom
+changes. Style/link media attributes use the same evaluator, with an absent or
+empty media list matching all environments. This does not add `matchMedia`,
+CSSOM media serialization, or new device features such as resolution/aspect-ratio;
+font-metric/viewport units and CSS math in media values remain unsupported.
 
 Layout fields form dependencies among document, parent, previous sibling, and
 child geometry. During one serialized layout traversal, document/block/line
@@ -888,7 +981,7 @@ Composition and raster snapshots must materialize it into ordinary owned
 containers before a Browser lock or thread boundary. Temporary rich-button
 trees cannot publish cache edges because their owners retire immediately.
 `render/retained_commands.zig` owns this deep-materialization algorithm: it
-recursively copies owning command containers and immutable canvas pixels, but
+recursively copies owning command containers, gradient stops and immutable canvas pixels, but
 does not own or extend the lifetime of the source layout cache.
 
 `render/paint_effects.zig` owns scalar effect resolution and the construction
@@ -925,7 +1018,8 @@ toggle is reflected without rebuilding geometry.
 `.blend` and `.transform` own their child slices; `.blend` also owns its mode
 string. Primitive ownership differs:
 
-- image and glyph commands borrow Element/FontManager pixel owners;
+- bitmap image and glyph commands borrow Element/FontManager pixel owners;
+- generated image commands own a scalar gradient-stop slice and no pixel buffer;
 - canvas commands own immutable pixel buffers;
 - frame-side provenance and effect nodes borrow DOM/layout identity;
 - composited-layer commands borrow live layer allocations.
@@ -948,6 +1042,12 @@ layout, or resource storage can change.
 every resource-backed leaf, clear DOM/layout provenance, and reject
 browser-owned layer pointers. Numeric compositor IDs may cross; raw pointers
 may not. Worker jobs, caches, and results use the SMP allocator.
+Image command cloning copies any owned gradient stops at retained-tree,
+iframe composition, compositor and raster boundaries. Its cleanup frees only
+generated data; external bitmap buffers keep their established source owner.
+Background image commands carry a scalar corner radius. Bitmap and gradient
+sampling share rounded-clip coverage with display masks, preserving previously
+painted content without allocating an element-sized clipping surface.
 
 ## Compositor and interest-region contracts
 

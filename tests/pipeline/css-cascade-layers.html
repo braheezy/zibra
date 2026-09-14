@@ -1,0 +1,23 @@
+<!doctype html>
+<style>
+body { margin:0; }
+main { width:250px; }
+div { height:20px; }
+@media(min-width:600px) { @layer responsive; }
+@layer base, theme, responsive;
+@layer base {
+  #normal { width:10px; background:red; }
+  .important { width:80px!important; background:green!important; }
+  #responsive { width:160px; background:green; }
+}
+@layer theme {
+  .normal { width:80px; background:green; }
+  #important { width:10px!important; background:red!important; }
+  #nested { width:80px; background:green; }
+}
+</style>
+<style>
+@layer theme.child { #nested { width:10px; background:red; } }
+@layer responsive { #responsive { width:80px; background:green; } }
+</style>
+<main><div id="normal" class="normal"></div><div id="important" class="important"></div><div id="nested"></div><div id="responsive"></div></main>

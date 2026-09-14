@@ -63,6 +63,26 @@ the result-collection tasks (`wpt`, `wpt-all`, `latest-results`, category runs,
 
 ### Focused compatibility manifests
 
+The [cascade-layer manifest](manifest-css-layers.yaml) covers named/anonymous
+ordering, important reversal, style nesting, repeated linked sheets and statement
+recovery. Its seven default-enabled files pass (44/44 assertions), up from two
+files and 6/44 assertions. Normal and important sharing reftests both render the
+expected green square. Named window globals block the upstream inline/keyframe
+cases; the media-toggle reftest has an unstyled XHTML/CDATA reference. Their
+engine behavior is covered by unit tests and the local six-assertion page.
+CSSOM, imports, adoption, other named at-rules and rollback remain distinct
+prerequisites; see the [layer review](../../CSS_PLAN.md#cascade-layers).
+
+The [retained stylesheet manifest](manifest-css-stylesheets.yaml) covers live
+style-element media, conditional source order, nesting and malformed supports
+recovery. It passes 8/8 files (8/8 assertions), up from 6/8 files (5/8 assertions).
+The default allowlist adds both style-media tests and `at-media-001/002` reftests.
+Existing malformed-supports crashtest coverage is retained. CSSOM sheet identity
+and link load-event tests remain blocked on those APIs; the no-refetch behavior
+has a deterministic loopback regression in `test-referrer`. See the
+[CSS plan](../../CSS_PLAN.md#retained-stylesheet-programs-and-live-media) for the
+reviewed exclusions and remaining capabilities.
+
 [`manifest-css-declarations.yaml`](manifest-css-declarations.yaml) selects five
 inline CSSOM testharness files, a clone-isolation reftest and a declaration-block
 crashtest. All seven are enabled in the default allowlist. The comparison improved
@@ -223,6 +243,87 @@ computed missing-component cases pass. This is a documented serialization
 choice, not a claim that every upstream assertion improved.
 The local [`css-completion.html`](../manual/css-completion.html) fixture checks
 native geometry and live edits without upstream CSSOM/timeline prerequisites.
+
+### Calculation serialization and color interpolation
+
+[`manifest-css-color-interpolation.yaml`](manifest-css-color-interpolation.yaml)
+selects 24 unchanged upstream cases: 15 testharness files, eight references and
+the existing malformed SVG-color crashtest. The saved-browser baseline passes
+3/24 files and 5079/6948 assertions, without harness errors, crashes, timeouts
+or infrastructure failures. Run with `--mode all --jobs 1 --timeout-ms 120000`.
+
+The final build passes 12/24 files and 6854/6948 assertions: 1775 additional
+assertions pass, with none lost. Mix computation, invalid-mix admission, all
+18 out-of-gamut assertions, missing-component computation and six native
+references pass. There are no harness errors, crashes, timeouts or infrastructure
+failures. The unchanged 35-case modern-color selection also improves from
+28/35 files and 1173/1320 assertions to 29/35 and 1291/1320, with no losses.
+
+The default allowlist adds five mix parsing/computation files and seven
+references. `color-mix-basic-001.html` remains a focused diagnostic because its
+reference constructs expected colors with unsupported `Element.animate()`;
+it is excluded from the default allowlist. The native test page paints, but
+that reference throws before creating its comparison rows. The runner records
+a reftest failure; this is an API prerequisite, not a mixing discrepancy.
+Related animation suites require `getAnimations()` and WAAPI, so no additional
+animation suite is enabled on the strength of the scalar sampler alone.
+No additional relevant standalone color crashtest was found.
+
+The non-sRGB reference has a bounded gamut-mapping difference: its first equal
+LCH mixture expects fixed RGB(145,116,0), while native CSS Color 4 gamut mapping
+paints RGB(143,117,0). The other eight rows match. Preserve the reference and its
+PASS expectation; do not replace the mapping algorithm with clipping for it.
+
+Specified tests also retain older missing-component and percentage-free
+HSL/HWB expectations. Remaining exact-serialization gaps include decimal
+precision and upper-range HSL components inside a contextual expression.
+The remaining 94 assertions comprise 52 missing-component serialization
+differences, 20 percentage-bearing contextual HSL/HWB serializations, two
+contextual HSL cases that also expose upper-range clamping, four exact hue
+decimal differences, and 16 unsupported container-unit calculations.
+Container-relative calculation units remain unsupported. The
+[local fixture](../manual/css-color-interpolation.html) runs in `test-wpt` and
+covers actual computed values, font/currentcolor inheritance, live theme edits,
+hue paths, zero/partial percentages and paused modern/legacy animations.
+Engine tests additionally cover independent declaration storage/CSSOM
+presentation, allocation failure, source retirement and retained paint.
+See the [CSS plan](../../CSS_PLAN.md#calculation-serialization-color-mixing-and-interpolation)
+for the complete scope and ownership boundaries.
+
+### Modern absolute color spaces
+
+[`manifest-css-modern-colors.yaml`](manifest-css-modern-colors.yaml) selects
+35 unchanged cases: nine valid/invalid/computed HWB, Lab-family and `color()`
+files, 25 native conversion references, and the already-enabled malformed
+SVG-color crashtest. The default allowlist gains the nine value files and all
+25 references. Other color-mixing/relative-color, HDR, canvas-space, custom
+profile and stylesheet-API suites require capabilities outside this slice;
+no additional relevant standalone crashtest was found.
+
+Run with `--mode all --jobs 1 --timeout-ms 60000`. The saved-browser baseline is
+4/35 passing files and 235/1320 passing assertions, without errors, crashes,
+timeouts or infrastructure failures. The final build passes 28/35 files and
+1173/1320 assertions, with no errors, crashes, timeouts or infrastructure
+failures and no previously passing assertions lost. All invalid-value files,
+24/25 rendering references and the crashtest pass. The
+[page fixture](../manual/css-modern-colors.html) checks native live theme/font
+updates and modern keyframe endpoints. The
+[CSS plan](../../CSS_PLAN.md#modern-absolute-color-spaces) records the numerical
+conversion owner, sRGB framebuffer boundary and remaining interpolation limits.
+
+Some checked-in HWB expectations predate the current draft's percentage-bearing
+missing-component serialization. The Rec.2020 reference also predates the
+current display-referred BT.1886 transfer function. Preserve those expectations
+and report these differences separately from missing arithmetic or paint bugs.
+Specified calculation serialization remains incomplete: constant calculations
+resolve too early, and relative-unit calculation trees are not canonically
+reordered. Computed container-unit cases remain unsupported. The LCH/OKLCH
+radian cases also compare against fewer serialized hue digits.
+The 147 remaining assertions comprise 122 specified-calculation serialization
+cases, 12 container-unit cases, four hue-precision comparisons and nine HWB
+missing-component comparisons. The earlier 57-case CSS completion selection
+retains every file and assertion status (41 passing files, 15 failures, one
+existing error; 4063/4154 assertions passing).
 
 [`manifest-css-colors.yaml`](manifest-css-colors.yaml) covers resolved sRGB
 color values and currentcolor inheritance/paint. Its bounded selection includes
@@ -548,6 +649,29 @@ These filters select the expansion as of the date above; future allowlist
 additions under those prefixes will also run. Manifest-runner unit tests guard
 representative coverage and promotion of the focused reftests without requiring
 an upstream checkout.
+
+[`manifest-css-linear-gradients.yaml`](manifest-css-linear-gradients.yaml) covers
+one background layer of ordinary/repeating linear gradients: four mixed-family
+testharness files, nineteen paint references and the NaN-gradient crash case.
+All 24 cases are newly enabled in the default allowlist. Radial/conic cases in
+the shared syntax suites retain their upstream expectations; their failure does
+not imply the corresponding linear assertion failed. The companion
+`multiple-position-color-stop-linear-2.html` was reviewed but omitted because
+reference discovery does not recognize its unquoted `rel=match` link. Its other
+multiple-position reference is included. Gradient animation/WAAPI suites remain
+outside this capability.
+
+The final run improved from 9/24 to 19/24 files and from 352/2784 to 1071/2784
+assertions, with 719 gained and none lost. All linear/repeating-linear syntax
+assertions pass; the 1713 remaining assertions belong to radial/conic gradients.
+Two paint references fail: `gradient-single-stop-001.html` paints the correct
+solid color but exposes existing absolute static-position overlap with preceding
+text; `normalization-linear-degenerate.html` expects the last stop where the
+[Images 3 draft](https://drafts.csswg.org/css-images-3/#repeating-gradients)
+specifies averaging a zero-length repetition. The implementation retains that
+average. Expectations are unchanged. The remaining seventeen paint references
+and the crash case pass without errors, timeouts or infrastructure failures.
+Mixed-family passing references do not establish radial/conic support.
 
 ## Small real-browser smoke run
 

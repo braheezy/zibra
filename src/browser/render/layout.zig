@@ -11439,7 +11439,10 @@ fn rootCanvasBackgroundColor(document: *const DocumentLayout) ?browser.Color {
 
 fn rootCanvasBackgroundImage(document: *const DocumentLayout) ?BackgroundImagePaint {
     const background = rootCanvasBackground(document) orelse return null;
-    return backgroundImagePaint(background.element);
+    var paint = backgroundImagePaint(background.element) orelse return null;
+    // Propagation paints the document canvas, not the originating border box.
+    paint.border_radius = 0;
+    return paint;
 }
 
 test "layout reads the current background color animation value" {
@@ -12025,6 +12028,10 @@ fn writeDisplayItemsDebug(writer: *std.Io.Writer, items: []const DisplayItem, in
             .rect => |rect| try writer.print("rect x1={d} y1={d} x2={d} y2={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ rect.x1, rect.y1, rect.x2, rect.y2, rect.color.r, rect.color.g, rect.color.b, rect.color.a }),
             .quad => |quad| try writer.print("quad x1={d} y1={d} x2={d} y2={d} x3={d} y3={d} x4={d} y4={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ quad.x1, quad.y1, quad.x2, quad.y2, quad.x3, quad.y3, quad.x4, quad.y4, quad.color.r, quad.color.g, quad.color.b, quad.color.a }),
             .image => |image| {
+                if (image.gradient) |gradient| {
+                    try writer.print("linear-gradient stops={d} repeating={} space={s} hue={s} width={d} height={d}\n", .{ gradient.stops.len, gradient.repeating, gradient.method.space.name(), @tagName(gradient.method.hue), gradient.width, gradient.height });
+                    try writeIndent(writer, indent);
+                }
                 if (image.tiling) |tile| {
                     try writer.print("image x1={d} y1={d} x2={d} y2={d} source_width={d} source_height={d} tile_width={d} tile_height={d} tile_x={d} tile_y={d} repeat_x={} repeat_y={} attachment={s} opacity={d}\n", .{
                         image.x1,
