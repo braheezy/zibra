@@ -732,3 +732,24 @@ test "radius parsing accepts only finite positive pixels" {
     try std.testing.expectEqual(@as(f64, 0), parseCssPixelRadius("-4px"));
     try std.testing.expectEqual(@as(f64, 0), parseCssPixelRadius("50%"));
 }
+
+/// Transfer a content-box axis through a preferred ratio, accounting for the
+/// selected sizing box. `auto <ratio>` always uses content-box dimensions.
+pub fn ratioDimension(value: @import("../../document/css_aspect_ratio.zig").Value, fixed: i32, fixed_edges: i32, dependent_edges: i32, border_box: bool, deriving_height: bool) ?i32 {
+    const ratio = value.ratio orelse return null;
+    const use_border = border_box and !value.use_intrinsic;
+    const size: f64 = @floatFromInt(@as(i64, fixed) + if (use_border) @as(i64, fixed_edges) else 0);
+    const result = (if (deriving_height) size / ratio else size * ratio) - if (use_border) @as(f64, @floatFromInt(dependent_edges)) else 0;
+    // Leave coordinate headroom for ancestors, box edges and paint offsets.
+    // Tiny positive ratios can otherwise produce an i32-max sized box.
+    return @intFromFloat(std.math.clamp(result, 0, 16777216));
+}
+
+test "preferred ratios use border-box edges only without auto" {
+    const ratio = @import("../../document/css_aspect_ratio.zig");
+    try std.testing.expectEqual(@as(?i32, 50), ratioDimension(ratio.parse("2 / 1").?, 50, 50, 0, true, true));
+    try std.testing.expectEqual(@as(?i32, 50), ratioDimension(ratio.parse("auto 1 / 1").?, 50, 50, 0, true, true));
+    try std.testing.expectEqual(@as(?i32, 100), ratioDimension(ratio.parse("2 / 1").?, 25, 25, 0, true, false));
+    try std.testing.expectEqual(@as(?i32, 16777216), ratioDimension(ratio.parse("1e-14 / 1").?, 800, 0, 0, false, true));
+    try std.testing.expectEqual(@as(?i32, null), ratioDimension(ratio.parse("0 / 1").?, 50, 0, 0, false, true));
+}

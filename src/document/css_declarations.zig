@@ -420,6 +420,7 @@ pub fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     if (std.mem.eql(u8, property, "font-style")) return keywordIn(raw_value, &.{ "normal", "italic", "oblique" });
     if (std.mem.eql(u8, property, "font-variant")) return keywordIn(raw_value, &.{ "normal", "small-caps" });
     if (std.mem.eql(u8, property, "font-stretch")) return isFontStretch(raw_value);
+    if (std.mem.eql(u8, property, "aspect-ratio")) return @import("css_aspect_ratio.zig").parse(raw_value) != null;
     if (std.mem.eql(u8, property, "object-fit")) return @import("object_fit.zig").parse(raw_value) != null;
     if (std.mem.eql(u8, property, "border-radius")) return isNonnegativeLength(raw_value);
     if (std.mem.eql(u8, property, "opacity")) {
@@ -448,7 +449,7 @@ pub fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
         return isAutomaticOrNonnegativeLength(raw_value);
     }
     if (std.mem.eql(u8, property, "min-width") or std.mem.eql(u8, property, "min-height")) {
-        return isNonnegativeLength(raw_value);
+        return isAutomaticOrNonnegativeLength(raw_value);
     }
     if (std.mem.eql(u8, property, "max-width") or std.mem.eql(u8, property, "max-height")) {
         return std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw_value, " \t\r\n\x0c"), "none") or

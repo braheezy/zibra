@@ -1,0 +1,42 @@
+<!-- How to verify: expect PASS and green panels. Click Toggle ratio: the first
+     panel alternates between 320x180 and 320x320. Resize the window: the fluid
+     panel stays twice as wide as tall. The content panel grows for its child;
+     the scroll panel stays square and scrolls. -->
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Block aspect ratios</title>
+<style>
+body { margin:24px; font:16px sans-serif; background:white; color:black }
+.panel { background:green; margin:12px 0; color:white }
+#ratio { width:320px; aspect-ratio:16 / 9 }
+#fluid { width:80%; aspect-ratio:2 }
+#border { width:120px; padding-left:20px; border:10px solid green; box-sizing:border-box; aspect-ratio:1 }
+#content, #scroll { width:100px; aspect-ratio:1 }
+#scroll { overflow:auto }
+.tall { height:140px }
+</style></head><body>
+<h1>Block aspect ratios</h1><p id="result">Checking...</p>
+<button id="toggle">Toggle ratio</button>
+<div id="ratio" class="panel"></div>
+<div id="fluid" class="panel"></div>
+<div id="border" class="panel"></div>
+<div id="content" class="panel"><div class="tall">Content minimum</div></div>
+<div id="scroll" class="panel"><div class="tall">Scrollable content</div></div>
+<script>
+var square = false;
+function check() {
+  var ratio = document.getElementById('ratio').getBoundingClientRect();
+  var border = document.getElementById('border').getBoundingClientRect();
+  var content = document.getElementById('content').getBoundingClientRect();
+  var scroll = document.getElementById('scroll').getBoundingClientRect();
+  document.getElementById('result').textContent =
+    ratio.width === 320 && ratio.height === (square ? 320 : 180) &&
+    border.width === 120 && border.height === 120 && content.height === 140 && scroll.height === 100
+      ? 'PASS' : 'FAIL';
+}
+document.getElementById('toggle').addEventListener('click', function () {
+  square = !square;
+  document.getElementById('ratio').style.setProperty('aspect-ratio', square ? '1' : '16 / 9');
+  check();
+});
+check();
+</script></body></html>

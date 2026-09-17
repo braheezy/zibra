@@ -149,7 +149,7 @@ pub const computed = svgProperties() ++ [_]Property{
     .{ .name = "min-width", .default_value = "0px", .serialization = .length },
     .{ .name = "max-width", .default_value = "none", .serialization = .length },
     .{ .name = "height", .default_value = "auto", .serialization = .length },
-    .{ .name = "min-height", .default_value = "0px", .serialization = .length },
+    .{ .name = "min-height", .default_value = "auto", .serialization = .length },
     .{ .name = "max-height", .default_value = "none", .serialization = .length },
     .{ .name = "float", .default_value = "none" },
     .{ .name = "clear", .default_value = "none" },

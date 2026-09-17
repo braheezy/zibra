@@ -81,6 +81,9 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
 
 ## CSS rules
 
+- `css_aspect_ratio.zig` owns ratio admission and serialization for both ordinary
+  and replaced boxes. Degenerate ratios are valid syntax with no used ratio.
+
 - `css_math.zig` evaluates bounded typed calculations with explicit unit and
   percentage contexts. Lengths and colors share it; layout-dependent units
   must not be guessed during declaration admission. Its optional transient

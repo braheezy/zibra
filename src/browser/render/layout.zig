@@ -8837,7 +8837,7 @@ const BlockLayout = struct {
         const native_text_control = self.inline_nodes == null and self.node == .element and
             (std.ascii.eqlIgnoreCase(self.node.element.tag, "textarea") or std.ascii.eqlIgnoreCase(self.node.element.tag, "audio") or
                 (std.ascii.eqlIgnoreCase(self.node.element.tag, "input") and !self.node.element.isCheckbox() and !self.node.element.isInputType("radio")));
-        const specified_width = if (image_box) |box|
+        var specified_width = if (image_box) |box|
             box.width
         else if (self.tableRole() == .table and allocated_box == null)
             try self.preferredTableWidth(engine, zoom_value, engine.zoom(), containing_width_css, style_specified_width)
@@ -8889,7 +8889,7 @@ const BlockLayout = struct {
             constrainDimension(height, min_height, max_height)
         else
             null;
-        const specified_height = if (image_box) |box|
+        var specified_height = if (image_box) |box|
             box.height
         else if (allocated_box) |box|
             if (box.height) |height|
@@ -8898,6 +8898,27 @@ const BlockLayout = struct {
                 style_specified_height
         else
             style_specified_height;
+        // Ordinary in-flow blocks share ratio grammar with replaced elements,
+        // but retain their own auto sizing and content minimum rules.
+        const preferred_ratio = if (self.inline_nodes == null and self.embedded_box == null and
+            allocated_box == null and image_box == null and !native_text_control and
+            !isOutOfFlowPosition(position_mode) and self.node == .element and
+            (flex_format.eq(self.formatStyle("display", "inline"), "block") or
+                flex_format.eq(self.formatStyle("display", "inline"), "list-item")) and
+            !flex_format.eq(self.node.element.tag, "input") and
+            !flex_format.eq(self.node.element.tag, "select") and
+            !flex_format.eq(self.node.element.tag, "iframe") and
+            !flex_format.eq(self.node.element.tag, "canvas") and
+            !flex_format.eq(self.node.element.tag, "svg") and
+            !flex_format.eq(self.node.element.tag, "button"))
+            replaced_sizing.parseAspectRatio(self.formatStyle("aspect-ratio", "auto")) orelse replaced_sizing.AspectRatio.auto
+        else
+            replaced_sizing.AspectRatio.auto;
+        if (specified_width == null) if (specified_height) |height| {
+            if (box_model.ratioDimension(preferred_ratio, height, self.padding.vertical() + self.border.vertical(), self.padding.horizontal() + self.border.horizontal(), sizing_border_box, false)) |width| {
+                specified_width = constrainDimension(width, min_width, max_width);
+            }
+        };
         const horizontal_insets = self.padding.horizontal() + self.border.horizontal();
         // Table grid placement supplies the border box directly. A cell or
         // row must not independently enter the surrounding float context.
@@ -9131,6 +9152,14 @@ const BlockLayout = struct {
             @max(self.width.get().* - horizontal_insets, 0);
         if (engine.collect_hit_test_bounds) {
             if (self.node_ptr) |ptr| try engine.recordFragmentTargets(ptr, layout_y);
+        }
+
+        var ratio_height = false;
+        if (specified_height == null) {
+            if (box_model.ratioDimension(preferred_ratio, self.content_width, horizontal_insets, self.padding.vertical() + self.border.vertical(), sizing_border_box, true)) |height| {
+                specified_height = constrainDimension(height, min_height, max_height);
+                ratio_height = true;
+            }
         }
 
         // Publish a definite block height before laying out descendants so a
@@ -9377,6 +9406,13 @@ const BlockLayout = struct {
             self.parent_block.?.y.get().* + self.parent_block.?.border.top
         else
             parent_content_y;
+        // The automatic minimum in the dependent axis prevents visible
+        // content overflow; an explicit minimum or scroll container opts out.
+        if (ratio_height and min_height == null and flex_format.eq(self.formatStyle("overflow", "visible"), "visible")) {
+            self.content_height = constrainDimension(@max(self.content_height, natural_height), min_height, max_height);
+            self.height.set(self.content_height +| self.padding.vertical() +| self.border.vertical());
+        }
+
         // Only resolved insets use the padding edge. With auto left/right,
         // preserve the hypothetical normal-flow (content-edge) x position.
         const position_origin_x = if (position_mode == .absolute and self.parent_block != null and self.embedded_box == null)

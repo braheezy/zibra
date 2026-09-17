@@ -16,6 +16,9 @@ pub fn primitive(allocator: std.mem.Allocator, property: []const u8, input: []co
     if (std.mem.startsWith(u8, property, "animation-") and !std.mem.eql(u8, property, "animation-name")) {
         return std.ascii.allocLowerString(allocator, input);
     }
+    if (std.mem.eql(u8, property, "aspect-ratio")) {
+        if (@import("css_aspect_ratio.zig").parse(input)) |ratio| return ratio.serialize(allocator);
+    }
     for (@import("css_properties.zig").computed) |entry| {
         if (!std.mem.eql(u8, entry.name, property)) continue;
         switch (entry.serialization) {

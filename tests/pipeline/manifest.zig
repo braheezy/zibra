@@ -27,6 +27,12 @@ pub const Case = struct {
 
 const existing_cases = [_]Case{
     .{
+        .name = "css-block-aspect-ratio-layout",
+        .mode = .layout,
+        .fixture = "tests/pipeline/css-block-aspect-ratio.html",
+        .golden = "tests/golden/pipeline/css-block-aspect-ratio.layout.txt",
+    },
+    .{
         .name = "css-cascade-layers-narrow-display-list",
         .mode = .display_list,
         .fixture = "tests/pipeline/css-cascade-layers.html",

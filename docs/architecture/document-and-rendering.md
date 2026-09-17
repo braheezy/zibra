@@ -833,6 +833,20 @@ Important geometry contracts:
   value into growable line buffers; even self-contained dependency edges would
   retain stale field addresses. Their persistent block owns invalidation.
 
+Ordinary in-flow `block` and `list-item` boxes transfer a definite height to an
+auto width, or their resolved width to an auto height, through `aspect-ratio`.
+`document/css_aspect_ratio.zig` owns the shared scalar grammar and serialization;
+`box_model.ratioDimension` transfers dimensions without retaining DOM state.
+Derived axes are capped at 2^24 layout pixels to retain coordinate headroom.
+Layout registers the ratio read on its persistent geometry owner and publishes
+the resulting definite height before percentage-height children are laid out.
+The ratio respects `box-sizing`; `auto <ratio>` uses the content box. Explicit
+axes and min/max constraints remain authoritative. `min-height` defaults to
+`auto`: visible content can enlarge the ratio-dependent height, while an explicit
+minimum or scroll container disables that automatic content minimum.
+Intrinsic-width content minimums, cross-axis min/max transfer, non-horizontal
+writing modes, positioned and flex/grid ratio sizing remain outside this slice.
+
 Images and iframes share `render/replaced_sizing.zig` for unscaled CSS used
 size. CSS dimensions override matching HTML attributes, a usable aspect ratio
 derives only a missing axis, and authored zoom is applied only after both axes

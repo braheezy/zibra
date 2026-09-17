@@ -49,74 +49,14 @@ pub const Constraints = struct {
     }
 };
 
-/// The supported `aspect-ratio` grammar is `auto || <ratio>`, where a ratio is
-/// one positive finite number or two such numbers separated by `/`.
-pub const AspectRatio = struct {
-    ratio: ?f64 = null,
-    use_intrinsic: bool = true,
-
-    pub const auto = AspectRatio{};
-};
+pub const AspectRatio = @import("../../document/css_aspect_ratio.zig").Value;
 
 pub const Kind = enum {
     image,
     iframe,
 };
 
-fn isCssWhitespace(byte: u8) bool {
-    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n' or byte == '\x0c';
-}
-
-fn parsePositiveNumber(input: []const u8) ?f64 {
-    const text = std.mem.trim(u8, input, " \t\r\n\x0c");
-    if (text.len == 0) return null;
-    const value = std.fmt.parseFloat(f64, text) catch return null;
-    return if (std.math.isFinite(value) and value > 0) value else null;
-}
-
-fn parseRatio(input: []const u8) ?f64 {
-    const slash = std.mem.indexOfScalar(u8, input, '/');
-    if (slash) |index| {
-        if (std.mem.indexOfScalar(u8, input[index + 1 ..], '/') != null) return null;
-        const numerator = parsePositiveNumber(input[0..index]) orelse return null;
-        const denominator = parsePositiveNumber(input[index + 1 ..]) orelse return null;
-        const ratio = numerator / denominator;
-        return if (std.math.isFinite(ratio) and ratio > 0) ratio else null;
-    }
-    return parsePositiveNumber(input);
-}
-
-fn startsWithAuto(input: []const u8) bool {
-    return input.len > 4 and
-        std.ascii.eqlIgnoreCase(input[0..4], "auto") and
-        isCssWhitespace(input[4]);
-}
-
-fn endsWithAuto(input: []const u8) bool {
-    return input.len > 4 and
-        std.ascii.eqlIgnoreCase(input[input.len - 4 ..], "auto") and
-        isCssWhitespace(input[input.len - 5]);
-}
-
-pub fn parseAspectRatio(input: []const u8) ?AspectRatio {
-    const text = std.mem.trim(u8, input, " \t\r\n\x0c");
-    if (std.ascii.eqlIgnoreCase(text, "auto")) return .auto;
-
-    var ratio_text = text;
-    var use_intrinsic = false;
-    if (startsWithAuto(text)) {
-        use_intrinsic = true;
-        ratio_text = std.mem.trim(u8, text[4..], " \t\r\n\x0c");
-    } else if (endsWithAuto(text)) {
-        use_intrinsic = true;
-        ratio_text = std.mem.trim(u8, text[0 .. text.len - 4], " \t\r\n\x0c");
-    }
-
-    return .{
-        .ratio = parseRatio(ratio_text) orelse return null,
-        .use_intrinsic = use_intrinsic,
-    };
-}
+pub const parseAspectRatio = @import("../../document/css_aspect_ratio.zig").parse;
 
 fn styleValue(element: *const parser.Element, property: []const u8) ?[]const u8 {
     const style_map = if (element.style) |*styles| styles else return null;
@@ -201,7 +141,7 @@ fn sizeRatio(size: ?Size) ?f64 {
 }
 
 fn effectiveRatio(value: AspectRatio, intrinsic: ?Size) ?f64 {
-    if (value.use_intrinsic) {
+    if (value.use_intrinsic or value.ratio == null) {
         if (sizeRatio(intrinsic)) |ratio| return ratio;
     }
     return value.ratio;
@@ -373,7 +313,7 @@ test "aspect-ratio parses auto, ratios, and the replaced fallback syntax" {
     try std.testing.expectApproxEqAbs(@as(f64, 4.0 / 3.0), fallback.ratio.?, 0.000001);
     try std.testing.expect(parseAspectRatio("4 / 3 auto").?.use_intrinsic);
 
-    try std.testing.expect(parseAspectRatio("0 / 1") == null);
+    try std.testing.expect(parseAspectRatio("0 / 1").?.ratio == null);
     try std.testing.expect(parseAspectRatio("1 / -2") == null);
     try std.testing.expect(parseAspectRatio("1 / 2 / 3") == null);
     try std.testing.expect(parseAspectRatio("auto auto") == null);
@@ -442,4 +382,9 @@ test "unloaded images retain only explicitly specified axes" {
         Size{ .width = 0, .height = 0 },
         resolve(.image, .{}, null, .auto),
     );
+}
+
+test "degenerate aspect-ratio falls back to natural image ratio" {
+    const size = resolve(.image, .{ .width = 100 }, .{ .width = 40, .height = 20 }, parseAspectRatio("0 / 1").?);
+    try std.testing.expectEqual(@as(i32, 50), size.height);
 }

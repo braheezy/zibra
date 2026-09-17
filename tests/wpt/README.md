@@ -922,3 +922,29 @@ collection, corruption handling, and build identity; when GNU Parallel is on
 PATH it also executes local scheduling and resume integration tests. These tests
 use fixture results and do not launch the browser. Remote execution needs an
 explicit SSH-host integration check before relying on a new worker setup.
+
+## Ordinary block aspect ratios
+
+`manifest-aspect-ratio-blocks.yaml` isolates shared property parsing/computed
+serialization, fractional block sizing, and both content/border-box reftests.
+All are already enabled by the default `css` directory, so no additional default
+allowlist entries are needed. The matching engine regression checks geometry,
+percentage-height descendants, live invalidation, limits and content overflow;
+`tests/manual/css-block-aspect-ratio.html` exercises responsive panels.
+
+This slice covers numeric ratios on ordinary in-flow blocks, including
+`auto <ratio>` and degenerate zero ratios. It does not implement calculation
+operands in ratios, flex/grid or positioned ratio algorithms, vertical writing,
+intrinsic-width content minimums, or full cross-axis min/max transfer. The focused
+manifest also includes the small-aspect-ratio crashtest, already enabled by the
+broad default selection. Derived dimensions are capped at 2^24 layout pixels
+to leave coordinate headroom for surrounding boxes.
+
+The focused baseline had 15/40 passing testharness assertions; block ratio
+support raises this to 40/40. The five selected reftests share an XHTML reference
+whose CDATA-wrapped stylesheet is not applied by Zibra's document path. Their
+blank-reference comparisons are not evidence of aspect-ratio correctness:
+three false passes become failures when the green squares render. Keep these
+cases selected and track the reference-document limitation separately. The
+HTML pipeline fixture `css-block-aspect-ratio.html` provides an independent exact
+layout baseline without that prerequisite.

@@ -1,0 +1,24 @@
+<!doctype html>
+<html><head><style>
+body {margin:0}
+main {width:320px}
+.tile {background:green}
+#fraction {width:100px;aspect-ratio:.00025 / .0001}
+#fluid {aspect-ratio:1.6}
+#border {width:100px;aspect-ratio:2;box-sizing:border-box;padding-left:50px}
+#fallback {width:100px;aspect-ratio:auto 1;box-sizing:border-box;padding-left:50px}
+#reverse {height:50px;aspect-ratio:2;box-sizing:border-box;padding-top:25px}
+#both {width:90px;height:30px;aspect-ratio:1}
+#content, #zero {width:50px;aspect-ratio:1}
+#zero {min-height:0}
+.child {height:90px}
+</style></head><body><main>
+<div id="fraction" class="tile"></div>
+<div id="fluid" class="tile"></div>
+<div id="border" class="tile"></div>
+<div id="fallback" class="tile"></div>
+<div id="reverse" class="tile"></div>
+<div id="both" class="tile"></div>
+<div id="content" class="tile"><div class="child"></div></div>
+<div id="zero" class="tile"><div class="child"></div></div>
+</main></body></html>

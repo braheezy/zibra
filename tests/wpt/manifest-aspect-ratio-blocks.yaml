@@ -1,0 +1,14 @@
+# Shared grammar and ordinary block preferred sizing; all are also in default css coverage.
+tests:
+  - css/css-sizing/aspect-ratio/parsing/aspect-ratio-valid.html
+  - css/css-sizing/aspect-ratio/parsing/aspect-ratio-invalid.html
+  - css/css-sizing/aspect-ratio/parsing/aspect-ratio-computed.html
+  - css/css-sizing/aspect-ratio/fractional-aspect-ratio.html
+reftests:
+  - css/css-sizing/aspect-ratio/block-aspect-ratio-001.html
+  - css/css-sizing/aspect-ratio/block-aspect-ratio-002.html
+  - css/css-sizing/aspect-ratio/block-aspect-ratio-004.html
+  - css/css-sizing/aspect-ratio/block-aspect-ratio-005.html
+  - css/css-sizing/aspect-ratio/block-aspect-ratio-006.html
+crashtests:
+  - css/css-sizing/aspect-ratio/small-aspect-ratio-crash.html
