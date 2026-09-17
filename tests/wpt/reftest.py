@@ -31,6 +31,9 @@ def _unfilter(raw: bytes, width: int, height: int, channels: int) -> bytes:
         offset += 1
         current = bytearray(raw[offset : offset + stride])
         offset += stride
+        if filter_type == 0:
+            output[row * stride : (row + 1) * stride] = current
+            continue
         previous_start = (row - 1) * stride
         current_start = row * stride
         for index in range(stride):
@@ -123,8 +126,28 @@ def compare_png(
     fuzzy metadata maps to a maximum per-channel difference and a maximum
     number of differing pixels.
     """
-    expected = load_png(expected_path)
-    actual = load_png(actual_path)
+    return compare_images(
+        load_png(expected_path),
+        load_png(actual_path),
+        ignored_top_rows=ignored_top_rows,
+        max_difference=max_difference,
+        max_different_pixels=max_different_pixels,
+    )
+
+
+def compare_images(
+    expected: Image,
+    actual: Image,
+    *,
+    ignored_top_rows: int = 70,
+    max_difference: int = 0,
+    max_different_pixels: int = 0,
+) -> dict[str, int | bool | list[int] | None]:
+    """Compare decoded RGBA snapshots with the same diagnostics as compare_png.
+
+    Callers may reuse an immutable snapshot within a case. Do not cache rendered
+    references across cases: pages can depend on server state and time.
+    """
     if (expected.width, expected.height) != (actual.width, actual.height):
         return {
             "passed": False,
@@ -140,18 +163,28 @@ def compare_png(
     different_pixels = 0
     max_channel_delta = 0
     first_difference: list[int] | None = None
+    stride = expected.width * 4
     for row in range(first_row, expected.height):
-        for column in range(expected.width):
-            expected_offset = (row * expected.width + column) * 4
-            actual_pixel = actual.pixels[expected_offset : expected_offset + 4]
-            expected_pixel = expected.pixels[expected_offset : expected_offset + 4]
-            delta = max(abs(left - right) for left, right in zip(expected_pixel, actual_pixel))
-            if delta == 0:
+        start = row * stride
+        expected_row = expected.pixels[start : start + stride]
+        actual_row = actual.pixels[start : start + stride]
+        # bytes equality runs in native code and avoids Python pixel work for
+        # identical rows, including the large blank areas common in reftests.
+        if expected_row == actual_row:
+            continue
+        for offset in range(0, stride, 4):
+            left = expected_row[offset : offset + 4]
+            right = actual_row[offset : offset + 4]
+            if left == right:
                 continue
+            delta = max(
+                abs(left[0] - right[0]), abs(left[1] - right[1]),
+                abs(left[2] - right[2]), abs(left[3] - right[3]),
+            )
             different_pixels += 1
             max_channel_delta = max(max_channel_delta, delta)
             if first_difference is None:
-                first_difference = [column, row]
+                first_difference = [offset // 4, row]
     passed = (
         different_pixels <= max_different_pixels
         and max_channel_delta <= max_difference

@@ -742,10 +742,30 @@ WPT `match`/`mismatch`
 references are captured through Zibra's windowless `--screenshot` mode. The
 runner compares RGB/RGBA PNG page pixels after the stable 70-pixel chrome
 strip, applies basic WPT fuzzy limits when present, and records per-reference
-diagnostics. Missing references, screenshot failures, malformed PNGs, and
-dimension mismatches are `INFRA`; a `mismatch` relation passes when the images
+diagnostics. Missing references, screenshot failures, and malformed PNGs are
+`INFRA`; dimension mismatches produce unequal-image diagnostics. A `mismatch`
+relation passes when the images
 are different. This provides the harness boundary without claiming rendering
 parity with the upstream browser.
+
+PNG comparison remains dependency-free. Unfiltered scanlines are copied in
+bulk, and equal RGBA rows bypass the Python pixel loop. Unequal rows retain
+exact per-channel/alpha diagnostics and fuzzy-limit behavior. A test screenshot
+is decoded once and reused across that case's references; decoded data is
+released when the case finishes. References are still captured independently,
+so this does not cache page behavior across tests or change pause/resume jobs.
+
+A local 800×600 benchmark (three-run medians, including both PNG decodes) took
+about 1.5ms for identical images and 1.6ms for a one-pixel difference, versus
+about 984ms and 986ms previously. A full-page difference took 223ms versus
+1066ms. These measure the comparison stage, not browser startup/rendering,
+WPT discovery, or overall suite throughput. Filtered PNGs still use the general
+Python decoder; Zibra's measured screenshot output used unfiltered rows.
+The five `manifest-background-origin.yaml` reftests retained identical statuses
+and all pixel diagnostics; their summed case time fell from 8.08s to 3.60s
+(including screenshot processes, excluding discovery/server startup). All 62
+runner/batch unit tests passed, including filter/RGB/RGBA round trips,
+scalar-oracle comparisons, fuzzy boundaries and per-case decode reuse.
 
 Crashtests use a process-health adapter, also included in mixed allowlist runs.
 `--mode crashtest` selects just that category; `--all --mode crashtest` or

@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import random
 from pathlib import Path
 import struct
 import sys
@@ -17,6 +18,76 @@ SPEC = importlib.util.spec_from_file_location(
 runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner
 SPEC.loader.exec_module(runner)
+
+
+class ReftestComparisonTests(unittest.TestCase):
+    def test_all_png_filters_rgb_and_rgba(self):
+        from reftest import read_png
+        rng = random.Random(17)
+        for channels in (3, 4):
+            width, height = 7, 6
+            pixels = bytes(rng.randrange(256) for _ in range(width * height * channels))
+            stride = width * channels
+            for filter_type in range(5):
+                raw = bytearray()
+                for row in range(height):
+                    raw.append(filter_type)
+                    for x in range(stride):
+                        i = row * stride + x
+                        a = pixels[i - channels] if x >= channels else 0
+                        b = pixels[i - stride] if row else 0
+                        c = pixels[i - stride - channels] if row and x >= channels else 0
+                        p = a + b - c
+                        distances = (abs(p - a), abs(p - b), abs(p - c))
+                        paeth = (a, b, c)[distances.index(min(distances))]
+                        predictor = (0, a, b, (a + b) // 2, paeth)[filter_type]
+                        raw.append((pixels[i] - predictor) % 256)
+                def chunk(kind, data):
+                    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+                png = (b"\x89PNG\r\n\x1a\n" +
+                       chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6 if channels == 4 else 2, 0, 0, 0)) +
+                       chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+                expected = pixels if channels == 4 else b"".join(
+                    pixels[i:i + 3] + b"\xff" for i in range(0, len(pixels), 3))
+                with self.subTest(channels=channels, filter=filter_type):
+                    image = read_png(io.BytesIO(png))
+                    self.assertEqual((width, height, expected), (image.width, image.height, image.pixels))
+
+    def test_comparison_matches_scalar_oracle(self):
+        from reftest import Image, compare_images
+        rng = random.Random(31)
+        width, height = 11, 8
+        expected = bytes(rng.randrange(256) for _ in range(width * height * 4))
+        for density in (0, .01, .5, 1):
+            actual = bytes((value + rng.randrange(1, 256)) % 256 if rng.random() < density else value for value in expected)
+            for ignored in (-1, 0, 3, height, height + 1):
+                changes = []
+                for pixel in range(max(0, min(ignored, height)) * width, width * height):
+                    delta = max(abs(expected[pixel * 4 + c] - actual[pixel * 4 + c]) for c in range(4))
+                    if delta: changes.append((pixel, delta))
+                peak = max((delta for _, delta in changes), default=0)
+                for maximum, count in ((0, 0), (255, width * height), (peak, len(changes)), (peak - 1, len(changes)), (peak, len(changes) - 1)):
+                    with self.subTest(density=density, ignored=ignored, maximum=maximum, count=count):
+                        self.assertEqual({
+                            "passed": len(changes) <= count and peak <= maximum,
+                            "width": width, "height": height,
+                            "different_pixels": len(changes), "max_channel_delta": peak,
+                            "first_difference": [changes[0][0] % width, changes[0][0] // width] if changes else None,
+                        }, compare_images(Image(width, height, expected), Image(width, height, actual),
+                                          ignored_top_rows=ignored, max_difference=maximum, max_different_pixels=count))
+
+    def test_alpha_hidden_rgb_dimensions_and_ignored_chrome(self):
+        from reftest import Image, compare_images
+        expected = Image(1, 3, bytes((0, 0, 0, 0)) * 3)
+        actual = Image(1, 3, bytes((255, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0)))
+        result = compare_images(expected, actual, ignored_top_rows=1, max_difference=1, max_different_pixels=2)
+        self.assertTrue(result["passed"])
+        self.assertEqual(2, result["different_pixels"])
+        self.assertEqual([0, 1], result["first_difference"])
+        mismatch = compare_images(expected, Image(3, 1, actual.pixels))
+        self.assertFalse(mismatch["passed"])
+        self.assertEqual(-1, mismatch["different_pixels"])
+        self.assertEqual(1, mismatch["expected_width"])
 
 
 class WptRunnerTests(unittest.TestCase):
@@ -282,7 +353,7 @@ class WptRunnerTests(unittest.TestCase):
             path="css/test.html",
             mode="reftest",
             reason="reftest fixture",
-            references=(("/css/ref.html", "!="),),
+            references=(("/css/ref.html", "!="), ("/css/ref.html?second", "!=")),
         )
 
         def png(color):
@@ -306,7 +377,8 @@ class WptRunnerTests(unittest.TestCase):
             output.write_bytes(png(color))
             return runner.ProcessOutcome(stdout="", stderr="")
 
-        with mock.patch.object(runner, "_invoke", side_effect=capture) as invoke:
+        with mock.patch.object(runner, "_invoke", side_effect=capture) as invoke, \
+             mock.patch.object(runner, "load_png", wraps=runner.load_png) as decode:
             result = runner._run_reftest(
                 test, "file:///wpt/css/test.html", ["fake-browser"]
             )
@@ -314,7 +386,22 @@ class WptRunnerTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual("PASS", result.status)
         self.assertEqual("!=", result.record["comparisons"][0]["relation"])
-        self.assertEqual(2, invoke.call_count)
+        self.assertEqual(3, invoke.call_count)
+        self.assertEqual(3, decode.call_count)
+        self.assertEqual(1, sum(Path(call.args[0]).name == "test.png" for call in decode.call_args_list))
+        self.assertEqual(2, len(result.record["comparisons"]))
+
+    def test_reftest_bad_test_png_does_not_capture_references(self):
+        case = runner.Case(path="css/bad.html", mode="reftest", reason="malformed screenshot",
+                           references=(("/css/ref.html", "=="),))
+        def capture(command, _watchdog):
+            Path(command[command.index("--screenshot") + 1]).write_bytes(b"bad PNG")
+            return runner.ProcessOutcome(stdout="", stderr="")
+        with mock.patch.object(runner, "_invoke", side_effect=capture) as invoke:
+            result = runner._run_reftest(case, "file:///wpt/css/bad.html", ["fake-browser"])
+        self.assertEqual("INFRA", result.status)
+        self.assertIn("test PNG decoding failed", result.infrastructure_error)
+        self.assertEqual(1, invoke.call_count)
 
     def test_crashtest_requires_a_healthy_browser_completion(self):
         test = runner.Case(

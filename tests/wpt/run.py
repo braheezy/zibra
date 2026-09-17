@@ -37,13 +37,13 @@ from typing import Any
 from urllib.parse import urljoin
 
 try:
-    from reftest import compare_png
+    from reftest import compare_images, load_png
     from protocol import parse_json_record
     from diagnostics import analyze_testharness
 except ModuleNotFoundError:
     # The runner is also imported directly by its dependency-free unit tests.
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from reftest import compare_png
+    from reftest import compare_images, load_png
     from protocol import parse_json_record
     from diagnostics import analyze_testharness
 
@@ -1239,6 +1239,17 @@ def _run_reftest(case: Case, url: str, browser: list[str]) -> CaseResult:
                 stderr=outcome.stderr,
             )
 
+        try:
+            test_image = load_png(str(test_png))
+        except (OSError, ValueError, zlib.error) as error:
+            return CaseResult(
+                case=case,
+                status="INFRA",
+                ok=False,
+                infrastructure_error=f"test PNG decoding failed: {error}",
+                stdout="\n".join(diagnostics),
+            )
+
         for index, (reference, relation) in enumerate(case.references):
             reference_png = pathlib.Path(directory) / f"reference-{index}.png"
             reference_url = _reference_url(url, reference)
@@ -1268,9 +1279,9 @@ def _run_reftest(case: Case, url: str, browser: list[str]) -> CaseResult:
                     stdout="\n".join(diagnostics),
                 )
             try:
-                comparison = compare_png(
-                    str(test_png),
-                    str(reference_png),
+                comparison = compare_images(
+                    test_image,
+                    load_png(str(reference_png)),
                     max_difference=case.fuzzy[0] if case.fuzzy else 0,
                     max_different_pixels=case.fuzzy[1] if case.fuzzy else 0,
                 )
