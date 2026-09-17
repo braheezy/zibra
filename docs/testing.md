@@ -31,8 +31,11 @@ For each coherent compatibility chunk:
    directory prefixes or bounded explicit cases, considering all three runnable
    categories: testharness, reftest, and crashtest. Run the selected additions
    and record their baseline. Prefer a coherent subset over enabling an entire
-   large domain with unsupported prerequisites. Do not select only passing
-   cases: semantic failures in implemented behavior are useful coverage, while
+   large domain with unsupported prerequisites for iteration. The default CSS
+   selection deliberately covers the whole runnable corpus for periodic
+   compatibility measurement; use focused manifests when iterating. Do not
+   select only passing cases: semantic failures in implemented behavior are
+   useful coverage, while
    unsupported automation or infrastructure must be identified separately.
    In the handoff, name the enabled coverage or explain why existing coverage
    is sufficient or which prerequisites prevent additions. A fetch/parse probe
@@ -345,3 +348,7 @@ subset that proves the contract.
    interaction.
 6. Report exactly which checks ran, which were unavailable, and which behavior
    remains manually verified.
+
+For resumable or multi-machine WPT collection, use the generated
+[GNU Parallel batches](../tests/wpt/README.md#resumable-batches-with-gnu-parallel).
+The existing manifest remains the selection source; batch plans are run artifacts.

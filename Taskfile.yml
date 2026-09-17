@@ -4,7 +4,7 @@ vars:
   WPT_MANIFEST: tests/wpt/manifest.yaml
   WPT_RESULTS: tests/wpt/results
   DASHBOARD_COMPOSE: tests/wpt/dashboard/docker-compose.yml
-  WPT_JOBS: 4
+  WPT_JOBS: 8re
   GIT_SHA:
     sh: git rev-parse --short HEAD 2>/dev/null || printf working-tree
 
@@ -25,14 +25,20 @@ tasks:
         --report {{.WPT_RESULTS}}/$(date -u +%Y%m%dT%H%M%SZ).json
 
   wpt:
-    desc: Collect allowlisted WPT results and report omitted coverage
+    desc: Start WPT or resume unfinished work; Ctrl+C pauses
     cmds:
-      - zig build -Doptimize=ReleaseSafe
-      - mkdir -p {{.WPT_RESULTS}}
       - >-
-        ZIBRA_GIT_SHA="{{.GIT_SHA}}" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py {{.WPT_MANIFEST}}
-        --mode all --full-suite --jobs {{.WPT_JOBS}} --browser ./zig-out/bin/zibra
-        --report {{.WPT_RESULTS}}/wpt-$(date -u +%Y%m%dT%H%M%SZ).json
+        SDL_VIDEODRIVER=dummy python3 tests/wpt/batch.py start --build
+        --manifest {{.WPT_MANIFEST}} --results {{.WPT_RESULTS}} --jobs {{.WPT_JOBS}}
+        {{.CLI_ARGS}}
+
+  wpt-fresh:
+    desc: Start a new WPT run, preserving previous results
+    cmds:
+      - >-
+        SDL_VIDEODRIVER=dummy python3 tests/wpt/batch.py start --build --fresh
+        --manifest {{.WPT_MANIFEST}} --results {{.WPT_RESULTS}} --jobs {{.WPT_JOBS}}
+        {{.CLI_ARGS}}
 
   wpt-smoke:
     desc: Check one upstream testharness, reftest, and crashtest serially

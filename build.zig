@@ -717,6 +717,7 @@ pub fn build(b: *std.Build) !void {
         "-m",
         "unittest",
         "tests/wpt/test_run.py",
+        "tests/wpt/test_batch.py",
     });
     const wpt_runner_test_step = b.step(
         "test-wpt-runner",

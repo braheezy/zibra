@@ -889,7 +889,12 @@ deviations:
         for section, paths in representatives.items():
             for path in paths:
                 with self.subTest(section=section, path=path):
-                    self.assertIn(path, config[section])
+                    self.assertTrue(
+                        path in config[section] or any(
+                            runner._path_in_directory(path, directory)
+                            for directory in config.get("directories", [])
+                        ), path,
+                    )
                     self.assertNotIn(path, config.get("deviations", {}))
         for section in ("tests", "reftests", "crashtests", "probes"):
             paths = config.get(section, [])
@@ -908,7 +913,13 @@ deviations:
         ):
             with self.subTest(manifest=name):
                 focused = runner._load_yaml_config(runner.DEFAULT_MANIFEST.with_name(name))
-                missing = set(focused["reftests"]) - default_reftests
+                missing = {
+                    path for path in focused["reftests"]
+                    if path not in default_reftests and not any(
+                        runner._path_in_directory(path, directory)
+                        for directory in config.get("directories", [])
+                    )
+                }
                 self.assertFalse(missing, sorted(missing))
 
     def test_testharness_invocation_accepts_an_exact_expected_timeout(self):

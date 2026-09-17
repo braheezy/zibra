@@ -39,13 +39,17 @@ Broader steps include:
 - `zig build test-pipeline` — exact box-model and nested-zoom
   style/layout/display-list goldens;
 - `zig build test-dump-dom` — DOM CLI output;
-- `zig build test-wpt-runner` — WPT manifest-runner protocol and failure paths;
+- `zig build test-wpt-runner` — WPT manifest-runner protocol, batch collection,
+  and failure paths; GNU Parallel integration checks run when it is installed;
 - `zig build test-csp` — loopback HTTP CSP loading, destination-specific denials,
   and repeated response-header intersection;
 - `zig build test-referrer` — loopback HTTP policy delivery, redirect reduction,
   element overrides, document referrers, and stylesheet resource provenance;
 - `zig build test-wpt` — serial, watchdog-bounded local WPT protocol and
   startup/error/progress diagnostics plus DOM, geometry, and parser-boundary fixtures;
+- `task wpt` — start or automatically resume a GNU Parallel batch run; Ctrl+C
+  drains active batches and saves progress. `task wpt-fresh` preserves older
+  results and starts a new run. See the WPT guide for remote workers.
 - `task wpt-smoke` — one upstream testharness, reftest, and crashtest run
   serially; requires the WPT checkout and server dependencies described in the
   [WPT guide](wpt/README.md);

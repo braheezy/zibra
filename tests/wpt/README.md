@@ -697,6 +697,22 @@ This proves the adapters can produce real results, not general WPT support.
 testharness, reftest, and crashtest entries below those WPT directories,
 including generated variants and reference metadata. Explicit entries and
 directory matches are deduplicated by category and test URL.
+The default manifest selects the entire `css` directory, including failing
+cases and features the engine does not implement yet. This replaces the former
+individual CSS allowlist; newly discovered runnable CSS tests are selected
+automatically. It is a compatibility measurement, not a passing gate. Manual
+and other discovery-only categories still cannot execute in this runner.
+Use focused manifests or `--directory css/css-color` for development iterations.
+To collect the full CSS corpus with an already built browser:
+
+```sh
+python3 tests/wpt/run.py --directory css --jobs 1 --report /tmp/zibra-css-wpt.json --browser ./zig-out/bin/zibra
+```
+
+This can be a long run. Failures, timeouts, and infrastructure errors remain
+visible in the report; no blanket CSS skip or expected-failure overrides are
+applied. Existing dashboard reports do not change until a new run is collected.
+
 `task wpt` runs that mixed-category
 allowlist with `--full-suite`: directories outside the allowlist are not
 executed, but remain in the report as `0/N` and mark its compatibility summary
@@ -825,3 +841,84 @@ The first audio-element pass has a small audio-only allowlist in
 resource state, and hidden fallback-content reftests. Run it with the same
 `--jobs 1 --browser ./zig-out/bin/zibra` options. It does not claim video,
 streaming, autoplay/testdriver, or complete media-event conformance.
+
+## Resumable batches with GNU Parallel
+
+The normal interface is:
+
+```sh
+task wpt        # Start, or resume unfinished work.
+# Press Ctrl+C to finish active batches and save progress.
+task wpt        # Continue where you stopped.
+task wpt-fresh  # Start over, preserving previous results.
+```
+
+GNU Parallel must be installed (`brew install parallel` on macOS). The task
+builds Zibra, discovers the existing manifest selection, and generates batches
+automatically. There is no extra test list, preparation command, run-directory
+argument, or resume flag to remember. A completed run is followed by a new run
+on the next invocation. Only one automatic run can be active at a time.
+
+Ctrl+C stops dispatching and drains active batches before saving the aggregate
+report. Leave the terminal open until the command finishes. Each batch runs up
+to 25 cases serially, so draining can take time if a test reaches its timeout.
+Workers are isolated from terminal interrupts; repeating Ctrl+C does not kill
+them. Abrupt termination may repeat an unfinished batch on the next run.
+Completed batches with failing CSS assertions remain completed work.
+
+The current run is remembered under `tests/wpt/results`; its generated plan,
+job log and per-batch results are internal run artifacts. Keep them together.
+The dashboard report is written alongside the run directory when the run
+finishes or pauses. `task wpt-fresh` preserves previous runs and changes which
+one will resume. Existing monolithic runs cannot be imported into this log.
+
+Before resuming, the coordinator checks the browser, selection manifest,
+runner files, and WPT checkout metadata (including resources and new files).
+If those changed, it explains that the run cannot resume and asks you to use
+`task wpt-fresh`; it never silently combines different inputs. The checkout
+check uses file size and modification time, not a full content hash of every
+asset, so preserve the checkout while a run is paused. Reports remain readable
+regardless of input changes. Builds and execution happen under the same lock.
+
+GNU Parallel assigns the next pending batch to an available worker. Each batch
+has its own Python process and WPT server, separating image comparison work
+across CPU cores. Results are saved independently; the large aggregate is only
+written when collecting. Completed collection exits 0 even when compatibility
+tests fail; inspect the report summary.
+
+Advanced users can still invoke `batch.py prepare`, `run`, or `collect`
+directly for a separately managed run, custom batch sizes, or focused selection.
+These lower-level commands are not required by `task wpt`.
+
+### SSH workers
+
+GNU Parallel also accepts remote workers through `--sshlogin` and `--workdir`:
+
+```sh
+task wpt WPT_JOBS=4 -- --sshlogin host-a,host-b --workdir /srv/zibra
+```
+
+Provision the repository, WPT checkout/server dependencies, Python, browser
+runtime libraries, and the **same browser binary** on each host first. The
+remote working directory must contain that checkout; the run directory and
+browser paths must be repository-relative. SSH authentication and rsync must
+already work. GNU Parallel transfers the generated plan with `--basefile` and
+captures remote stdout/stderr back on the coordinator; no shared results
+filesystem or manually copied test lists are required. `--jobs` applies per
+host. The first version deliberately requires identical browser binary hashes,
+so use workers with compatible OS/architecture and runtime libraries, rather
+than combining different platform builds into one result.
+
+Workers verify the browser and adapter hashes and selected WPT source hashes.
+Keep the entire WPT checkout (including references/resources) identical and
+unchanged across hosts: these checks do not hash every transitive resource.
+A new build or adapter edit requires a new prepared run. Remote hosts and browser
+dependencies are not installed automatically. Existing monolithic `task wpt`
+runs cannot be adopted into this batch job log.
+
+Scheduler semantics follow the [GNU Parallel manual](https://www.gnu.org/software/parallel/man.html).
+`python3 -m unittest discover -s tests/wpt -p test_batch.py` checks batching,
+collection, corruption handling, and build identity; when GNU Parallel is on
+PATH it also executes local scheduling and resume integration tests. These tests
+use fixture results and do not launch the browser. Remote execution needs an
+explicit SSH-host integration check before relying on a new worker setup.
