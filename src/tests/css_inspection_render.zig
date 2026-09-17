@@ -343,3 +343,62 @@ test "CSS nested mixes repaint inherited currentcolor without rebuilding geometr
     try std.testing.expectEqualDeep(first, coloredBox(commands, blue, 0, 0) orelse return error.MissingBoxPaint);
     try std.testing.expect(coloredBox(commands, red, 0, 0) == null);
 }
+
+test "CSS background origin restyles retained paint without changing geometry" {
+    var page = try inspection.Page.fromHtml(allocator, "<style>#target{display:block;width:100px;height:40px;padding:10px;border:4px solid transparent;" ++
+        "background-image:linear-gradient(lime,lime);background-repeat:no-repeat}</style><div id=target></div>", .{});
+    defer page.deinit();
+    page.repairParentPointers();
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    var engine = try Layout.init(allocator, std.testing.io, &environ, 400, 300, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&page.root);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    const target = &findById(&page.root, "target").?.element;
+    const Case = struct { origin: []const u8, width: i32, offset: i32 };
+    for ([_]Case{
+        .{ .origin = "padding-box", .width = 120, .offset = 4 },
+        .{ .origin = "content-box", .width = 100, .offset = 14 },
+        .{ .origin = "border-box", .width = 128, .offset = 0 },
+    }) |case| {
+        const inline_text = try std.fmt.allocPrint(allocator, "background-origin:{s}", .{case.origin});
+        defer allocator.free(inline_text);
+        const block = try @import("../document/css_declaration_block.zig").create(allocator, inline_text);
+        target.replaceInlineStyle(allocator, block) catch |err| {
+            block.destroy();
+            return err;
+        };
+        dom.dirtyStyleForElement(target);
+        try page.restyle();
+        try std.testing.expect(!document.layoutNeeded());
+        const commands = try engine.paintDocument(document);
+        defer display.DisplayItem.freeList(allocator, commands);
+        const image = gradientImage(commands) orelse return error.MissingGradientPaint;
+        try std.testing.expectEqual(128, image.x2 - image.x1);
+        try std.testing.expectEqual(68, image.y2 - image.y1);
+        try std.testing.expectEqual(case.width, image.tiling.?.width);
+        try std.testing.expectEqual(case.offset, image.tiling.?.offset_x);
+        try std.testing.expectEqual(case.offset, image.tiling.?.offset_y);
+        var bounds = Compositor.init(allocator);
+        defer bounds.deinit();
+        var renderer = Renderer.init(allocator, allocator, std.testing.io, &bounds);
+        var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 200, 120);
+        defer surface.deinit(allocator);
+        const pixels = surface.image_surface_rgba.buf;
+        @memset(pixels, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+        var context = z2d.Context.init(std.testing.io, allocator, &surface);
+        defer context.deinit();
+        // This leaf uses absolute block coordinates and includes the complete
+        // tile geometry; clipping/tiling are exercised by the actual rasterizer.
+        try renderer.drawDisplayItemZ2dContext(&context, .{ .image = image }, 0, 1);
+        const row: usize = @intCast(image.y1 + 30);
+        const left: usize = @intCast(image.x1);
+        try std.testing.expectEqual(@as(u8, 0), pixels[row * 200 + left + @as(usize, @intCast(case.offset))].r);
+        if (case.offset > 0) try std.testing.expectEqual(@as(u8, 255), pixels[row * 200 + left + @as(usize, @intCast(case.offset - 1))].r);
+    }
+}

@@ -483,6 +483,7 @@ pub fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     if (std.mem.eql(u8, property, "background-size")) return background_image.parseSize(raw_value) != null;
     if (std.mem.eql(u8, property, "background-repeat")) return background_image.parseRepeat(raw_value) != null;
     if (std.mem.eql(u8, property, "background-position")) return validBackgroundPosition(raw_value);
+    if (std.mem.eql(u8, property, "background-origin")) return background_image.parseOrigin(raw_value) != null;
     if (std.mem.eql(u8, property, "background-attachment")) return isBackgroundAttachment(raw_value);
     if (std.mem.eql(u8, property, "font-size")) return isNonnegativeLength(raw_value);
     if (std.mem.eql(u8, property, "line-height")) return isSupportedFontLineHeight(raw_value);
@@ -846,6 +847,7 @@ fn expandBackground(
     try putLonghand(map, "background-repeat", .{ .value = repeat, .important = declaration.important });
     try putLonghand(map, "background-position", .{ .value = position, .important = declaration.important });
     try putLonghand(map, "background-attachment", .{ .value = attachment, .important = declaration.important });
+    try putLonghand(map, "background-origin", .{ .value = "padding-box", .important = declaration.important });
     return true;
 }
 

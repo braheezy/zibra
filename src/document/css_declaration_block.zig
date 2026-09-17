@@ -337,6 +337,9 @@ fn shorthandValue(self: *const Block, allocator: std.mem.Allocator, shorthand: p
         return std.mem.join(allocator, " ", components.items);
     }
     if (std.mem.eql(u8, name, "background")) {
+        // Box keywords in the shorthand also set background-clip, which is not
+        // supported yet. Preserve a nondefault origin as separate longhands.
+        if (!std.mem.eql(u8, parts[6], "padding-box")) return allocator.dupe(u8, "");
         return std.fmt.allocPrint(allocator, "{s} {s} / {s} {s} {s} {s}", .{ parts[1], parts[4], parts[2], parts[3], parts[5], parts[0] });
     }
     if (parts.len == 2 and !std.mem.eql(u8, name, "flex-flow") and std.mem.eql(u8, parts[0], parts[1])) return allocator.dupe(u8, parts[0]);
@@ -498,4 +501,30 @@ test "supported shorthand serialization preserves native declarations when repar
             try std.testing.expect(equalDeclaration(value, after.get(name).?));
         }
     }
+}
+
+test "background origin normalization precedence resets and CSSOM round trips" {
+    const allocator = std.testing.allocator;
+    const block = try create(allocator, "background:green; background-origin: C\\6f NTENT-box");
+    defer block.destroy();
+    try std.testing.expectEqualStrings("content-box", block.get("background-origin").?.value);
+    const text = try block.serialize(allocator);
+    defer allocator.free(text);
+    const copy = try create(allocator, text);
+    defer copy.destroy();
+    try std.testing.expectEqualStrings("content-box", copy.get("background-origin").?.value);
+    for ([_][]const u8{ "text", "margin-box", "content-box border-box", "border-box,", ",content-box", "border-box,,content-box" }) |invalid|
+        try std.testing.expect(!try block.setProperty("background-origin", invalid, ""));
+    try std.testing.expect(try block.setProperty("background", "red", ""));
+    try std.testing.expectEqualStrings("padding-box", block.get("background-origin").?.value);
+    try std.testing.expect(try block.setProperty("background-origin", "BORDER-BOX,content-box", ""));
+    try std.testing.expectEqualStrings("border-box, content-box", block.get("background-origin").?.value);
+    const important = try create(allocator, "background-origin:border-box!important; background:green");
+    defer important.destroy();
+    try std.testing.expectEqualStrings("border-box", important.get("background-origin").?.value);
+    const reversed = try create(allocator, "background:green!important; background-origin:content-box");
+    defer reversed.destroy();
+    try std.testing.expectEqualStrings("padding-box", reversed.get("background-origin").?.value);
+    try std.testing.expect(try block.setProperty("background", "inherit", ""));
+    try std.testing.expectEqualStrings("inherit", block.get("background-origin").?.value);
 }

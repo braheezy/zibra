@@ -948,3 +948,29 @@ three false passes become failures when the green squares render. Keep these
 cases selected and track the reference-document limitation separately. The
 HTML pipeline fixture `css-block-aspect-ratio.html` provides an independent exact
 layout baseline without that prerequisite.
+
+### Background positioning areas
+
+`manifest-background-origin.yaml` isolates initial/valid/invalid/computed origin
+values, bitmap origin/size/position reftests, and the background no-repeat
+crashtest. All are already selected by the default `css` directory entry; the
+focused manifest adds no skips or expectation overrides. The pre-change baseline
+was 2/10 cases and 4/19 assertions passing. After implementation, all 19
+assertions and the crashtest pass (5/10 cases). All five visual comparisons
+remain failing and enabled. The unchanged padding-box comparison has exactly
+the same pixel difference as before. Layout inspection also exposes reference
+prerequisites: the content-box test has a 584px body while its inline-block/image
+reference has a 730px body, before comparing background pixels. These results
+are not a claim of full background reftest conformance.
+
+The renderer now positions bitmap and generated backgrounds against border,
+padding or content boxes, including percentage size/position and authored zoom.
+Fixed attachment continues to use the viewport. Origin lists round-trip through
+CSSOM; only the first entry is used by the existing single image layer. Native
+render tests cover live origin changes without relayout and actual software
+pixels. `tests/manual/css-background-origin.html` is the page-level regression.
+
+Multiple image layers, `background-clip`, box keywords in the background
+shorthand, special root/body canvas positioning, and native button box modeling
+remain outside this slice. Shorthand resets include origin, and serialization
+retains nondefault origins as longhands rather than dropping them.

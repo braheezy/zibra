@@ -25,6 +25,7 @@ pub const BackgroundImagePaint = struct {
     gradient_source: ?[]const u8 = null,
     foreground: []const u8 = "black",
     border_radius: f64 = 0,
+    origin: background_image.Origin = .padding_box,
 };
 
 pub fn backgroundImagePaint(element: *const parser.Element) ?BackgroundImagePaint {
@@ -47,6 +48,7 @@ pub fn backgroundImagePaint(element: *const parser.Element) ?BackgroundImagePain
         .gradient_source = gradient,
         .foreground = styleValue(styles, "color") orelse "black",
         .border_radius = @import("box_model.zig").parseCssPixelRadius(styleValue(styles, "border-radius") orelse "0px"),
+        .origin = background_image.parseOrigin(styleValue(styles, "background-origin") orelse "padding-box") orelse .padding_box,
         .size = size,
         .repeat = repeat,
         .position = styleValue(styles, "background-position") orelse "0% 0%",
@@ -108,7 +110,8 @@ pub fn appendBackgroundBox(
 }
 
 /// Paint one positioned background tile clipped to the element's border box.
-/// Used borders are already scaled by layout; the padding box positions tiles.
+/// Used borders and padding are already scaled by layout. Origin selects the
+/// positioning area without shrinking the paint clip.
 /// The raster command retains repetition metadata so small images do not produce
 /// one display command per tile. A fixed attachment resolves its size and
 /// position against the frame viewport but keeps the supplied element box as
@@ -122,6 +125,7 @@ pub fn appendBackgroundImageBox(
     width: i32,
     height: i32,
     border: BoxEdges,
+    padding: BoxEdges,
     viewport_width: i32,
     viewport_height: i32,
     css_scale: f64,
@@ -129,8 +133,18 @@ pub fn appendBackgroundImageBox(
 ) !void {
     if (width <= 0 or height <= 0) return;
     const fixed = paint.attachment == .fixed;
-    const positioning_width = if (fixed) viewport_width else @max(width -| border.left -| border.right, 0);
-    const positioning_height = if (fixed) viewport_height else @max(height -| border.top -| border.bottom, 0);
+    const insets: BoxEdges = switch (paint.origin) {
+        .border_box => .{},
+        .padding_box => border,
+        .content_box => .{
+            .left = border.left +| padding.left,
+            .right = border.right +| padding.right,
+            .top = border.top +| padding.top,
+            .bottom = border.bottom +| padding.bottom,
+        },
+    };
+    const positioning_width = if (fixed) viewport_width else @max(width -| insets.left -| insets.right, 0);
+    const positioning_height = if (fixed) viewport_height else @max(height -| insets.top -| insets.bottom, 0);
     const resolved = if (paint.gradient_source != null) background_image.resolveGeneratedSize(paint.size, positioning_width, positioning_height, css_scale) else background_image.resolveSize(
         paint.size,
         positioning_width,
@@ -172,8 +186,8 @@ pub fn appendBackgroundImageBox(
         .tiling = .{
             .width = resolved.width,
             .height = resolved.height,
-            .offset_x = position.x +| if (fixed) @as(i32, 0) else border.left,
-            .offset_y = position.y +| if (fixed) @as(i32, 0) else border.top,
+            .offset_x = position.x +| if (fixed) @as(i32, 0) else insets.left,
+            .offset_y = position.y +| if (fixed) @as(i32, 0) else insets.top,
             .repeat_x = paint.repeat.x,
             .repeat_y = paint.repeat.y,
             .attachment = paint.attachment,
@@ -245,7 +259,7 @@ fn roundedGradientAllocationCheck(allocator: std.mem.Allocator) !void {
         .attachment = .scroll,
         .gradient_source = "linear-gradient(red, blue)",
         .border_radius = 8,
-    }, 0, 0, 20, 20, .{}, 400, 300, 2, null);
+    }, 0, 0, 20, 20, .{}, .{}, 400, 300, 2, null);
     try std.testing.expectEqual(@as(usize, 1), commands.items.len);
     try std.testing.expect(commands.items[0] == .image);
     try std.testing.expectEqual(@as(f64, 16), commands.items[0].image.clip_radius);
@@ -279,6 +293,7 @@ test "background image paint resolves size and fractional source crop" {
         20,
         100,
         100,
+        .{},
         .{},
         300,
         200,
@@ -319,6 +334,7 @@ test "fixed background images use viewport sizing but retain element clipping" {
         20,
         20,
         .{ .top = 3, .left = 5, .bottom = 3, .right = 5 },
+        .{},
         200,
         100,
         1.0,
@@ -349,7 +365,7 @@ test "CSS background edge positions preserve font zoom negative offsets and clip
         .font_size = 24,
         .repeat = .{ .x = false, .y = false },
         .attachment = .scroll,
-    }, 10, 20, 200, 100, .{ .left = 3, .right = 7, .top = 5, .bottom = 9 }, 800, 600, 2, null);
+    }, 10, 20, 200, 100, .{ .left = 3, .right = 7, .top = 5, .bottom = 9 }, .{}, 800, 600, 2, null);
     const command = commands.items[0].image;
     try std.testing.expectEqual(10, command.x1);
     try std.testing.expectEqual(210, command.x2);
@@ -404,4 +420,58 @@ test "rounded control group constrains child hits without compositing" {
     try std.testing.expect(!grouped.items[0].blend.needs_compositing);
     try std.testing.expect(DisplayItem.hitTestDevice(grouped.items, 50, 20, 1.0) != null);
     try std.testing.expect(DisplayItem.hitTestDevice(grouped.items, 1, 1, 1.0) == null);
+}
+
+test "background origin changes tile size and phase independently of clipping" {
+    const allocator = std.testing.allocator;
+    const Case = struct { origin: background_image.Origin, width: i32, height: i32, x: i32, y: i32 };
+    const cases = [_]Case{
+        .{ .origin = .border_box, .width = 100, .height = 60, .x = 100, .y = 60 },
+        .{ .origin = .padding_box, .width = 90, .height = 50, .x = 95, .y = 54 },
+        .{ .origin = .content_box, .width = 75, .height = 40, .x = 90, .y = 52 },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |fixed| for ([_]bool{ false, true }) |generated| {
+        var commands: std.ArrayList(DisplayItem) = .empty;
+        defer commands.deinit(allocator);
+        defer DisplayItem.freeItems(allocator, commands.items);
+        try appendBackgroundImageBox(&commands, allocator, .{
+            .pixels = &.{ 0, 255, 0, 255 },
+            .source_width = 1,
+            .source_height = 1,
+            .size = .{ .dimensions = .{ .width = .{ .percentage = 50 }, .height = .{ .percentage = 50 } } },
+            .repeat = .{ .x = true, .y = false },
+            .position = "100% 100%",
+            .attachment = if (fixed) .fixed else .scroll,
+            .origin = case.origin,
+            .gradient_source = if (generated) "linear-gradient(red, blue)" else null,
+        }, 30, 40, 200, 120, .{ .left = 5, .right = 15, .top = 4, .bottom = 16 }, .{ .left = 10, .right = 20, .top = 8, .bottom = 12 }, 800, 600, 2, null);
+        const command = commands.items[0].image;
+        try std.testing.expectEqual(30, command.x1);
+        try std.testing.expectEqual(230, command.x2);
+        try std.testing.expectEqual(40, command.y1);
+        try std.testing.expectEqual(160, command.y2);
+        try std.testing.expectEqual(if (fixed) @as(i32, 400) else case.width, command.tiling.?.width);
+        try std.testing.expectEqual(if (fixed) @as(i32, 300) else case.height, command.tiling.?.height);
+        try std.testing.expectEqual(if (fixed) @as(i32, 400) else case.x, command.tiling.?.offset_x);
+        try std.testing.expectEqual(if (fixed) @as(i32, 300) else case.y, command.tiling.?.offset_y);
+        try std.testing.expectEqual(generated, command.gradient != null);
+    };
+}
+
+test "empty background content area does not publish a generated image" {
+    var commands: std.ArrayList(DisplayItem) = .empty;
+    defer commands.deinit(std.testing.allocator);
+    defer DisplayItem.freeItems(std.testing.allocator, commands.items);
+    try appendBackgroundImageBox(&commands, std.testing.allocator, .{
+        .pixels = &.{},
+        .source_width = 1,
+        .source_height = 1,
+        .size = .cover,
+        .repeat = .{ .x = true, .y = true },
+        .position = "center",
+        .attachment = .scroll,
+        .origin = .content_box,
+        .gradient_source = "linear-gradient(red, blue)",
+    }, 0, 0, 10, 10, .{}, .{ .left = 10, .right = 10 }, 800, 600, 1, null);
+    try std.testing.expectEqual(0, commands.items.len);
 }

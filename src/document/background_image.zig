@@ -3,6 +3,33 @@
 const std = @import("std");
 const length = @import("length.zig");
 
+/// The single background layer's positioning area; independent of its paint clip.
+pub const Origin = enum {
+    border_box,
+    padding_box,
+    content_box,
+};
+
+/// Validate the box list and return the first layer's origin. Additional entries
+/// are retained by CSSOM but unused while the renderer has one image layer.
+pub fn parseOrigin(input: []const u8) ?Origin {
+    var entries = std.mem.splitScalar(u8, input, ',');
+    var first: ?Origin = null;
+    while (entries.next()) |entry| {
+        const value = std.mem.trim(u8, entry, " \t\r\n\x0c");
+        const origin: Origin = if (std.ascii.eqlIgnoreCase(value, "border-box"))
+            .border_box
+        else if (std.ascii.eqlIgnoreCase(value, "padding-box"))
+            .padding_box
+        else if (std.ascii.eqlIgnoreCase(value, "content-box"))
+            .content_box
+        else
+            return null;
+        if (first == null) first = origin;
+    }
+    return first;
+}
+
 pub const SizeComponent = union(enum) {
     auto,
     pixels: f64,
@@ -267,4 +294,12 @@ test "background repeat and position resolve the supported single layer" {
         ResolvedPosition{ .x = 96, .y = 0 },
         resolvePosition("25.4mm 0", 200, 40, 2, 2, 1.0, 16),
     );
+}
+
+test "background origin lists validate every layer and use the first" {
+    try std.testing.expectEqual(Origin.border_box, parseOrigin("border-box, content-box").?);
+    try std.testing.expectEqual(Origin.content_box, parseOrigin("CONTENT-BOX , padding-box, border-box").?);
+    try std.testing.expect(parseOrigin("border-box, nonsense") == null);
+    try std.testing.expect(parseOrigin("padding-box,") == null);
+    try std.testing.expect(parseOrigin("") == null);
 }

@@ -1,0 +1,26 @@
+<!doctype html>
+<!-- How to verify: each green rectangle starts at its labeled box edge.
+     Press Cycle origin: the live green rectangle changes size and position,
+     but its border geometry stays fixed. The status must say PASS. -->
+<title>Background positioning areas</title>
+<style>
+body { background:white; color:black; font:16px sans-serif }
+.sample { width:200px; height:40px; padding:16px; border:8px solid rgba(0,0,0,.25);
+  margin-bottom:12px; background-image:linear-gradient(lime,lime); background-repeat:no-repeat }
+#border { background-origin:border-box }
+#content { background-origin:content-box }
+</style>
+<h1>Background positioning areas</h1>
+<p>Border box / padding box / content box:</p>
+<div class=sample id=border></div><div class=sample></div><div class=sample id=content></div>
+<button id=cycle>Cycle origin</button><p id=status>Checking</p><div class=sample id=live></div>
+<script>
+var choices=['padding-box','content-box','border-box'], index=0;
+var live=document.getElementById('live'), statusNode=document.getElementById('status');
+function check(){
+ var box=live.getBoundingClientRect();
+ statusNode.textContent=(getComputedStyle(live).backgroundOrigin===choices[index] && box.width===248 && box.height===88 ? 'PASS: ' : 'FAIL: ')+choices[index];
+}
+document.getElementById('cycle').onclick=function(){index=(index+1)%3;live.style.backgroundOrigin=choices[index];check();};
+check();
+</script>

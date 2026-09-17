@@ -1,0 +1,14 @@
+# Background positioning areas: CSSOM lists and single-layer image rendering.
+tests:
+  - css/css-backgrounds/background-origin-001.html
+  - css/css-backgrounds/parsing/background-origin-valid.html
+  - css/css-backgrounds/parsing/background-origin-invalid.html
+  - css/css-backgrounds/parsing/background-origin-computed.html
+reftests:
+  - css/css-backgrounds/background-origin/origin-border-box.html
+  - css/css-backgrounds/background-origin/origin-padding-box.html
+  - css/css-backgrounds/background-origin/origin-content-box.html
+  - css/css-backgrounds/background-origin/origin-content-box_with_size.html
+  - css/css-backgrounds/background-origin/origin-border-box_with_position.html
+crashtests:
+  - css/css-backgrounds/crashtests/background-norepeat.html

@@ -159,7 +159,7 @@ test "rounded gradient image clipping preserves previously painted content" {
         .attachment = .scroll,
         .gradient_source = "linear-gradient(red)",
         .border_radius = 8,
-    }, 0, 0, 20, 20, .{}, 400, 300, 1, null);
+    }, 0, 0, 20, 20, .{}, .{}, 400, 300, 1, null);
     var bounds = DisplayCompositor.init(allocator);
     defer bounds.deinit();
     var renderer = Renderer.init(allocator, allocator, std.testing.io, &bounds);

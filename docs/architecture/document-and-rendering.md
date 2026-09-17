@@ -907,9 +907,16 @@ Pure layout leaves are intentionally separated from retained object state:
   DOM or layout pointers; and
 - `render/replaced_paint.zig` constructs background and rounded-control
   command leaves/groups whose pixels and provenance remain borrowed from the
-  current generation. Layout passes already-scaled used border widths for
-  ordinary background image positioning within the padding box; the paint
-  clip remains the border box. Fixed backgrounds retain viewport positioning.
+  current generation. Layout passes already-scaled used border and padding widths;
+  `background-origin` selects the border, padding or content positioning box
+  for bitmap and generated images. Percent sizes and positions use that box,
+  while the paint clip remains the border box. Fixed backgrounds ignore origin
+  and retain viewport positioning. Style changes invalidate retained paint
+  without invalidating geometry. CSSOM preserves origin lists; the single image
+  layer uses their first entry. Background shorthand resets origin but still
+  rejects box keywords because their coupled background-clip behavior is not
+  implemented. Root/body canvas propagation and native button box modeling
+  retain their existing limitations.
 
 These modules must not register ProtectedField dependencies or acquire
 Browser/Frame ownership. Methods that mutate parent/previous links, dirty

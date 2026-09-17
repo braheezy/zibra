@@ -83,9 +83,10 @@ boundaries.
   leaves/groups and owning editor clips without owning layout objects.
   Background attachment selects an element-local or viewport-local tile phase
   while the command rectangle
-  remains the element clip. Pass layout's used border widths so ordinary
-  images are positioned within the padding box. Its image pixels and provenance
-  are generation-scoped borrows until snapshot. Generated background images own
+  remains the element clip. Pass layout's used border and padding widths so
+  `background-origin` selects the image positioning area independently of its
+  clip. Its image pixels and provenance are generation-scoped borrows until
+  snapshot. Generated background images own
   scalar gradient stops; clone that owner at every command materialization.
 - `paint_effects.zig` resolves scalar block effects from live style and wraps
   owned command slices in blur, clip, blend, transform, position, and scroll
