@@ -199,13 +199,17 @@ pub fn FrameType(
         /// after the style phase clears this boundary; teardown deliberately uses
         /// `lastValue()` to retire the previous owning layout pointer.
         document: ProtectedField(?*Layout.DocumentLayout),
-        /// Browser-chrome scrollbar choice from the last successful layout
+        /// Viewport overflow policy from the last successful layout
         /// generation. This deliberately survives a subsequent style
         /// invalidation: presentation commits must never inspect live computed
         /// style while `document` is dirty.
-        viewport_scrollbar_visible: bool = true,
+        viewport_overflow: @import("../document/css_overflow.zig").Pair = .{ .x = .auto, .y = .auto },
         display_list: ?[]DisplayItem = null,
         content_height: i32 = 0,
+        content_width: i32 = 0,
+        scrollport_width: i32 = 0,
+        scrollport_height: i32 = 0,
+        scroll_x: i32 = 0,
         scroll: i32 = 0,
         // Worker-owned viewport animation. Root-frame steps commit only a new
         // scalar scroll offset; child-frame steps currently require recomposition
@@ -298,18 +302,18 @@ pub fn FrameType(
             self.document.mark();
         }
 
-        /// Publish the root viewport scrollbar choice after a successful layout
+        /// Publish the viewport overflow pair after a successful layout
         /// generation. The caller must have resolved the root's computed style
         /// while the document phase was clean.
-        pub fn publishViewportScrollbarVisibility(self: *Frame, visible: bool) void {
-            self.viewport_scrollbar_visible = visible;
+        pub fn publishViewportOverflow(self: *Frame, policy: @import("../document/css_overflow.zig").Pair) void {
+            self.viewport_overflow = policy;
         }
 
         /// Return the last layout generation's browser-chrome scrollbar choice.
         /// Unlike computed style, this scalar remains readable while a later
         /// DOM or hover change has made the document's style phase dirty.
         pub fn committedViewportScrollbarVisible(self: *const Frame) bool {
-            return self.viewport_scrollbar_visible;
+            return self.viewport_overflow.y.allowsUserScroll();
         }
 
         pub fn updateHoveredNode(self: *Frame, node: ?*Node) bool {
@@ -359,7 +363,7 @@ pub fn FrameType(
             if (self.document.dirty) return false;
             const document = self.documentLayout() orelse return false;
             if (document.layoutNeeded()) return false;
-            return document.updateSticky(self.scroll);
+            return document.updateStickyAxes(self.scroll_x, self.scroll);
         }
 
         /// Finish a style pass performed by a navigation path before it enters
@@ -910,7 +914,7 @@ pub fn FrameType(
             while (current) |node| {
                 switch (node.*) {
                     .element => |element| {
-                        if (element.scroll_container and element.scroll_interactive) return node;
+                        if (element.allowsUserScroll(.x) or element.allowsUserScroll(.y)) return node;
                         current = element.parent;
                     },
                     .text => |text| current = text.parent,
@@ -943,6 +947,8 @@ pub fn FrameType(
             self: *Frame,
             device_x: i32,
             device_y: i32,
+            viewport_x: i32,
+            viewport_y: i32,
             zoom: f32,
         ) ?*Node {
             // Root-frame input arrives in page coordinates, but a fixed
@@ -951,13 +957,12 @@ pub fn FrameType(
             // block can paint its background below a float and its inline
             // descendants above it, which one structural box cannot express.
             if (self.display_list) |items| {
-                const frame_viewport_y = device_y -|
-                    DisplayItem.scaleLayoutPx(self.scroll, zoom);
                 if (DisplayItem.hitTestFrameViewportDevice(
                     items,
                     device_x,
                     device_y,
-                    frame_viewport_y,
+                    viewport_x,
+                    viewport_y,
                     zoom,
                 )) |hit| {
                     if (hit.source.originatingNode()) |node| {
@@ -1000,10 +1005,12 @@ pub fn FrameType(
             self: *Frame,
             device_x: i32,
             device_y: i32,
+            viewport_x: i32,
+            viewport_y: i32,
             zoom: f32,
             path: *std.ArrayList(FrameHoverTarget),
         ) !void {
-            const target = self.hoverHitNodeDevice(device_x, device_y, zoom) orelse return;
+            const target = self.hoverHitNodeDevice(device_x, device_y, viewport_x, viewport_y, zoom) orelse return;
             try path.append(self.allocator, .{ .frame = self, .node = target });
 
             const element = switch (target.*) {
@@ -1014,10 +1021,10 @@ pub fn FrameType(
 
             const child = self.findFrameByElement(target) orelse return;
             const bounds = self.iframeBoundsForNode(target) orelse return;
-            const child_x = device_x -| DisplayItem.scaleLayoutPx(bounds.x, zoom);
+            const child_x = device_x -| DisplayItem.scaleLayoutPx(bounds.x -| child.scroll_x, zoom);
             const child_origin_y = bounds.y -| child.scroll;
             const child_y = device_y -| DisplayItem.scaleLayoutPx(child_origin_y, zoom);
-            try child.collectHoverPathDevice(child_x, child_y, zoom, path);
+            try child.collectHoverPathDevice(child_x, child_y, device_x -| DisplayItem.scaleLayoutPx(bounds.x, zoom), device_y -| DisplayItem.scaleLayoutPx(bounds.y, zoom), zoom, path);
         }
 
         pub fn click(self: *Frame, b: *Browser, x: i32, y: i32, button: ClickButton) !bool {
@@ -1039,9 +1046,13 @@ pub fn FrameType(
             button: ClickButton,
             zoom: f32,
         ) !bool {
+            return self.clickDeviceInViewport(b, device_x, device_y, device_x -| DisplayItem.scaleLayoutPx(self.scroll_x, zoom), device_y -| DisplayItem.scaleLayoutPx(self.scroll, zoom), button, zoom);
+        }
+
+        // Parent frames supply independently localized viewport and content
+        // points so fractional zoom never rounds scroll cancellation twice.
+        fn clickDeviceInViewport(self: *Frame, b: *Browser, device_x: i32, device_y: i32, viewport_x: i32, viewport_y: i32, button: ClickButton, zoom: f32) !bool {
             const items = self.display_list orelse return false;
-            const frame_viewport_y = device_y -|
-                DisplayItem.scaleLayoutPx(self.scroll, zoom);
             // Keep regular document-attached commands on their established
             // path, but give fixed controls a chance to resolve using the
             // unscrolled frame viewport before layout falls back to page space.
@@ -1049,7 +1060,8 @@ pub fn FrameType(
                 items,
                 device_x,
                 device_y,
-                frame_viewport_y,
+                viewport_x,
+                viewport_y,
                 zoom,
             ) orelse DisplayItem.hitTestDevice(items, device_x, device_y, zoom) orelse return false;
             const layout_hit = if (!self.document.dirty)
@@ -1075,14 +1087,14 @@ pub fn FrameType(
                     };
                     if (self.findFrameByElement(candidate.node)) |child| {
                         if (button == .primary) self.tab.focused_frame = child;
-                        const child_x = hit.device_x -| DisplayItem.scaleLayoutPx(rect.left, zoom);
+                        const child_x = hit.device_x -| DisplayItem.scaleLayoutPx(rect.left -| child.scroll_x, zoom);
                         // Composition applies one translation for
                         // `iframe_top - child_scroll`; scale that combined CSS
                         // offset once so fractional truncation matches the pixels
                         // the user clicked.
                         const child_origin_y = rect.top -| child.scroll;
                         const child_y = hit.device_y -| DisplayItem.scaleLayoutPx(child_origin_y, zoom);
-                        _ = try child.clickDevice(b, child_x, child_y, button, zoom);
+                        _ = try child.clickDeviceInViewport(b, child_x, child_y, hit.device_x -| DisplayItem.scaleLayoutPx(rect.left, zoom), hit.device_y -| DisplayItem.scaleLayoutPx(rect.top, zoom), button, zoom);
                     }
                     return true;
                 }

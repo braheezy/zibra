@@ -60,6 +60,11 @@ const Page = struct {
     }
 
     fn set(self: *Page, id: []const u8, property: []const u8, value: []const u8) void {
+        if (std.mem.eql(u8, property, "overflow")) {
+            self.set(id, "overflow-x", value);
+            self.set(id, "overflow-y", value);
+            return;
+        }
         self.node(id).element.style.?.getPtr(property).?.set(value);
     }
 

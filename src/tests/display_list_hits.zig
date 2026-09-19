@@ -182,6 +182,38 @@ test "blurred pixels do not expand the element hit target" {
     try std.testing.expect(DisplayItem.hitTest(&items, 7, 15, 1.0) == null);
 }
 
+test "retained axis clips preserve visible overflow hits and the stationary border target" {
+    const allocator = std.testing.allocator;
+    var shell: u8 = 0;
+    var content: u8 = 0;
+    for ([_][2]bool{ .{ true, false }, .{ false, true } }) |axes| {
+        var children = [_]DisplayItem{rect(0, 0, 60, 60, source(&content, null))};
+        const commands = [_]DisplayItem{
+            rect(0, 0, 40, 40, source(&shell, null)),
+            .{ .blend = .{
+                .opacity = 1,
+                .blend_mode = null,
+                .children = &children,
+                .overflow_clip = .{
+                    .x1 = 10,
+                    .y1 = 10,
+                    .x2 = 30,
+                    .y2 = 30,
+                    .clip_x = axes[0],
+                    .clip_y = axes[1],
+                },
+            } },
+        };
+        const retained = try @import("../browser/render/retained_commands.zig").cloneList(allocator, &commands);
+        defer DisplayItem.freeList(allocator, retained);
+        const border_hit = DisplayItem.hitTest(retained, if (axes[0]) 5 else 20, if (axes[1]) 5 else 20, 1).?;
+        try std.testing.expectEqual(@intFromPtr(&shell), @intFromPtr(border_hit.source.layout));
+        const outside_hit = DisplayItem.hitTest(retained, if (axes[0]) 20 else 50, if (axes[1]) 20 else 50, 1).?;
+        try std.testing.expectEqual(@intFromPtr(&content), @intFromPtr(outside_hit.source.layout));
+        try std.testing.expect(DisplayItem.hitTest(retained, if (axes[0]) 50 else 20, if (axes[1]) 50 else 20, 1) == null);
+    }
+}
+
 test "device hit testing matches truncating raster edges at fractional zoom" {
     var generator: u8 = 0;
     const item_source = source(&generator, null);
@@ -372,6 +404,7 @@ test "simultaneous transform and opacity commit is draw-only" {
     test_browser.active_tab_committed_url = null;
     test_browser.active_tab_committed_security = .none;
     test_browser.active_tab_scroll = 0;
+    test_browser.active_tab_scroll_x = 0;
     test_browser.active_tab_height = 100;
     test_browser.active_tab_show_scrollbar = true;
     test_browser.active_tab_zoom = 1.0;
@@ -406,13 +439,19 @@ test "simultaneous transform and opacity commit is draw-only" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.4), display_list[0].transform.children[0].blend.opacity, 0.000001);
 }
 
-test "root scrolling inside the interest region is draw-only" {
+test "root scroll input preserves y cache but rerasterizes x and respects axis policy" {
     const allocator = std.testing.allocator;
     var tab: tab_module.Tab = undefined;
-    var frame: tab_module.Frame = undefined;
+    initClickTab(&tab, allocator);
+    defer deinitClickTab(&tab);
+    var frame = tab_module.Frame.init(allocator, &tab, null, null);
+    defer frame.deinit();
     frame.scroll = 0;
     frame.content_height = 5000;
     frame.viewport_height = 534;
+    frame.content_width = 1200;
+    frame.scrollport_width = 400;
+    frame.publishViewportOverflow(.{ .x = .auto, .y = .auto });
     tab.root_frame = &frame;
     tab.focused_frame = null;
     tab.tab_height = 534;
@@ -427,6 +466,7 @@ test "root scrolling inside the interest region is draw-only" {
     try test_browser.tabs.append(allocator, &tab);
     test_browser.active_tab_index = 0;
     test_browser.active_tab_scroll = 0;
+    test_browser.active_tab_scroll_x = 0;
     test_browser.active_tab_height = 5000;
     test_browser.active_tab_zoom = 1.0;
     test_browser.window_height = 600;
@@ -446,6 +486,7 @@ test "root scrolling inside the interest region is draw-only" {
     test_browser.handleScrollForTab(&stale_tab, 100);
     try std.testing.expectEqual(@as(i32, 0), frame.scroll);
     try std.testing.expectEqual(@as(i32, 0), test_browser.active_tab_scroll);
+    try std.testing.expect(!tab.pending_hover);
 
     test_browser.handleScroll(100);
     try std.testing.expectEqual(@as(i32, 100), frame.scroll);
@@ -453,6 +494,29 @@ test "root scrolling inside the interest region is draw-only" {
     try std.testing.expect(!test_browser.needs_composite);
     try std.testing.expect(!test_browser.needs_raster);
     try std.testing.expect(test_browser.needs_draw);
+    try std.testing.expect(tab.pending_hover);
+
+    tab.pending_hover = false;
+    test_browser.handleViewportScrollForTab(&stale_tab, &frame, 100, 100);
+    try std.testing.expectEqual(@as(i32, 0), frame.scroll_x);
+    try std.testing.expectEqual(@as(i32, 100), frame.scroll);
+    try std.testing.expect(!tab.pending_hover);
+    test_browser.handleViewportScrollForTab(&tab, &frame, 2000, 0);
+    try std.testing.expectEqual(@as(i32, 800), frame.scroll_x);
+    try std.testing.expectEqual(@as(i32, 800), test_browser.active_tab_scroll_x);
+    try std.testing.expectEqual(@as(i32, 100), frame.scroll);
+    try std.testing.expect(test_browser.needs_raster);
+    try std.testing.expect(!test_browser.needs_composite);
+    try std.testing.expect(tab.pending_hover);
+
+    test_browser.needs_raster = false;
+    tab.pending_hover = false;
+    frame.publishViewportOverflow(.{ .x = .hidden, .y = .hidden });
+    test_browser.handleViewportScrollForTab(&tab, &frame, -100, 100);
+    try std.testing.expectEqual(@as(i32, 800), frame.scroll_x);
+    try std.testing.expectEqual(@as(i32, 100), frame.scroll);
+    try std.testing.expect(!test_browser.needs_raster);
+    try std.testing.expect(!tab.pending_hover);
 }
 
 test "layout origin validates the fragment used for activation" {
@@ -532,6 +596,7 @@ fn initQueueBrowser(
     result.lock = .init(std.testing.io);
     result.tabs = .empty;
     result.active_tab_index = null;
+    result.active_tab_scroll_x = 0;
     result.shutting_down = false;
     result.animation_timer_active = false;
     result.needs_animation_frame = false;
@@ -642,7 +707,7 @@ test "structural mutation retires a painted link before DOM removal" {
     link.element.is_focused = true;
     link.element.is_focus_visible = true;
     frame.focus = link;
-    link.element.setScrollGeometry(true, 20, 80);
+    link.element.setScrollGeometry(.{ .x = .auto, .y = .auto }, true, .{ .client_height = 20, .content_height = 80 });
     frame.scroll_focus = link;
 
     var current_url = try Url.init(allocator, "https://example.com/page.html");
@@ -942,8 +1007,8 @@ test "primary painted click focuses the innermost scroll container" {
     const outer = divs.items[0];
     const inner = divs.items[1];
     const painted_node = painted orelse return error.TestPaintedNodeMissing;
-    outer.element.setScrollGeometry(true, 100, 300);
-    inner.element.setScrollGeometry(true, 50, 200);
+    outer.element.setScrollGeometry(.{ .x = .auto, .y = .auto }, true, .{ .client_height = 100, .content_height = 300 });
+    inner.element.setScrollGeometry(.{ .x = .auto, .y = .auto }, true, .{ .client_height = 50, .content_height = 200 });
 
     var tab: tab_module.Tab = undefined;
     initClickTab(&tab, allocator);
@@ -962,7 +1027,7 @@ test "primary painted click focuses the innermost scroll container" {
     try std.testing.expect(frame.scroll_focus == inner);
     try std.testing.expect(tab.focused_frame == &frame);
 
-    inner.element.setScrollGeometry(false, 0, 0);
+    inner.element.setScrollGeometry(.{}, false, .{});
     try std.testing.expect(try frame.clickDevice(&unused_browser, 10, 10, .primary, 1.0));
     try std.testing.expect(frame.scroll_focus == outer);
 }
@@ -1168,6 +1233,22 @@ test "iframe display hit translates into the child frame list" {
     child_list[0] = rect(0, 2, 4, 4, source(&child_generator, link));
     try std.testing.expect(try parent.clickDevice(&test_browser, 1, 1, .middle, 0.75));
     try std.testing.expectEqual(@as(usize, 2), test_browser.pending_new_tabs.items.len);
+
+    // Fixed child content starts at the iframe viewport, independently of the
+    // rounded document-scroll translation used for its ordinary descendants.
+    parent_list[0].iframe.rect = .{ .left = 3, .top = 3, .right = 20, .bottom = 20 };
+    child.scroll_x = 1;
+    child.scroll = 1;
+    const fixed_children = try allocator.alloc(DisplayItem, 1);
+    fixed_children[0] = rect(0, 0, 2, 2, source(&child_generator, link));
+    child_list[0] = .{ .transform = .{
+        .translate_x = 0,
+        .translate_y = 0,
+        .scroll_attachment = .frame_viewport,
+        .children = fixed_children,
+    } };
+    try std.testing.expect(try parent.clickDevice(&test_browser, 2, 2, .middle, 0.75));
+    try std.testing.expectEqual(@as(usize, 3), test_browser.pending_new_tabs.items.len);
 }
 
 test "activating a clean tab republishes its retained list and committed URL" {

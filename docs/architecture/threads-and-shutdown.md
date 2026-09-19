@@ -81,6 +81,15 @@ They carry only numeric tab identity; a dirty newer generation, identity/window
 mismatch, or shutdown discards them. Accepted surface ownership moves to the UI
 thread together with its allocator. Browser alone uploads it and presents.
 
+Horizontal viewport position is copied into each task and result and retained
+with the worker cache. A changed X invalidates the viewport-width raster, even
+when Y stays within its vertical interest region. Draw-only work rejects a
+cache at a different X, and both result publication and presentation reject an
+older X. Nonzero horizontal origins use the assembled surface path; the
+existing vertical cache remains bounded. The worker reads no live Frame or
+computed overflow fields. Fixed groups discard both root origins; child-frame
+fixed groups are rebased during composition to cancel only the child's scroll.
+
 ### Audio workers
 
 The session also owns a serialized media loader and one lazy native output

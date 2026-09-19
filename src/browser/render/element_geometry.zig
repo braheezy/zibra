@@ -25,6 +25,9 @@ pub const Fragment = struct {
 };
 
 pub const Metrics = struct {
+    /// A zero-sized box still exists; distinguish it from display:none or a
+    /// missing fragment before using persistent Element scroll state.
+    has_box: bool = false,
     client: Rect = .{},
     offset_x: f64 = 0,
     offset_y: f64 = 0,
@@ -157,6 +160,7 @@ pub fn measureMetrics(document: anytype, target: *dom.Node, frame_zoom: f32, vie
     var result = Metrics{};
     if (hidden(target)) return result;
     const own = (try firstBox(document, target, allocator)) orelse return result;
+    result.has_box = true;
     const zoom = box_model.effectiveCssZoomForNode(target);
     const scale: f64 = 1.0 / (frame_zoom * zoom);
     if (own.client_insets orelse own.border) |border| {
@@ -197,6 +201,11 @@ pub fn measureMetrics(document: anytype, target: *dom.Node, frame_zoom: f32, vie
 /// is a static numeric snapshot in the owning frame's CSS viewport; it never
 /// includes native chrome or raster/accessibility scaling.
 pub fn collect(document: anytype, target: *dom.Node, frame_zoom: f32, scroll_y: i32, unscaled: bool, allocator: std.mem.Allocator, out: *std.ArrayList(Rect)) !void {
+    return collectScrolled(document, target, frame_zoom, 0, scroll_y, unscaled, allocator, out);
+}
+
+/// Copy current rectangles with both viewport offsets removed. No layout borrow escapes.
+pub fn collectScrolled(document: anytype, target: *dom.Node, frame_zoom: f32, scroll_x: i32, scroll_y: i32, unscaled: bool, allocator: std.mem.Allocator, out: *std.ArrayList(Rect)) !void {
     std.debug.assert(!document.layoutNeeded());
     if (hidden(target)) return;
     var fragments = std.ArrayList(Fragment).empty;
@@ -223,7 +232,10 @@ pub fn collect(document: anytype, target: *dom.Node, frame_zoom: f32, scroll_y: 
             }
             if (std.mem.eql(u8, style(element, "position"), "fixed")) fixed = true;
         }
-        if (!fixed) dy -= @floatFromInt(scroll_y);
+        if (!fixed) {
+            dx -= @floatFromInt(scroll_x);
+            dy -= @floatFromInt(scroll_y);
+        }
     }
     for (fragments.items) |fragment| try out.append(allocator, fragment.rect.translated(dx, dy).scaled(scale));
 }

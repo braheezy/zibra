@@ -588,8 +588,8 @@ test "nested element scrolling clamps and bubbles at container boundaries" {
 
     const outer_node = outer orelse return error.TestOuterMissing;
     const inner_node = inner orelse return error.TestInnerMissing;
-    outer_node.element.setScrollGeometry(true, 200, 600);
-    inner_node.element.setScrollGeometry(true, 100, 350);
+    outer_node.element.setScrollGeometry(.{ .x = .auto, .y = .auto }, true, .{ .client_width = 0, .content_width = 0, .client_height = 200, .content_height = 600 });
+    inner_node.element.setScrollGeometry(.{ .x = .auto, .y = .auto }, true, .{ .client_width = 0, .content_width = 0, .client_height = 100, .content_height = 350 });
 
     try std.testing.expect(tab_module.scrollElementChain(inner_node, 100));
     try std.testing.expectEqual(@as(i32, 100), inner_node.element.scroll_y);
@@ -610,11 +610,50 @@ test "nested element scrolling clamps and bubbles at container boundaries" {
 
     // A new layout generation preserves but clamps the persistent offset.
     inner_node.element.scroll_y = 200;
-    inner_node.element.setScrollGeometry(true, 100, 140);
+    inner_node.element.setScrollGeometry(.{ .x = .auto, .y = .auto }, true, .{ .client_width = 0, .content_width = 0, .client_height = 100, .content_height = 140 });
     try std.testing.expectEqual(@as(i32, 40), inner_node.element.scroll_y);
-    inner_node.element.setScrollGeometry(false, 0, 0);
+    inner_node.element.setScrollGeometry(.{}, true, .{ .client_width = 0, .content_width = 0, .client_height = 0, .content_height = 0 });
     try std.testing.expect(!inner_node.element.scroll_container);
     try std.testing.expectEqual(@as(i32, 0), inner_node.element.scroll_y);
+}
+
+test "overflow input chains each axis independently and skips hidden axes" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser_module.HTMLParser.init(allocator, "<div><div></div></div>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser_module.fixParentPointers(&root, null);
+    const inner = &root.element.children.items[0];
+    const dimensions = @import("../document/dom.zig").ScrollGeometry{
+        .client_width = 100,
+        .content_width = 400,
+        .client_height = 100,
+        .content_height = 300,
+    };
+    root.element.setScrollGeometry(.{ .x = .auto, .y = .auto }, true, dimensions);
+    inner.element.setScrollGeometry(.{ .x = .auto, .y = .clip }, true, dimensions);
+    const first = tab_module.scrollElementAxes(inner, 150, 40);
+    try std.testing.expect(first.x and first.y);
+    try std.testing.expectEqual(@as(i32, 150), inner.element.scroll_x);
+    try std.testing.expectEqual(@as(i32, 0), inner.element.scroll_y);
+    try std.testing.expectEqual(@as(i32, 0), root.element.scroll_x);
+    try std.testing.expectEqual(@as(i32, 40), root.element.scroll_y);
+
+    inner.element.setScrollGeometry(.{ .x = .hidden, .y = .clip }, true, dimensions);
+    try std.testing.expect(inner.element.scrollTo(200, 20));
+    const second = tab_module.scrollElementAxes(inner, 30, 50);
+    try std.testing.expect(second.x and second.y);
+    try std.testing.expectEqual(@as(i32, 200), inner.element.scroll_x);
+    try std.testing.expectEqual(@as(i32, 0), inner.element.scroll_y);
+    try std.testing.expectEqual(@as(i32, 30), root.element.scroll_x);
+    try std.testing.expectEqual(@as(i32, 90), root.element.scroll_y);
+
+    try std.testing.expectEqual(@as(i32, 100), browser.wheelHorizontalScrollDelta(1, false));
+    try std.testing.expectEqual(@as(i32, -100), browser.wheelHorizontalScrollDelta(1, true));
+    try std.testing.expectEqual(std.math.maxInt(i32), browser.wheelHorizontalScrollDelta(std.math.maxInt(i32), false));
+    try std.testing.expectEqual(std.math.minInt(i32), browser.wheelHorizontalScrollDelta(std.math.minInt(i32), false));
 }
 
 test "address input inserts at the cursor and backspace deletes before it" {

@@ -103,6 +103,14 @@ into either leaf module.
 - `Frame.document` is a protected style-phase guard. A dirty value cannot be
   read by layout or hit testing. Successful style/resource processing
   republishes it before `DocumentLayout.layoutNeeded()` gates geometry.
+- Frame viewport overflow is a copied pair from the last successful layout.
+  Commits and user-input policy checks must not read dirty computed fields.
+  Wheel axes are queued as scalars and resolved against the current hovered
+  frame on the Tab worker; each axis chains independently. See the
+  [geometry contract](../../docs/architecture/javascript-and-accessibility.md#javascript-element-geometry).
+- Root horizontal scrolling invalidates the viewport-width raster. Preserve
+  its X origin through tasks, cache state and result acceptance; a vertical
+  interest-region hit alone cannot validate pixels painted at another X.
 - Do not reintroduce tab-wide `needs_style` or `needs_layout`. Paint remains
   independent; compositor-only opacity/translation should avoid all three
   full phases.

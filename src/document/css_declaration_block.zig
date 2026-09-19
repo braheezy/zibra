@@ -300,6 +300,55 @@ test "gradient declaration clones preserve fractional operands beyond CSSOM pres
     try std.testing.expectEqualStrings(block.get("background-image").?.value, copy.get("background-image").?.value);
 }
 
+test "overflow shorthand preserves specified pairs priorities and pending substitution" {
+    const allocator = std.testing.allocator;
+    const block = try create(allocator, "overflow:visible scroll;overflow-x:clip!important;overflow:auto hidden");
+    defer block.destroy();
+    try std.testing.expectEqualStrings("clip", block.get("overflow-x").?.value);
+    try std.testing.expectEqualStrings("hidden", block.get("overflow-y").?.value);
+    const mixed = try block.propertyValue(allocator, "overflow");
+    defer allocator.free(mixed);
+    try std.testing.expectEqualStrings("", mixed);
+    try std.testing.expect(try block.setProperty("overflow", "visible scroll", ""));
+    const specified = try block.propertyValue(allocator, "overflow");
+    defer allocator.free(specified);
+    try std.testing.expectEqualStrings("visible scroll", specified);
+    try std.testing.expect(!try block.setProperty("overflow", "auto clip hidden", ""));
+    try std.testing.expect(try block.setProperty("overflow", "overlay", ""));
+    const alias = try block.propertyValue(allocator, "overflow");
+    defer allocator.free(alias);
+    try std.testing.expectEqualStrings("auto", alias);
+    try std.testing.expect(try block.setProperty("overflow", "var(--axes)", "important"));
+    const pending = try block.propertyValue(allocator, "overflow");
+    defer allocator.free(pending);
+    try std.testing.expectEqualStrings("var(--axes)", pending);
+    try std.testing.expect(block.propertyImportant("overflow"));
+    try std.testing.expect(try block.setProperty("overflow-y", "clip", ""));
+    const partial = try block.propertyValue(allocator, "overflow");
+    defer allocator.free(partial);
+    try std.testing.expectEqualStrings("", partial);
+    try std.testing.expect(block.removeProperty("overflow"));
+    try std.testing.expectEqual(@as(usize, 0), block.count());
+}
+
+test "overflow declaration clone and CSSOM mutation clean up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const block = try create(allocator, "overflow:var(--axes)!important;overflow-x:clip");
+            defer block.destroy();
+            const copy = try block.clone(allocator);
+            defer copy.destroy();
+            _ = try copy.setProperty("overflow", "overlay clip", "");
+            const serialized = try copy.serialize(allocator);
+            defer allocator.free(serialized);
+            const reparsed = try create(allocator, serialized);
+            defer reparsed.destroy();
+            try std.testing.expectEqualStrings("auto", reparsed.get("overflow-x").?.value);
+            try std.testing.expectEqualStrings("clip", reparsed.get("overflow-y").?.value);
+        }
+    }.run, .{});
+}
+
 fn shorthandFor(name: []const u8) ?properties.Shorthand {
     for (properties.shorthands) |candidate| if (std.mem.eql(u8, name, candidate.name)) return candidate;
     return null;

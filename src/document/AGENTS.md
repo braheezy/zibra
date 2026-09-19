@@ -84,6 +84,12 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
 - `css_display.zig` shares the supported display vocabulary and distinguishes
   inner flex/grid formatting from outer atomic-inline participation. Keep
   admission, intrinsic measurement and final layout dispatch consistent.
+- `css_overflow.zig` owns physical overflow grammar, simultaneous computed-pair
+  coercion and pointer-free axis predicates. `overflow` is a shorthand; computed
+  fields are `overflow-x`/`overflow-y`. Layout publishes Element's separate used
+  policy and geometry; paint must not repeat root/body viewport selection.
+  Programmatic permission, user permission and reported overflow dimensions
+  remain independent; see the overflow contract in document and rendering.
 - `css_aspect_ratio.zig` owns ratio admission and serialization for both ordinary
   and replaced boxes. Degenerate ratios are valid syntax with no used ratio.
 - `css_sizing.zig` owns preferred/minimum/maximum sizing value admission;

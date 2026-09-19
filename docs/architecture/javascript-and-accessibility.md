@@ -639,13 +639,23 @@ then JavaScript uses the canonical wrapper cache. Detached/retired handles
 produce zero metrics and a null parent without calling into a retired Frame.
 
 Scroll requests synchronously flush style/layout before clamping to the used
-range. Element offsets use the box's effective zoom; root HTML vertical offsets
-map to the Frame viewport. A successful move refreshes sticky descendants,
+range. Element offsets use the box's effective zoom; root HTML offsets in both
+axes map to the Frame viewport. Element overflow dimensions remain observable
+on visible and clipped axes, independently of scrolling permission. Hidden
+axes allow programmatic scrolling; clip axes always clamp their offset to zero.
+Changing an axis policy preserves and clamps the other axis independently.
+The viewport interprets propagated visible as auto and clip as hidden; the
+root/body donor retains its computed CSSOM values and uses visible locally.
+A successful move refreshes sticky descendants,
 marks the owning paint cache and schedules normal presentation, without
 evaluating JavaScript inside the callback. Geometry reads refresh sticky offsets
 before copying boxes, so script-visible rectangles and the next paint agree.
-Horizontal root scrolling, RTL/reversed ranges, smooth scrolling, scroll events
-and overflow-axis longhands remain separate capabilities.
+Wheel input resolves the current hovered frame on the Tab worker and chains
+each axis through eligible element ancestors before its viewport. Keyboard and
+immediate input publish pending layout before consulting the cached viewport
+policy. Hidden axes reject direct user input while preserving programmatic
+access. RTL/reversed ranges, smooth element scrolling, scroll events, logical
+overflow axes and horizontal scrollbar chrome remain separate capabilities.
 
 This is an initial HTML box-geometry slice, not complete CSSOM View. Geometry
 inherits layout's integer precision, bounded formatting, and translation-only

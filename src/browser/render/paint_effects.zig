@@ -9,6 +9,7 @@ const dom = @import("../../document/dom.zig");
 const ProtectedField = @import("../../core/protected_field.zig").ProtectedField;
 const box_model = @import("box_model.zig");
 const display_list = @import("display_list.zig");
+const css_overflow = @import("../../document/css_overflow.zig");
 
 const DisplayItem = display_list.DisplayItem;
 const ScrollAttachment = display_list.ScrollAttachment;
@@ -25,14 +26,19 @@ pub const ResolvedEffects = struct {
     blend_mode: ?[]const u8 = null,
     blur_radius: f64 = 0.0,
     border_radius: f64 = 0.0,
-    clips_overflow: bool = false,
+    clip_x: bool = false,
+    clip_y: bool = false,
     translation: ?Offset = null,
     transform_animation_active: bool = false,
+
+    pub fn clipsOverflow(self: ResolvedEffects) bool {
+        return self.clip_x or self.clip_y;
+    }
 
     pub fn needsBlendGroup(self: ResolvedEffects) bool {
         return self.opacity_animated or self.opacity < 1.0 or
             self.blend_mode != null or self.blur_radius > 0.0 or
-            self.border_radius > 0.0 or self.clips_overflow;
+            self.border_radius > 0.0 or self.clipsOverflow();
     }
 };
 
@@ -96,17 +102,14 @@ pub fn resolveElement(
             page_zoom,
         );
     }
-    const overflow = std.mem.trim(
-        u8,
-        styleValue(styles, "overflow") orelse "visible",
-        " \t\r\n",
-    );
-    // `hidden` clips painted descendants just like `clip`; unlike `scroll`,
-    // it does not create an element-local scrolling interaction. Keep the
-    // distinction here so layout/hit testing share the same clip decision.
-    result.clips_overflow = std.ascii.eqlIgnoreCase(overflow, "hidden") or
-        std.ascii.eqlIgnoreCase(overflow, "clip") or
-        ((std.ascii.eqlIgnoreCase(overflow, "scroll") or std.ascii.eqlIgnoreCase(overflow, "auto")) and value.scroll_container);
+    // Used policy is layout output: viewport donors remain visible locally
+    // without rewriting computed CSSOM values or searching the DOM in paint.
+    const overflow = value.used_overflow orelse css_overflow.compute(.{
+        .x = css_overflow.parse(styleValue(styles, "overflow-x") orelse "visible") orelse .visible,
+        .y = css_overflow.parse(styleValue(styles, "overflow-y") orelse "visible") orelse .visible,
+    });
+    result.clip_x = overflow.x.clips();
+    result.clip_y = overflow.y.clips();
 
     var animated_translation: ?dom.Translation = null;
     if (value.animations) |animations| {
@@ -189,23 +192,6 @@ pub fn wrapOwned(
         current = result;
     }
 
-    if (effects.clips_overflow) {
-        const mask = makeClipMask(allocator, effects, context) catch |err| {
-            DisplayItem.freeList(allocator, current);
-            return err;
-        };
-        const expanded = allocator.alloc(DisplayItem, current.len + 1) catch |err| {
-            var owned_mask = [1]DisplayItem{mask};
-            DisplayItem.freeItems(allocator, owned_mask[0..]);
-            DisplayItem.freeList(allocator, current);
-            return err;
-        };
-        @memcpy(expanded[0..current.len], current);
-        expanded[current.len] = mask;
-        allocator.free(current);
-        current = expanded;
-    }
-
     if (effects.needsBlendGroup()) {
         const owned_mode: ?[]u8 = if (effects.blend_mode) |mode|
             allocator.dupe(u8, mode) catch |err| {
@@ -220,17 +206,10 @@ pub fn wrapOwned(
             return err;
         };
         const needs_compositing = effects.opacity_animated or effects.opacity < 1.0 or
-            owned_mode != null or effects.blur_radius > 0.0 or effects.clips_overflow;
+            owned_mode != null or effects.blur_radius > 0.0;
         result[0] = .{ .blend = .{
             .opacity = effects.opacity,
             .blend_mode = owned_mode,
-            .hit_clip = if (effects.border_radius > 0.0 or effects.clips_overflow) .{
-                .x1 = context.bounds.left,
-                .y1 = context.bounds.top,
-                .x2 = context.bounds.right,
-                .y2 = context.bounds.bottom,
-                .radius = effects.border_radius,
-            } else null,
             .children = current,
             .node = context.identity,
             .needs_compositing = needs_compositing,
@@ -306,45 +285,32 @@ pub fn wrapScrolledSuffix(
     } });
 }
 
+/// Move a content suffix into an owning axis clip, preserving the caller's
+/// stationary background/border prefix. Failure leaves the list unchanged.
+pub fn wrapOverflowSuffix(
+    allocator: std.mem.Allocator,
+    commands: *std.ArrayList(DisplayItem),
+    content_start: usize,
+    clip: display_list.AxisClip,
+    source: ?display_list.DisplayItemSource,
+) std.mem.Allocator.Error!void {
+    if ((!clip.clip_x and !clip.clip_y) or content_start >= commands.items.len) return;
+    const children = try allocator.alloc(DisplayItem, commands.items.len - content_start);
+    @memcpy(children, commands.items[content_start..]);
+    commands.shrinkRetainingCapacity(content_start);
+    commands.appendAssumeCapacity(.{ .blend = .{
+        .opacity = 1.0,
+        .blend_mode = null,
+        .overflow_clip = clip,
+        .children = children,
+        .needs_compositing = true,
+        .source = source,
+    } });
+}
+
 fn styleValue(style_map: *const dom.StyleMap, property: []const u8) ?[]const u8 {
     const field = @constCast(style_map).getPtr(property) orelse return null;
     return field.get().*;
-}
-
-fn makeClipMask(
-    allocator: std.mem.Allocator,
-    effects: ResolvedEffects,
-    context: WrapContext,
-) std.mem.Allocator.Error!DisplayItem {
-    const mode = try allocator.dupe(u8, "dst_in");
-    errdefer allocator.free(mode);
-    const children = try allocator.alloc(DisplayItem, 1);
-    children[0] = if (effects.border_radius > 0.0)
-        .{ .rounded_rect = .{
-            .x1 = context.bounds.left,
-            .y1 = context.bounds.top,
-            .x2 = context.bounds.right,
-            .y2 = context.bounds.bottom,
-            .radius = effects.border_radius,
-            .color = .{ .r = 255, .g = 255, .b = 255, .a = 255 },
-            .source = context.source,
-        } }
-    else
-        .{ .rect = .{
-            .x1 = context.bounds.left,
-            .y1 = context.bounds.top,
-            .x2 = context.bounds.right,
-            .y2 = context.bounds.bottom,
-            .color = .{ .r = 255, .g = 255, .b = 255, .a = 255 },
-            .source = context.source,
-        } };
-    return .{ .blend = .{
-        .opacity = 1.0,
-        .blend_mode = mode,
-        .children = children,
-        .needs_compositing = true,
-        .source = context.source,
-    } };
 }
 
 fn wrapTransformOwned(
@@ -384,7 +350,7 @@ test "blur parser accepts only the supported single pixel filter" {
     try std.testing.expect(parseBlurFilter("blur(2px) opacity(.5)") == null);
 }
 
-test "hidden overflow creates a paint and hit clip without a scroll container" {
+test "overflow effects use the committed axis policy without requiring scroll range" {
     const allocator = std.testing.allocator;
     var element = try dom.Element.init(allocator, "div", null);
     defer element.deinit(allocator);
@@ -394,16 +360,20 @@ test "hidden overflow creates a paint and hit clip without a scroll container" {
     overflow.set("hidden");
     var overflow_installed = false;
     errdefer if (!overflow_installed) overflow.deinit(allocator);
-    try element.style.?.put("overflow", overflow);
+    try element.style.?.put("overflow-x", overflow);
     overflow_installed = true;
 
     const effects = resolveElement(&element, 1.0, 1.0);
-    try std.testing.expect(effects.clips_overflow);
+    try std.testing.expect(effects.clip_x and effects.clip_y);
     try std.testing.expect(effects.needsBlendGroup());
-    try std.testing.expect(!element.scroll_container);
+    element.used_overflow = .{};
+    try std.testing.expect(!resolveElement(&element, 1.0, 1.0).clipsOverflow());
+    element.used_overflow = .{ .x = .clip, .y = .visible };
+    const single = resolveElement(&element, 1.0, 1.0);
+    try std.testing.expect(single.clip_x and !single.clip_y);
 }
 
-test "effect wrappers preserve filter clip blend transform and position order" {
+test "whole-box effect wrappers preserve filter blend transform and position order" {
     var identity: u8 = 0;
     const commands = try std.testing.allocator.alloc(DisplayItem, 1);
     commands[0] = .{ .rect = .{
@@ -418,7 +388,6 @@ test "effect wrappers preserve filter clip blend transform and position order" {
         .blend_mode = "multiply",
         .blur_radius = 2.0,
         .border_radius = 4.0,
-        .clips_overflow = true,
         .translation = .{ .x = 3, .y = 4 },
         .transform_animation_active = true,
     }, .{
@@ -435,10 +404,9 @@ test "effect wrappers preserve filter clip blend transform and position order" {
     try std.testing.expectEqual(@as(i32, 3), transformed.translate_x);
     const outer = transformed.children[0].blend;
     try std.testing.expectEqualStrings("multiply", outer.blend_mode.?);
-    try std.testing.expectEqual(@as(f64, 4.0), outer.hit_clip.?.radius);
-    try std.testing.expectEqual(@as(usize, 2), outer.children.len);
+    try std.testing.expect(outer.hit_clip == null);
+    try std.testing.expectEqual(@as(usize, 1), outer.children.len);
     try std.testing.expectEqual(@as(f64, 2.0), outer.children[0].blend.blur_radius);
-    try std.testing.expectEqualStrings("dst_in", outer.children[1].blend.blend_mode.?);
 }
 
 test "viewport-attached effects wrap the complete subtree outermost" {
@@ -467,7 +435,7 @@ test "viewport-attached effects wrap the complete subtree outermost" {
     try std.testing.expectEqual(@as(i32, 3), transformed.translate_x);
 }
 
-test "rounded hit group stays non-compositing and cached edges remain shallow" {
+test "border radius does not clip visible descendants and cached edges remain shallow" {
     var retained = std.ArrayList(DisplayItem).empty;
     defer retained.deinit(std.testing.allocator);
     try retained.append(std.testing.allocator, .{ .rect = .{
@@ -484,6 +452,8 @@ test "rounded hit group stays non-compositing and cached edges remain shallow" {
     }, .{ .bounds = .{ .left = 0, .top = 0, .right = 5, .bottom = 5 } });
     defer DisplayItem.freeList(std.testing.allocator, result);
     try std.testing.expect(!result[0].blend.needs_compositing);
+    try std.testing.expect(result[0].blend.hit_clip == null);
+    try std.testing.expect(result[0].blend.overflow_clip == null);
     try std.testing.expect(result[0].blend.children[0] == .cached_subtree);
     try std.testing.expect(result[0].blend.children[0].cached_subtree.list == &retained);
 }
@@ -522,7 +492,6 @@ fn allocationFailureCase(allocator: std.mem.Allocator) !void {
         .blend_mode = "multiply",
         .blur_radius = 2,
         .border_radius = 4,
-        .clips_overflow = true,
         .translation = .{ .x = 3, .y = 4 },
     }, .{
         .bounds = .{ .left = 0, .top = 0, .right = 20, .bottom = 20 },
@@ -537,4 +506,38 @@ test "full effect wrapping cleans every allocation-failure path" {
         allocationFailureCase,
         .{},
     );
+}
+
+fn suffixAllocationFailureCase(allocator: std.mem.Allocator) !void {
+    var commands = std.ArrayList(DisplayItem).empty;
+    defer {
+        DisplayItem.freeItems(allocator, commands.items);
+        commands.deinit(allocator);
+    }
+    for (0..2) |index| try commands.append(allocator, .{ .rect = .{
+        .x1 = @intCast(index * 10),
+        .y1 = 0,
+        .x2 = 20,
+        .y2 = 20,
+        .color = .{ .r = 255, .g = 0, .b = 0 },
+    } });
+    wrapOverflowSuffix(allocator, &commands, 1, .{
+        .x1 = 5,
+        .y1 = 5,
+        .x2 = 15,
+        .y2 = 15,
+        .clip_y = false,
+    }, null) catch |err| {
+        try std.testing.expectEqual(@as(usize, 2), commands.items.len);
+        try std.testing.expect(commands.items[0] == .rect and commands.items[1] == .rect);
+        return err;
+    };
+    try std.testing.expect(commands.items[0] == .rect);
+    try std.testing.expect(commands.items[1].blend.overflow_clip.?.clip_x);
+    try std.testing.expect(!commands.items[1].blend.overflow_clip.?.clip_y);
+    try std.testing.expectEqual(@as(i32, 10), commands.items[1].blend.children[0].rect.x1);
+}
+
+test "overflow suffix preserves the stationary shell on success and allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, suffixAllocationFailureCase, .{});
 }

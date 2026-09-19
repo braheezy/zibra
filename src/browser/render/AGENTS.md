@@ -21,7 +21,9 @@ boundaries.
 - `layout_hit.zig` owns pointer-free local-coordinate hit geometry: saturating
   coordinate conversion, rounded clips, scroll/transform localization, and
   reverse-child ordering over a synchronously borrowed committed paint
-  permutation. It never owns or traverses layout objects.
+  permutation. Own-border hits and content-clip descent are separate outputs;
+  layout must gate descendant traversal with `hits_content`. It never owns or
+  traverses layout objects.
 - `element_geometry.zig` queries clean layout boxes and retains per-line
   inline fragments and used border edges with their layout/snapshot owner.
   Queries copy numeric rectangles and box metrics; the offset-parent Node is
@@ -36,6 +38,12 @@ boundaries.
   keywords, radii, and authored-zoom used values. It does not subscribe to
   style fields; `layout.zig` performs dependency-tracked reads before calling
   it.
+- `overflow_geometry.zig` owns pointer-free scroll bounds, saturating
+  translation and independent axis propagation. Layout retains scroll and
+  inline overflow; atomic snapshots retain separate propagated bounds rather
+  than clipping or unioning CSSOM fragment rectangles. A scrollable used axis
+  establishes an overflow formatting context; `clip visible` remains atomic
+  for paint without establishing that formatting context.
 - `sizing.zig` owns scalar content/border-box conversion, intrinsic keyword
   resolution, min/max constraints and automatic-minimum suggestions. Callers
   provide authored-zoom page units and a separate CSS percentage context;
@@ -111,10 +119,11 @@ boundaries.
   clip. Its image pixels and provenance are generation-scoped borrows until
   snapshot. Generated background images own
   scalar gradient stops; clone that owner at every command materialization.
-- `paint_effects.zig` resolves scalar block effects from live style and wraps
-  owned command slices in blur, clip, blend, transform, position, and scroll
-  groups. `wrapOwned` consumes its input slice on every outcome; callers must
-  pass an independently owned top-level container.
+- `paint_effects.zig` resolves scalar block effects from clean style and
+  layout's committed used overflow. Scroll and overflow suffix wrappers keep
+  the stationary background/border prefix outside their groups and leave the
+  caller's list unchanged on allocation failure. `wrapOwned` adds whole-box
+  effects and consumes its independently owned input slice on every outcome.
 - `retained_commands.zig` deep-materializes a retained command tree only at a
   boundary that cannot borrow its cache owner. It owns recursive container
   copies and canvas snapshots, but does not own a layout cache.
@@ -122,7 +131,14 @@ boundaries.
   bitmaps. Commands borrow glyph pixels only until snapshot.
 - `display_list.zig` owns command types, recursive cleanup, provenance,
   painted hit testing, and composited-layer data. It remains independent of
-  Browser, SDL, and native-window lifetime.
+  Browser, SDL, and native-window lifetime. `AxisClip` is pointer-free geometry
+  shared by content paint and hits; preserve its enable flags through every
+  clone and bound only enabled axes. A visible axis is not an enormous clip
+  rectangle. Rebased iframe fixed transforms retain a scalar translation origin;
+  every device interpreter and bounds reader uses `scaledTranslation` so scroll
+  cancellation precedes fractional-zoom rounding. Preserve it in all copies.
+  See the authoritative overflow contract for donor policy and
+  content-suffix ordering.
 - `raster_snapshot.zig` is the deep-copy thread boundary. It clears
   provenance, materializes retained cache edges, copies leaf pixels, and
   permits numeric compositor IDs but no DOM/layout pointers.

@@ -5,6 +5,7 @@ const geometry = @import("../browser/render/element_geometry.zig");
 const parser = @import("../document/parser.zig");
 const Rect = geometry.Rect;
 const DisplayItem = @import("../browser/render/display_list.zig").DisplayItem;
+const AxisClip = @import("../browser/render/display_list.zig").AxisClip;
 const allocator = std.testing.allocator;
 
 const Page = struct {
@@ -54,6 +55,25 @@ const Page = struct {
 fn setStyle(node: *parser.Node, value: []const u8) !void {
     try node.element.attributes.?.put("style", value);
     @import("../document/dom.zig").dirtyStyleForElement(&node.element);
+}
+
+test "overflow viewport geometry scrolls both axes and preserves fixed rectangles" {
+    var page = try Page.init("<main style='display:block;width:1200px;height:900px'><div style='display:block;width:100px;height:80px'></div><div style='display:block;position:fixed;left:40px;top:50px;width:30px;height:20px'></div></main>");
+    defer page.deinit();
+    try page.render();
+    const normal = &page.root.element.children.items[0];
+    const fixed = &page.root.element.children.items[1];
+    for ([_]*parser.Node{ normal, fixed }) |node| {
+        var initial = std.ArrayList(Rect).empty;
+        defer initial.deinit(allocator);
+        var moved = std.ArrayList(Rect).empty;
+        defer moved.deinit(allocator);
+        try geometry.collectScrolled(page.document.?, node, 1, 0, 0, false, allocator, &initial);
+        try geometry.collectScrolled(page.document.?, node, 1, 120, 70, false, allocator, &moved);
+        try std.testing.expectEqual(@as(usize, 1), moved.items.len);
+        try std.testing.expectEqual(initial.items[0].x - (if (node == fixed) @as(f64, 0) else 120), moved.items[0].x);
+        try std.testing.expectEqual(initial.items[0].y - (if (node == fixed) @as(f64, 0) else 70), moved.items[0].y);
+    }
 }
 
 test "sticky element scrolling shares paint hit geometry and containing limits" {
@@ -126,15 +146,22 @@ test "sticky horizontal block uses its nearest scrollport and zoomed inset" {
     try std.testing.expectEqual(outer.items[0].x + 40, rects.items[0].x);
 }
 
-fn editorClip(items: []const DisplayItem, node: *parser.Node) ?Rect {
+fn editorClip(items: []const DisplayItem, node: *parser.Node) ?AxisClip {
     for (items) |item| switch (item) {
         .blend => |group| {
-            if (group.hit_clip) |clip| if (group.source) |source| {
-                if (source.node == node and group.needs_compositing) return geometry.box(clip.x1, clip.y1, clip.x2 - clip.x1, clip.y2 - clip.y1);
+            if (group.overflow_clip) |clip| if (group.source) |source| {
+                if (source.node == node and group.needs_compositing) return clip;
             };
             if (editorClip(group.children, node)) |clip| return clip;
         },
-        .transform => |group| if (editorClip(group.children, node)) |clip| return clip.translated(@floatFromInt(group.translate_x), @floatFromInt(group.translate_y)),
+        .transform => |group| if (editorClip(group.children, node)) |clip| {
+            var translated = clip;
+            translated.x1 +|= group.translate_x;
+            translated.x2 +|= group.translate_x;
+            translated.y1 +|= group.translate_y;
+            translated.y2 +|= group.translate_y;
+            return translated;
+        },
         .cached_subtree => |cached| if (editorClip(cached.list.items, node)) |clip| return clip,
         else => {},
     };
@@ -151,7 +178,10 @@ test "geometry native editor clipping uses the same insets as CSSOM" {
         const expected = (try page.metrics(node)).client.translated(rects.items[0].x, rects.items[0].y);
         const commands = try page.engine.paintDocument(page.document.?);
         defer DisplayItem.freeList(allocator, commands);
-        try std.testing.expectEqual(expected, editorClip(commands, node).?);
+        const clip = editorClip(commands, node) orelse return error.MissingEditorContentClip;
+        try std.testing.expect(clip.clip_x and clip.clip_y);
+        try std.testing.expectEqual(@as(f64, 0), clip.radius);
+        try std.testing.expectEqual(expected, geometry.box(clip.x1, clip.y1, clip.x2 - clip.x1, clip.y2 - clip.y1));
     }
     const input = &page.root.element.children.items[0];
     try setStyle(input, "width:0;height:0;padding:0;border:0");

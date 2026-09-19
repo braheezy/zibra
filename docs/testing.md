@@ -206,6 +206,19 @@ provides link/button interactions inside an inline badge. It also runs in
 [phase-two manifest](../tests/wpt/manifest-css-shared-sizing-phase2.yaml) for
 before/after comparisons; see the [coverage notes](../tests/wpt/README.md#nested-sizing-and-inline-formatting).
 
+Independent overflow coverage lives in
+[`overflow_axes.zig`](../src/tests/overflow_axes.zig); use
+`zig build test-render -Dtest-filter='overflow'` for the focused geometry/hit
+checks, followed by the full render and browser suites. The text-free
+[`css-overflow-axes` pipeline fixture](../tests/pipeline/css-overflow-axes.html)
+checks independent padding-edge clipping and stationary borders; its
+[manual counterpart](../tests/manual/css-overflow-axes.html) runs CSSOM metrics,
+offset mutation and atomic geometry assertions in `test-wpt`, with wheel and
+link/control interaction checks for the native window. Use the separate
+[overflow manifest](../tests/wpt/manifest-css-overflow-axes.yaml), preserving
+both sizing selections; the [WPT notes](../tests/wpt/README.md#independent-overflow-axes)
+distinguish unsupported APIs and logical/RTL cases from geometry coverage.
+
 Dump and screenshot modes accept `--viewport WIDTHxHEIGHT` (default 800x600,
 each dimension 1–8192). Dumps use the entire size for document geometry and
 width/height media queries. Screenshots use that presentation size, with the

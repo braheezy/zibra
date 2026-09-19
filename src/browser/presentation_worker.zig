@@ -23,6 +23,8 @@ pub const Result = struct {
     /// Numeric identity only; the worker result never owns or dereferences a
     /// Tab. Browser revalidates this identity while holding its lock.
     active_identity: ?usize,
+    /// Layout-pixel horizontal origin; reject a result for a superseded position.
+    scroll_x: i32,
     duration_ns: u64,
     sample_animation_work: bool,
 
@@ -42,6 +44,7 @@ pub const Worker = struct {
     compositor_cache: compositor_cache.Cache = .{},
     interest_region: scroll_model.InterestRegion = .{ .start_px = 0, .height_px = 0 },
     interest_region_valid: bool = false,
+    scroll_x: i32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, measure: *MeasureTime) Worker {
         return .{
@@ -79,6 +82,7 @@ test "presentation result owns its accepted software surface" {
         .window_width = 4,
         .window_height = 3,
         .active_identity = 17,
+        .scroll_x = 0,
         .duration_ns = 0,
         .sample_animation_work = false,
     };

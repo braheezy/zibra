@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const dom = @import("../../document/dom.zig");
+const AxisClip = @import("display_list.zig").AxisClip;
 
 pub const Bounds = struct {
     x: i32,
@@ -31,11 +32,6 @@ pub const Result = struct {
     local_y: i32,
 };
 
-pub const Clip = struct {
-    enabled: bool = false,
-    radius: f64 = 0.0,
-};
-
 pub const BlockInput = struct {
     child_origin: Point,
     parent_origin: Point,
@@ -43,7 +39,9 @@ pub const BlockInput = struct {
     position_offset: Point = .{ .x = 0, .y = 0 },
     transform_translation: Point = .{ .x = 0, .y = 0 },
     opacity: f64 = 1.0,
-    clip: Clip = .{},
+    border_radius: f64 = 0.0,
+    /// Padding-edge content clip in coordinates local to this border box.
+    content_clip: ?AxisClip = null,
     scroll_y: i32 = 0,
     scroll_x: i32 = 0,
 };
@@ -52,6 +50,7 @@ pub const LocalizedBlock = struct {
     local: Point,
     content: Point,
     hits_own_box: bool,
+    hits_content: bool,
 };
 
 pub fn addOffset(point: Point, offset: Point) Point {
@@ -117,11 +116,14 @@ pub fn localizeBlock(parent_point: Point, input: BlockInput) ?LocalizedBlock {
     var local = childLocalPoint(parent_point, input.child_origin, input.parent_origin);
     local = subtractOffset(local, input.position_offset);
     local = subtractOffset(local, input.transform_translation);
-    if (input.clip.enabled and !containsRoundedBox(local, input.size, input.clip.radius)) return null;
+    const hits_own_box = containsRoundedBox(local, input.size, input.border_radius);
+    const hits_content = if (input.content_clip) |clip| clip.contains(local.x, local.y, 1.0) else true;
+    if (!hits_own_box and !hits_content) return null;
     return .{
         .local = local,
         .content = addOffset(local, .{ .x = @max(input.scroll_x, 0), .y = @max(input.scroll_y, 0) }),
-        .hits_own_box = containsRoundedBox(local, input.size, input.clip.radius),
+        .hits_own_box = hits_own_box,
+        .hits_content = hits_content,
     };
 }
 
@@ -216,7 +218,7 @@ test "block localization separates scroll from visual offsets and clipping" {
         .child_origin = .{ .x = 0, .y = 0 },
         .parent_origin = .{ .x = 0, .y = 0 },
         .size = .{ .width = 100, .height = 50 },
-        .clip = .{ .enabled = true },
+        .content_clip = .{ .x1 = 0, .y1 = 0, .x2 = 100, .y2 = 50 },
     }) == null);
     try std.testing.expect(localizeBlock(.{ .x = 20, .y = 20 }, .{
         .child_origin = .{ .x = 0, .y = 0 },
@@ -238,4 +240,23 @@ test "reverse committed order remains stable" {
     try std.testing.expectEqual(@as(?usize, 2), fallback.next());
     try std.testing.expectEqual(@as(?usize, 1), fallback.next());
     try std.testing.expectEqual(@as(?usize, 0), fallback.next());
+}
+
+test "content clips preserve border hits and localize visible-axis descendants" {
+    const input = BlockInput{
+        .child_origin = .{ .x = 20, .y = 30 },
+        .parent_origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = 100, .height = 80 },
+        .border_radius = 4,
+        .content_clip = .{ .x1 = 10, .y1 = 10, .x2 = 90, .y2 = 70, .clip_y = false },
+        .scroll_x = 25,
+    };
+    const border = localizeBlock(.{ .x = 25, .y = 50 }, input).?;
+    try std.testing.expect(border.hits_own_box);
+    try std.testing.expect(!border.hits_content);
+    const outside_y = localizeBlock(.{ .x = 50, .y = 130 }, input).?;
+    try std.testing.expect(!outside_y.hits_own_box);
+    try std.testing.expect(outside_y.hits_content);
+    try std.testing.expectEqual(Point{ .x = 55, .y = 100 }, outside_y.content);
+    try std.testing.expect(localizeBlock(.{ .x = 125, .y = 50 }, input) == null);
 }

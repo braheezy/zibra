@@ -526,6 +526,13 @@ pub fn wheelScrollDelta(delta_y: i32, is_flipped: bool) i32 {
     ));
 }
 
+/// SDL horizontal wheel units are positive to the right, independently of
+/// the vertical axis's away-from-user convention.
+pub fn wheelHorizontalScrollDelta(delta_x: i32, is_flipped: bool) i32 {
+    const normalized: i64 = if (is_flipped) -@as(i64, delta_x) else delta_x;
+    return @intCast(std.math.clamp(normalized * scroll_step, std.math.minInt(i32), std.math.maxInt(i32)));
+}
+
 /// Chrome address editing takes precedence over a stale document focus. The
 /// address bar consumes editing keys even when an operation is a boundary
 /// no-op, such as Backspace at cursor zero.
@@ -618,6 +625,7 @@ const RasterTaskContext = struct {
     /// the worker never reads DOM or computed style.
     show_scrollbar: bool,
     scroll: i32,
+    scroll_x: i32,
     document_height: i32,
     zoom: f32,
     interest_region: scroll_model.InterestRegion,
@@ -759,6 +767,7 @@ pub const Browser = struct {
     active_tab_committed_url: ?[]u8 = null,
     active_tab_committed_security: NavigationSecurity = .none,
     active_tab_scroll: i32 = 0,
+    active_tab_scroll_x: i32 = 0,
     active_tab_height: i32 = 0,
     active_tab_show_scrollbar: bool = true,
     active_tab_zoom: f32 = 1.0,
@@ -1311,14 +1320,19 @@ pub const Browser = struct {
     }
 
     pub fn handleScroll(self: *Browser, delta: i32) void {
-        self.handleScrollForExpectedTab(null, delta);
+        self.handleScrollForExpectedTab(null, null, 0, delta);
     }
 
     pub fn handleScrollForTab(self: *Browser, tab: *Tab, delta: i32) void {
-        self.handleScrollForExpectedTab(tab, delta);
+        self.handleScrollForExpectedTab(tab, null, 0, delta);
     }
 
-    fn handleScrollForExpectedTab(self: *Browser, expected_tab: ?*Tab, delta: i32) void {
+    /// Called on the serialized Tab worker with a synchronous current Frame borrow.
+    pub fn handleViewportScrollForTab(self: *Browser, tab: *Tab, frame: *Frame, dx: i32, dy: i32) void {
+        self.handleScrollForExpectedTab(tab, frame, dx, dy);
+    }
+
+    fn handleScrollForExpectedTab(self: *Browser, expected_tab: ?*Tab, requested_frame: ?*Frame, dx: i32, delta: i32) void {
         var should_schedule = false;
         self.lock.lock();
         const tab = self.activeTab();
@@ -1329,17 +1343,28 @@ pub const Browser = struct {
             }
         }
         if (tab) |active| {
-            const target_frame = active.focused_frame orelse active.root_frame;
+            const target_frame = requested_frame orelse active.focused_frame orelse active.root_frame;
             if (target_frame) |frame| {
-                const new_scroll = active.clampScrollForFrame(frame, frame.scroll +| delta);
-                if (new_scroll != frame.scroll) {
+                const new_scroll = if (frame.viewport_overflow.y.allowsUserScroll())
+                    active.clampScrollForFrame(frame, frame.scroll +| delta)
+                else
+                    frame.scroll;
+                const new_x = if (frame.viewport_overflow.x.allowsUserScroll())
+                    active.clampScrollXForFrame(frame, frame.scroll_x +| dx)
+                else
+                    frame.scroll_x;
+                const x_changed = new_x != frame.scroll_x;
+                if (new_scroll != frame.scroll or x_changed) {
                     frame.scroll = new_scroll;
+                    frame.scroll_x = new_x;
+                    active.pending_hover = true;
                     if (frame == active.root_frame) {
                         self.active_tab_scroll = new_scroll;
+                        self.active_tab_scroll_x = new_x;
                         // Scrolling inside the raster cache only moves the
                         // cached surface. Crossing an edge requests a new
                         // interest-region raster around the viewport.
-                        if (!self.interestRegionContainsScroll(new_scroll)) {
+                        if (x_changed or !self.interestRegionContainsScroll(new_scroll)) {
                             self.needs_raster = true;
                         }
                     } else {
@@ -1385,6 +1410,7 @@ pub const Browser = struct {
             tab.requestActivationCommit();
             self.window_title_dirty = true;
             self.active_tab_scroll = 0;
+            self.active_tab_scroll_x = 0;
             self.active_tab_show_scrollbar = true;
             self.active_tab_zoom = tab.accessibility.zoom;
             self.active_tab_prefers_dark = tab.accessibility.prefers_dark;
@@ -1445,6 +1471,7 @@ pub const Browser = struct {
             self.active_tab_index = null;
             self.retireActiveRenderStateLocked();
             self.active_tab_scroll = 0;
+            self.active_tab_scroll_x = 0;
             self.active_tab_show_scrollbar = true;
             self.active_tab_zoom = 1.0;
             self.active_tab_prefers_dark = false;
@@ -1910,8 +1937,9 @@ pub const Browser = struct {
             },
             .mouse_wheel => |wheel_event| {
                 const delta = wheelScrollDelta(wheel_event.delta_y, wheel_event.direction == .flipped);
-                if (delta != 0) {
-                    if (self.activeTab()) |tab| self.scheduleTabImmediateScrollTask(tab, delta);
+                const dx = wheelHorizontalScrollDelta(wheel_event.delta_x, wheel_event.direction == .flipped);
+                if (delta != 0 or dx != 0) {
+                    if (self.activeTab()) |tab| self.scheduleTabAction(tab, .{ .wheel_scroll = .{ .x = dx, .y = delta } }, "task:wheel");
                 }
             },
             .mouse_button_down => |button_event| {
@@ -2373,6 +2401,7 @@ pub const Browser = struct {
         _ = frame;
         const zoom = self.activeZoom();
         const scroll_device = DisplayItem.scaleLayoutPx(self.active_tab_scroll, zoom);
+        const scroll_x_device = DisplayItem.scaleLayoutPx(self.active_tab_scroll_x, zoom);
 
         self.focus = "content";
         self.chrome.blur();
@@ -2383,7 +2412,7 @@ pub const Browser = struct {
         const tab_y = screen_y - chrome_bottom;
         const page_y = tab_y +| scroll_device;
 
-        self.scheduleTabClickTask(tab, screen_x, page_y, .primary, zoom);
+        self.scheduleTabClickTask(tab, screen_x +| scroll_x_device, page_y, .primary, zoom);
     }
 
     // Middle-click only activates links in page content. Chrome and non-link
@@ -2395,6 +2424,7 @@ pub const Browser = struct {
         const zoom = self.activeZoom();
         const frame = if (tab) |active_tab| active_tab.root_frame else null;
         const scroll_device = DisplayItem.scaleLayoutPx(self.active_tab_scroll, zoom);
+        const scroll_x_device = DisplayItem.scaleLayoutPx(self.active_tab_scroll_x, zoom);
         self.lock.unlock();
 
         if (screen_y < chrome_bottom) return;
@@ -2403,7 +2433,7 @@ pub const Browser = struct {
         const tab_y = screen_y - chrome_bottom;
         const page_y = tab_y +| scroll_device;
 
-        self.scheduleTabClickTask(active_tab, screen_x, page_y, .middle, zoom);
+        self.scheduleTabClickTask(active_tab, screen_x +| scroll_x_device, page_y, .middle, zoom);
     }
 
     fn handleHover(self: *Browser, screen_x: i32, screen_y: i32) !void {
@@ -2802,6 +2832,7 @@ pub const Browser = struct {
         tab.focused_frame = frame;
 
         frame.scroll = 0;
+        frame.scroll_x = 0;
         tab.scroll_changed_in_tab = true;
 
         frame.clearContentSecurityPolicy();
@@ -3166,8 +3197,12 @@ pub const Browser = struct {
         frame.resources_dirty = false;
         frame.stylesheets_dirty = true;
         frame.content_height = 0;
+        frame.content_width = 0;
+        frame.scrollport_width = 0;
+        frame.scrollport_height = 0;
         frame.scroll = 0;
-        frame.publishViewportScrollbarVisibility(true);
+        frame.scroll_x = 0;
+        frame.publishViewportOverflow(.{ .x = .auto, .y = .auto });
         frame.focus = null;
         frame.scroll_focus = null;
 
@@ -4704,7 +4739,8 @@ pub const Browser = struct {
         // ordinary element overflow inside layout/paint rather than treating it
         // as browser chrome state. This is the sole live-style read for the
         // retained commit scalar, while the Frame style phase is clean.
-        const viewport_scrollbar_visible = Layout.rootViewportScrollbarVisible(&frame.current_node.?);
+        const viewport_overflow = Layout.rootViewportOverflow(&frame.current_node.?);
+        const viewport_scrollbar_visible = viewport_overflow.y.allowsUserScroll();
         if (self.layout_engine.setViewportScrollbarReservation(viewport_scrollbar_visible)) {
             if (frame.documentLayout()) |document| document.mark();
         }
@@ -4728,6 +4764,18 @@ pub const Browser = struct {
                 try doc.layout(self.layout_engine);
                 did_layout = true;
             }
+        }
+        const clean_document = frame.documentLayout().?;
+        frame.content_width = clean_document.content_width;
+        frame.content_height = clean_document.content_height;
+        frame.scrollport_width = clean_document.scrollport_width;
+        frame.scrollport_height = clean_document.scrollport_height;
+        const next_x = frame.tab.clampScrollXForFrame(frame, frame.scroll_x);
+        const next_y = frame.tab.clampScrollForFrame(frame, frame.scroll);
+        if (next_x != frame.scroll_x or next_y != frame.scroll) {
+            frame.scroll_x = next_x;
+            frame.scroll = next_y;
+            if (frame.parent == null) frame.tab.scroll_changed_in_tab = true;
         }
         const sticky_changed = frame.updateSticky();
         // Repaint if layout ran or a scrolling-dependent wrapper changed.
@@ -4806,8 +4854,7 @@ pub const Browser = struct {
             self.allocator.free(old_list);
         }
 
-        // Update content height from the layout engine
-        frame.content_height = self.layout_engine.content_height;
+        // Scroll extents were copied from the clean document before paint.
 
         frame.tab.buildAccessibilityTree() catch |err| {
             std.log.warn("Failed to build accessibility tree: {}", .{err});
@@ -4816,7 +4863,7 @@ pub const Browser = struct {
         // Commit consumers can run after hover or DOM work has deliberately
         // dirtied style again. Retain the result from this complete, clean
         // layout generation rather than asking them to read computed overflow.
-        frame.publishViewportScrollbarVisibility(viewport_scrollbar_visible);
+        frame.publishViewportOverflow(viewport_overflow);
     }
 
     /// Rebuild retained composited layers for the committed page generation.
@@ -4847,6 +4894,8 @@ pub const Browser = struct {
             return error.InvalidRasterDimensions;
         }
         if (task.raster) try self.rasterWorkerCaches(task);
+        if (task.active_tab_has_content and self.presentation_worker.scroll_x != task.scroll_x)
+            return error.MissingTabRasterCache;
         self.presentation_worker.compositor_cache.apply(task.composited_updates);
         const chrome_surface = if (self.presentation_worker.chrome_surface) |*surface|
             surface
@@ -4946,7 +4995,7 @@ pub const Browser = struct {
                     try self.software_renderer.drawDisplayItemZ2dContextForLayer(
                         &tab_context,
                         item,
-                        0,
+                        scroll_model.scaleCssPx(task.scroll_x, task.zoom),
                         task.interest_region.start_px,
                         task.zoom,
                     );
@@ -4963,6 +5012,7 @@ pub const Browser = struct {
         self.presentation_worker.tab_surface = tab_surface;
         tab_owned = false;
         self.presentation_worker.interest_region = task.interest_region;
+        self.presentation_worker.scroll_x = task.scroll_x;
         self.presentation_worker.interest_region_valid = task.page != null;
     }
 
@@ -4976,7 +5026,7 @@ pub const Browser = struct {
 
     fn workerPlaneSpec(item: DisplayItem) ?WorkerPlaneSpec {
         return switch (item) {
-            .transform => |transform| if (transform.composited and transform.compositor_id != null) blk: {
+            .transform => |transform| if (transform.translation_origin == null and transform.composited and transform.compositor_id != null) blk: {
                 var opacity: f64 = 1.0;
                 for (transform.children) |child| {
                     if (child == .blend and child.blend.compositor_id == transform.compositor_id) {
@@ -5038,7 +5088,7 @@ pub const Browser = struct {
         items: []const DisplayItem,
     ) !bool {
         self.presentation_worker.compositor_cache.clear(task.allocator);
-        if (!workerCacheCanSplit(items)) return false;
+        if (task.scroll_x != 0 or !workerCacheCanSplit(items)) return false;
 
         var static_start: usize = 0;
         for (items, 0..) |item, index| {
@@ -5629,7 +5679,7 @@ pub const Browser = struct {
         else
             base_list;
         for (draw_list) |item| {
-            try self.software_renderer.drawDisplayItemZ2dContext(&tab_context, item, region.start_px, zoom);
+            try self.software_renderer.drawDisplayItemZ2dContextWithTransform(&tab_context, item, region.start_px, 0 -| scroll_model.scaleCssPx(self.active_tab_scroll_x, zoom), zoom);
         }
 
         self.tab_interest_region = region;
@@ -5731,6 +5781,7 @@ pub const Browser = struct {
             .active_tab_has_content = active_tab_has_content,
             .show_scrollbar = self.active_tab_show_scrollbar,
             .scroll = self.active_tab_scroll,
+            .scroll_x = self.active_tab_scroll_x,
             .document_height = self.active_tab_height,
             .zoom = zoom,
             .interest_region = if (raster)
@@ -5790,6 +5841,7 @@ pub const Browser = struct {
             .window_width = task.window_width,
             .window_height = task.window_height,
             .active_identity = tabIdentity(task.active_tab),
+            .scroll_x = task.scroll_x,
             .duration_ns = duration_ns,
             .sample_animation_work = task.sample_animation_work,
         };
@@ -5800,6 +5852,7 @@ pub const Browser = struct {
             self.window_width == result.window_width and
             self.window_height == result.window_height and
             tabIdentity(self.activeTab()) == result.active_identity and
+            self.active_tab_scroll_x == result.scroll_x and
             !self.needs_composite and !self.needs_raster and !self.needs_draw;
         var replaced: ?RasterResult = null;
         if (current) {
@@ -5829,6 +5882,7 @@ pub const Browser = struct {
         const current = self.window_width == result.window_width and
             self.window_height == result.window_height and
             tabIdentity(self.activeTab()) == result.active_identity and
+            self.active_tab_scroll_x == result.scroll_x and
             !self.needs_composite and !self.needs_raster and !self.needs_draw;
         self.lock.unlock();
 
@@ -5909,6 +5963,7 @@ pub const Browser = struct {
         }
 
         const previous_scroll = self.active_tab_scroll;
+        const previous_scroll_x = self.active_tab_scroll_x;
         const previous_height = self.active_tab_height;
         const previous_show_scrollbar = self.active_tab_show_scrollbar;
         const previous_zoom = self.active_tab_zoom;
@@ -5936,6 +5991,7 @@ pub const Browser = struct {
         if (data.scroll) |scroll| {
             self.active_tab_scroll = scroll;
         }
+        if (data.scroll_x) |scroll_x| self.active_tab_scroll_x = scroll_x;
         self.active_tab_height = data.height;
         self.active_tab_show_scrollbar = data.show_scrollbar;
         self.active_tab_zoom = data.zoom;
@@ -5977,7 +6033,7 @@ pub const Browser = struct {
 
         const geometry_changed = previous_height != self.active_tab_height or
             previous_zoom != self.active_tab_zoom;
-        if (geometry_changed) {
+        if (geometry_changed or previous_scroll_x != self.active_tab_scroll_x) {
             self.invalidateInterestRegion();
             self.needs_raster = true;
             self.needs_draw = true;
@@ -6026,7 +6082,7 @@ pub const Browser = struct {
         // Draw-only updates are valid only for a top-level effect represented
         // by the worker's retained plane cache. Nested/unsupported effects
         // fall back to raster so an update is never silently dropped.
-        if (!workerCacheSupportsCompositorId(display_list, compositor_id)) return false;
+        if (self.active_tab_scroll_x != 0 or !workerCacheSupportsCompositorId(display_list, compositor_id)) return false;
 
         const worker_update = CompositorUpdate{
             .id = compositor_id,
@@ -6367,6 +6423,39 @@ pub const Browser = struct {
     }
 };
 
+test "overflow horizontal raster applies animation updates before requesting reraster" {
+    const allocator = std.testing.allocator;
+    var marker: u8 = 0;
+    var leaf = [_]DisplayItem{.{ .rect = .{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 10,
+        .y2 = 10,
+        .color = .{ .r = 255, .g = 0, .b = 0 },
+    } }};
+    var items = [_]DisplayItem{.{ .transform = .{
+        .translate_x = 0,
+        .translate_y = 0,
+        .children = &leaf,
+        .node = &marker,
+        .composited = true,
+        .compositor_id = @intFromPtr(&marker),
+    } }};
+    var browser: Browser = undefined;
+    browser.allocator = allocator;
+    browser.active_tab_display_list = &items;
+    browser.active_tab_scroll_x = 40;
+    browser.pending_composited_updates = .empty;
+    defer browser.pending_composited_updates.deinit(allocator);
+
+    try std.testing.expect(!browser.applyCompositedUpdate(.{ .node = &marker, .value = .{ .transform = .{ .x = 8, .y = 9 } } }));
+    try std.testing.expectEqual(@as(i32, 8), items[0].transform.translate_x);
+    try std.testing.expectEqual(@as(usize, 0), browser.pending_composited_updates.items.len);
+    browser.active_tab_scroll_x = 0;
+    try std.testing.expect(browser.applyCompositedUpdate(.{ .node = &marker, .value = .{ .transform = .{ .x = 11, .y = 12 } } }));
+    try std.testing.expectEqual(@as(usize, 1), browser.pending_composited_updates.items.len);
+}
+
 test "worker compositor cache accepts representable planes and rejects nested effects" {
     var leaf = [_]DisplayItem{.{ .rect = .{
         .x1 = 0,
@@ -6523,9 +6612,9 @@ test "viewport-attached raster groups ignore the document cache origin" {
     @memset(pixels, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
 
     var document_children = [_]DisplayItem{.{ .rect = .{
-        .x1 = 1,
+        .x1 = 101,
         .y1 = 103,
-        .x2 = 5,
+        .x2 = 105,
         .y2 = 107,
         .color = .{ .r = 0, .g = 0, .b = 255, .a = 255 },
     } }};
@@ -6553,14 +6642,44 @@ test "viewport-attached raster groups ignore the document cache origin" {
     var bounds = DisplayCompositor.init(allocator);
     defer bounds.deinit();
     var renderer = SoftwareRenderer.init(allocator, allocator, std.testing.io, &bounds);
-    try renderer.drawDisplayItemZ2dContextForLayer(&context, document, 0, 100, 1.0);
-    try renderer.drawDisplayItemZ2dContextForLayer(&context, fixed, 0, 100, 1.0);
+    try renderer.drawDisplayItemZ2dContextForLayer(&context, document, 100, 100, 1.0);
+    try renderer.drawDisplayItemZ2dContextForLayer(&context, fixed, 100, 100, 1.0);
 
     const width: usize = 20;
     const scrolled = pixels[4 * width + 2];
     const viewport = pixels[11 * width + 2];
     try std.testing.expectEqual(z2d.pixel.RGBA{ .r = 0, .g = 0, .b = 255, .a = 255 }, scrolled);
     try std.testing.expectEqual(z2d.pixel.RGBA{ .r = 255, .g = 0, .b = 0, .a = 255 }, viewport);
+}
+
+test "overflow presentation rejects a completed raster for an older horizontal position" {
+    const allocator = std.testing.allocator;
+    var browser: Browser = undefined;
+    browser.lock = .init(std.testing.io);
+    browser.tabs = .empty;
+    browser.active_tab_index = 0;
+    browser.window_width = 20;
+    browser.window_height = 20;
+    browser.active_tab_scroll_x = 30;
+    browser.needs_composite = false;
+    browser.needs_raster = false;
+    browser.needs_draw = false;
+    browser.presentation_worker.result = .{
+        .allocator = allocator,
+        .surface = try z2d.Surface.init(.image_surface_rgba, allocator, 20, 20),
+        .interest_region = .{ .start_px = 0, .height_px = 20 },
+        .interest_region_valid = true,
+        .window_width = 20,
+        .window_height = 20,
+        .active_identity = null,
+        .scroll_x = 10,
+        .duration_ns = 0,
+        .sample_animation_work = false,
+    };
+    // All other acceptance fields still match; the newer X alone must retire
+    // the old owning surface before any native upload or cache publication.
+    try browser.presentRasterResult();
+    try std.testing.expect(browser.presentation_worker.result == null);
 }
 
 test "tab zoom publishes an immediate active render preview" {
@@ -6768,6 +6887,7 @@ pub const CommitData = struct {
     certificate_error: bool = false,
     display_list: ?[]DisplayItem,
     scroll: ?i32,
+    scroll_x: ?i32 = null,
     height: i32,
     show_scrollbar: bool = true,
     zoom: f32,

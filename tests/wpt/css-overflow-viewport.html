@@ -1,0 +1,106 @@
+<!doctype html>
+<!-- Local WPT protocol fixture. Child geometry runs in its actual Frame and
+     returns through postMessage; contentDocument is not used as a live proxy. -->
+<html><head><meta charset="utf-8"><title>Overflow viewport and child-frame geometry</title>
+<style>
+html { overflow:visible }
+body { margin:0; width:220px; height:140px; overflow:hidden clip }
+#canvas { width:2400px; height:1800px; background:#e2e8f0 }
+#fixed { position:fixed; left:12px; top:12px; width:30px; height:20px; background:green }
+iframe { position:fixed; left:100px; top:60px; width:300px; height:160px; border:0 }
+</style></head><body>
+<div id="canvas"></div><div id="fixed"></div>
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+  var results=[],finished=false;
+  var root=document.documentElement,body=document.body;
+  var canvas=document.getElementById('canvas'),fixed=document.getElementById('fixed');
+  var initialCanvas=canvas.getBoundingClientRect(),initialFixed=fixed.getBoundingClientRect();
+  function equal(actual,expected){if(actual!==expected)throw Error(String(actual)+' != '+String(expected));}
+  function atLeast(actual,minimum){if(actual<minimum)throw Error(String(actual)+' < '+String(minimum));}
+  function check(name,fn){try{fn();results.push({name:name,status:0});}catch(error){results.push({name:name,status:1,message:String(error)});}}
+  function fixedUnchanged(){var box=fixed.getBoundingClientRect();equal(box.x,initialFixed.x);equal(box.y,initialFixed.y);}
+  function finish(){
+    if(finished)return;
+    finished=true;
+    if(typeof completion_callback==='function')completion_callback(results,{status:0});
+  }
+  check('viewport donor preserves root and body computed overflow',function(){
+    equal(getComputedStyle(root).overflow,'visible');
+    equal(getComputedStyle(body).overflow,'hidden clip');
+  });
+  check('root scroll dimensions include both overflowing axes',function(){
+    atLeast(root.scrollWidth,2400);atLeast(root.scrollHeight,1800);
+    atLeast(root.scrollWidth,root.clientWidth);atLeast(root.scrollHeight,root.clientHeight);
+  });
+  check('hidden and viewport clip axes permit programmatic root scrolling',function(){
+    root.scrollTo(80,60);equal(root.scrollLeft,80);equal(root.scrollTop,60);
+    var box=canvas.getBoundingClientRect();equal(box.x,initialCanvas.x-80);equal(box.y,initialCanvas.y-60);
+  });
+  check('root fixed geometry cancels horizontal and vertical scroll',fixedUnchanged);
+  check('viewport donor has no duplicate local scroll offset',function(){
+    body.scrollTo(40,50);equal(body.scrollLeft,0);equal(body.scrollTop,0);
+    equal(root.scrollLeft,80);equal(root.scrollTop,60);
+  });
+  check('retained body policy change updates viewport programmatic geometry',function(){
+    body.style.overflow='clip auto';
+    equal(getComputedStyle(body).overflow,'clip auto');
+    root.scrollTo(140,90);equal(root.scrollLeft,140);equal(root.scrollTop,90);
+    fixedUnchanged();
+  });
+  check('root taking overflow back restores body single-axis scrolling',function(){
+    root.style.overflow='auto';
+    body.scrollTo(70,50);equal(body.scrollLeft,0);equal(body.scrollTop,50);
+    atLeast(body.scrollWidth,2400);atLeast(body.scrollHeight,1800);
+    equal(root.scrollLeft,0);equal(root.scrollTop,0);
+  });
+  check('restoring body donation clears its old offset and restores root range',function(){
+    root.style.overflow='visible';body.style.overflow='hidden clip';
+    root.scrollTo(80,60);equal(root.scrollLeft,80);equal(root.scrollTop,60);
+    equal(body.scrollLeft,0);equal(body.scrollTop,0);fixedUnchanged();
+  });
+  var local=document.createElement('div');
+  local.style.cssText='display:block;width:100px;height:100px;overflow:auto';
+  local.innerHTML='<div style="width:300px;height:300px"></div>';
+  body.appendChild(local);
+  check('display none exposes zero scroll metrics and ignores scroll setters',function(){
+    local.scrollTo(40,50);equal(local.scrollLeft,40);equal(local.scrollTop,50);
+    local.style.display='none';
+    equal(local.scrollLeft,0);equal(local.scrollTop,0);equal(local.scrollWidth,0);equal(local.scrollHeight,0);
+    local.scrollTo(150,160);equal(local.scrollLeft,0);equal(local.scrollTop,0);
+  });
+  check('detached scroll subtree exposes zero metrics and ignores setters',function(){
+    local.style.display='block';local.scrollTo(60,70);equal(local.scrollLeft,60);equal(local.scrollTop,70);
+    local.remove();
+    equal(local.scrollLeft,0);equal(local.scrollTop,0);equal(local.scrollWidth,0);equal(local.scrollHeight,0);
+    local.scrollTo(150,160);equal(local.scrollLeft,0);equal(local.scrollTop,0);
+  });
+  var frame=document.createElement('iframe');
+  var frameBefore;
+  window.addEventListener('message',function(event){
+    var data=event.data;
+    if(!data||data.kind!=='overflow-viewport-child')return;
+    results=results.concat(data.results);
+    check('child scroll leaves the parent viewport and fixed box unchanged',function(){
+      equal(root.scrollLeft,80);equal(root.scrollTop,60);fixedUnchanged();
+    });
+    check('child scroll leaves its iframe element in the parent viewport',function(){
+      var box=frame.getBoundingClientRect();equal(box.x,frameBefore.x);equal(box.y,frameBefore.y);
+    });
+    check('root scroll dimensions retain the viewport when the root has no box',function(){
+      root.style.display='none';
+      atLeast(root.scrollWidth,1);atLeast(root.scrollHeight,1);
+      root.scrollTo(100,100);equal(root.scrollLeft,0);equal(root.scrollTop,0);
+    });
+    finish();
+  });
+  frame.src='css-overflow-viewport-child.html';
+  body.appendChild(frame);
+  frameBefore=frame.getBoundingClientRect();
+  setTimeout(function(){
+    if(finished)return;
+    results.push({name:'real child Frame reports its scrolling assertions',status:1,message:'child report missing'});
+    finish();
+  },5000);
+});
+</script></body></html>

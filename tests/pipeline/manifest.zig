@@ -27,6 +27,18 @@ pub const Case = struct {
 
 const existing_cases = [_]Case{
     .{
+        .name = "css-overflow-axes-layout",
+        .mode = .layout,
+        .fixture = "tests/pipeline/css-overflow-axes.html",
+        .golden = "tests/golden/pipeline/css-overflow-axes.layout.txt",
+    },
+    .{
+        .name = "css-overflow-axes-display-list",
+        .mode = .display_list,
+        .fixture = "tests/pipeline/css-overflow-axes.html",
+        .golden = "tests/golden/pipeline/css-overflow-axes.display-list.txt",
+    },
+    .{
         .name = "css-nested-sizing-layout",
         .mode = .layout,
         .fixture = "tests/pipeline/css-nested-sizing.html",

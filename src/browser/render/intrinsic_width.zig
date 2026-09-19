@@ -10,6 +10,7 @@ const inline_format = @import("inline_format.zig");
 const replaced_sizing = @import("replaced_sizing.zig");
 const sizing = @import("sizing.zig");
 const css_display = @import("../../document/css_display.zig");
+const css_overflow = @import("../../document/css_overflow.zig");
 const css_flex = @import("../../document/css_flex.zig");
 const flex_format = @import("flex_format.zig");
 const grid_format = @import("grid_format.zig");
@@ -162,10 +163,10 @@ fn constrainedValue(element: dom.Element, natural: Width, intrinsic: Width, tran
     };
     const maximum = sizing.resolve(value(element.style, "max-width", "none"), context) orelse std.math.inf(f64);
     const raw_width = value(element.style, "width", "auto");
-    const overflow = value(element.style, "overflow", "visible");
+    const overflow = css_overflow.parse(value(element.style, "overflow-x", "visible")) orelse .visible;
     const content_minimum = transferred and length.resolve(raw_width, .{ .font_size = context.font_size }) == null and
         std.ascii.eqlIgnoreCase(value(element.style, "min-width", "auto"), "auto") and
-        !std.ascii.eqlIgnoreCase(overflow, "hidden") and !std.ascii.eqlIgnoreCase(overflow, "scroll") and !std.ascii.eqlIgnoreCase(overflow, "auto");
+        !overflow.isScrollable();
     const limits = sizing.Constraints{
         .min = sizing.resolve(value(element.style, "min-width", "auto"), context) orelse if (content_minimum) @min(natural.min, maximum) else 0,
         .max = maximum,
@@ -231,8 +232,8 @@ fn formattingItem(node: *const dom.Node, natural_width: Width, scale: f64, defin
     const preferred = sizing.resolve(value(styles, "width", "auto"), context);
     const minimum = sizing.resolve(value(styles, "min-width", "auto"), context);
     const maximum = sizing.resolve(value(styles, "max-width", "none"), context);
-    const overflow = value(styles, "overflow", "visible");
-    const scrollable = flex_format.eq(overflow, "hidden") or flex_format.eq(overflow, "auto") or flex_format.eq(overflow, "scroll");
+    const overflow = css_overflow.parse(value(styles, "overflow-x", "visible")) orelse .visible;
+    const scrollable = overflow.isScrollable();
     const automatic = minimum == null and flex_format.eq(value(styles, "min-width", "auto"), "auto");
 
     const aspect = replaced_sizing.parseAspectRatio(value(styles, "aspect-ratio", "auto")) orelse replaced_sizing.AspectRatio.auto;

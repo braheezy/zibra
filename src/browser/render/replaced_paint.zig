@@ -234,10 +234,19 @@ pub fn appendRoundedControlGroup(
 /// The control shell stays outside this group. `items` is empty after transfer,
 /// including on failure; the returned command containers belong to destination.
 pub fn appendEditorClip(destination: *std.ArrayList(DisplayItem), allocator: std.mem.Allocator, items: *std.ArrayList(DisplayItem), bounds: display_list.Rect, source: ?display_list.DisplayItemSource) !void {
-    const wrapped = try paint_effects.wrapOwned(allocator, try items.toOwnedSlice(allocator), .{ .clips_overflow = true }, .{ .bounds = bounds, .source = source });
-    errdefer DisplayItem.freeList(allocator, wrapped);
-    try destination.appendSlice(allocator, wrapped);
-    allocator.free(wrapped);
+    var wrapped = std.ArrayList(DisplayItem).fromOwnedSlice(try items.toOwnedSlice(allocator));
+    defer {
+        DisplayItem.freeItems(allocator, wrapped.items);
+        wrapped.deinit(allocator);
+    }
+    try paint_effects.wrapOverflowSuffix(allocator, &wrapped, 0, .{
+        .x1 = bounds.left,
+        .y1 = bounds.top,
+        .x2 = bounds.right,
+        .y2 = bounds.bottom,
+    }, source);
+    try destination.appendSlice(allocator, wrapped.items);
+    wrapped.clearRetainingCapacity();
 }
 
 fn styleValue(style_map: *const parser.StyleMap, property: []const u8) ?[]const u8 {

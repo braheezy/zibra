@@ -581,7 +581,61 @@ test "fixed background raster phase is viewport-local while its clip scrolls" {
     );
 }
 
-test "overflow clip masks an oversized descendant to its block bounds" {
+test "rebased fixed iframe pixels keep their fractional zoom origin through snapshots" {
+    const allocator = std.testing.allocator;
+    var bounds = DisplayCompositor.init(allocator);
+    defer bounds.deinit();
+    var renderer = Renderer.init(allocator, allocator, std.testing.io, &bounds);
+    const red = display_commands.Color{ .r = 255, .g = 0, .b = 0, .a = 255 };
+    const white = z2d.pixel.RGBA{ .r = 255, .g = 255, .b = 255, .a = 255 };
+
+    for ([_]i32{ 0, 1, 2, 5 }) |scroll| {
+        var leaf = [_]DisplayItem{.{ .rect = .{ .x1 = 0, .y1 = 0, .x2 = 8, .y2 = 8, .color = red } }};
+        var fixed = [_]DisplayItem{.{ .transform = .{
+            .translate_x = scroll,
+            .translate_y = scroll,
+            .translation_origin = .{ .x = 3 - scroll, .y = 7 - scroll },
+            .children = &leaf,
+        } }};
+        const source = [_]DisplayItem{.{ .transform = .{
+            .translate_x = 3 - scroll,
+            .translate_y = 7 - scroll,
+            .children = &fixed,
+        } }};
+        var snapshot = snapshot: {
+            const retained = try @import("render/retained_commands.zig").cloneList(allocator, &source);
+            defer DisplayItem.freeList(allocator, retained);
+            break :snapshot try raster_snapshot.RasterSnapshot.clone(allocator, retained);
+        };
+        defer snapshot.deinit();
+        try bounds.rebuildDrawList(snapshot.items);
+        try std.testing.expectEqual(display_commands.Rect{ .left = 2, .top = 5, .right = 8, .bottom = 11 }, bounds.getDisplayItemBounds(bounds.draw_list.items[0], 0.75));
+
+        // Exercise all three interpreters after retained and worker copies.
+        for (0..3) |path| {
+            var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 16, 16);
+            defer surface.deinit(allocator);
+            const pixels = try imageSurfacePixels(&surface);
+            @memset(pixels, white);
+            var context = z2d.Context.init(std.testing.io, allocator, &surface);
+            defer context.deinit();
+            const item = bounds.draw_list.items[0];
+            switch (path) {
+                0 => try renderer.drawDisplayItemZ2dContext(&context, item, 0, 0.75),
+                1 => try renderer.drawDisplayItemZ2dContextWithTransform(&context, item, 0, 0, 0.75),
+                else => try renderer.drawDisplayItemZ2dContextForLayer(&context, item, 0, 0, 0.75),
+            }
+            for (pixels, 0..) |pixel, index| {
+                const x = index % 16;
+                const y = index / 16;
+                const expected = if (x >= 2 and x < 8 and y >= 5 and y < 11) red.toZ2dRgba() else white;
+                try std.testing.expectEqual(expected, pixel);
+            }
+        }
+    }
+}
+
+test "overflow clip masks an oversized descendant to its padding bounds" {
     const allocator = std.testing.allocator;
     var bounds = DisplayCompositor.init(allocator);
     defer bounds.deinit();
@@ -595,12 +649,12 @@ test "overflow clip masks an oversized descendant to its block bounds" {
         .y2 = 20,
         .color = .{ .r = 255, .g = 0, .b = 0, .a = 255 },
     } };
-    const clipped = try paint_effects.wrapOwned(allocator, commands, .{
-        .clips_overflow = true,
-    }, .{
-        .bounds = .{ .left = 5, .top = 5, .right = 15, .bottom = 15 },
-    });
-    defer DisplayItem.freeList(allocator, clipped);
+    var clipped = std.ArrayList(DisplayItem).fromOwnedSlice(commands);
+    defer {
+        DisplayItem.freeItems(allocator, clipped.items);
+        clipped.deinit(allocator);
+    }
+    try paint_effects.wrapOverflowSuffix(allocator, &clipped, 0, .{ .x1 = 5, .y1 = 5, .x2 = 15, .y2 = 15 }, null);
 
     var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 24, 24);
     defer surface.deinit(allocator);
@@ -611,7 +665,7 @@ test "overflow clip masks an oversized descendant to its block bounds" {
     @memset(pixels, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
     var context = z2d.Context.init(std.testing.io, allocator, &surface);
     defer context.deinit();
-    try renderer.drawDisplayItemZ2dContextForLayer(&context, clipped[0], 0, 0, 1.0);
+    try renderer.drawDisplayItemZ2dContextForLayer(&context, clipped.items[0], 0, 0, 1.0);
 
     const width: usize = 24;
     try std.testing.expectEqual(
@@ -626,6 +680,90 @@ test "overflow clip masks an oversized descendant to its block bounds" {
         z2d.pixel.RGBA{ .r = 255, .g = 255, .b = 255, .a = 255 },
         pixels[16 * width + 16],
     );
+}
+
+test "snapshotted overflow clips preserve visible-axis pixels and stationary shell" {
+    const allocator = std.testing.allocator;
+    var bounds = DisplayCompositor.init(allocator);
+    defer bounds.deinit();
+    var renderer = Renderer.init(allocator, allocator, std.testing.io, &bounds);
+    for ([_][2]bool{ .{ true, false }, .{ false, true }, .{ true, true } }) |axes| {
+        var commands = std.ArrayList(DisplayItem).empty;
+        defer {
+            DisplayItem.freeItems(allocator, commands.items);
+            commands.deinit(allocator);
+        }
+        try commands.append(allocator, .{ .rect = .{
+            .x1 = 0,
+            .y1 = 0,
+            .x2 = 40,
+            .y2 = 40,
+            .color = .{ .r = 255, .g = 0, .b = 0 },
+        } });
+        try commands.append(allocator, .{ .rect = .{
+            .x1 = 0,
+            .y1 = 0,
+            .x2 = 40,
+            .y2 = 40,
+            .color = .{ .r = 0, .g = 255, .b = 0 },
+        } });
+        try paint_effects.wrapOverflowSuffix(allocator, &commands, 1, .{
+            .x1 = 10,
+            .y1 = 10,
+            .x2 = 30,
+            .y2 = 30,
+            .clip_x = axes[0],
+            .clip_y = axes[1],
+            .radius = 8,
+        }, null);
+        var snapshot = try raster_snapshot.RasterSnapshot.clone(allocator, commands.items);
+        defer snapshot.deinit();
+        DisplayItem.freeItems(allocator, commands.items);
+        commands.clearRetainingCapacity();
+
+        var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 40, 40);
+        defer surface.deinit(allocator);
+        const pixels = try imageSurfacePixels(&surface);
+        @memset(pixels, .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+        var context = z2d.Context.init(std.testing.io, allocator, &surface);
+        defer context.deinit();
+        for (snapshot.items) |item| try renderer.drawDisplayItemZ2dContextForLayer(&context, item, 0, 0, 1);
+        const red = z2d.pixel.RGBA{ .r = 255, .g = 0, .b = 0, .a = 255 };
+        const green = z2d.pixel.RGBA{ .r = 0, .g = 255, .b = 0, .a = 255 };
+        try std.testing.expectEqual(green, pixels[20 * 40 + 20]);
+        try std.testing.expectEqual(if (axes[0]) red else green, pixels[20 * 40 + 5]);
+        try std.testing.expectEqual(if (axes[1]) red else green, pixels[5 * 40 + 20]);
+        try std.testing.expectEqual(if (axes[0] and axes[1]) red else green, pixels[10 * 40 + 10]);
+    }
+}
+
+test "single-axis raster clips bound huge visible extents to the raster target" {
+    const allocator = std.testing.allocator;
+    var bounds = DisplayCompositor.init(allocator);
+    defer bounds.deinit();
+    var renderer = Renderer.init(allocator, allocator, std.testing.io, &bounds);
+    var children = [_]DisplayItem{.{ .rect = .{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 1000000000,
+        .y2 = 20,
+        .color = .{ .r = 0, .g = 255, .b = 0 },
+    } }};
+    const clipped = DisplayItem{ .blend = .{
+        .opacity = 1,
+        .blend_mode = null,
+        .children = &children,
+        .overflow_clip = .{ .x1 = 0, .y1 = 5, .x2 = 10, .y2 = 15, .clip_x = false },
+    } };
+    var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 24, 24);
+    defer surface.deinit(allocator);
+    const pixels = try imageSurfacePixels(&surface);
+    @memset(pixels, .{ .r = 255, .g = 0, .b = 0, .a = 255 });
+    var context = z2d.Context.init(std.testing.io, allocator, &surface);
+    defer context.deinit();
+    try renderer.drawDisplayItemZ2dContextForLayer(&context, clipped, 100, 0, 1);
+    try std.testing.expectEqual(@as(u8, 255), pixels[10 * 24 + 23].g);
+    try std.testing.expectEqual(@as(u8, 255), pixels[4 * 24 + 23].r);
 }
 
 test "convex quad paint preserves mitered border corners" {
@@ -1241,7 +1379,18 @@ pub const Renderer = struct {
     ) anyerror!void {
         std.debug.assert(blend_item == .blend);
         const blend = blend_item.blend;
-        const bounds = self.bounds.getDisplayItemBounds(blend_item, zoom);
+        var bounds = self.bounds.getDisplayItemBounds(blend_item, zoom);
+        if (blend.overflow_clip != null) {
+            // A visible axis may contain arbitrarily distant descendants. Its
+            // clip surface need cover only this raster target, not that entire
+            // finite-but-potentially-enormous overflow range.
+            bounds = bounds.intersection(.{
+                .left = layer_x,
+                .top = layer_y,
+                .right = layer_x +| context.surface.getWidth(),
+                .bottom = layer_y +| context.surface.getHeight(),
+            }) orelse return;
+        }
         const width = bounds.width();
         const height = bounds.height();
         if (width <= 0 or height <= 0) return;
@@ -1256,6 +1405,7 @@ pub const Renderer = struct {
         var isolated_item = blend_item;
         isolated_item.blend.needs_compositing = false;
         isolated_item.blend.opacity = 1.0;
+        isolated_item.blend.overflow_clip = null;
         const is_destination_mask = if (blend.blend_mode) |mode|
             std.mem.eql(u8, mode, "dst_in")
         else
@@ -1268,6 +1418,32 @@ pub const Renderer = struct {
             bounds.top,
             zoom,
         );
+        if (blend.overflow_clip) |clip| {
+            const left = self.scalePxWithZoom(clip.x1, zoom) -| bounds.left;
+            const right = self.scalePxWithZoom(clip.x2, zoom) -| bounds.left;
+            const top = self.scalePxWithZoom(clip.y1, zoom) -| bounds.top;
+            const bottom = self.scalePxWithZoom(clip.y2, zoom) -| bounds.top;
+            const radius = if (clip.clip_x and clip.clip_y) self.scalePxFWithZoom(clip.radius, zoom) else 0.0;
+            const pixels = try imageSurfacePixels(&surface);
+            const columns: usize = @intCast(width);
+            for (0..@as(usize, @intCast(height))) |row| {
+                for (0..columns) |column| {
+                    const x: i32 = @intCast(column);
+                    const y: i32 = @intCast(row);
+                    const coverage = if ((clip.clip_x and (x < left or x >= right)) or
+                        (clip.clip_y and (y < top or y >= bottom)))
+                        0.0
+                    else if (radius > 0)
+                        roundedRectCoverage(x, y, left, top, right, bottom, radius)
+                    else
+                        1.0;
+                    if (coverage >= 1) continue;
+                    const alpha: u8 = @intFromFloat(@round(255.0 * coverage));
+                    const pixel = &pixels[row * columns + column];
+                    pixel.* = compositor.runPixelT(z2d.pixel.RGBA, pixel.*, z2d.pixel.RGBA, .{ .r = alpha, .g = alpha, .b = alpha, .a = alpha }, .dst_in);
+                }
+            }
+        }
 
         const operator = if (blend.blend_mode) |mode| self.parseBlendMode(mode) else .src_over;
         try self.compositePremultipliedSurface(
@@ -1462,6 +1638,10 @@ pub const Renderer = struct {
                 }
             },
             .blend => |blend_item| {
+                if (blend_item.overflow_clip != null) {
+                    try self.drawIsolatedBlendForLayer(context, item, 0, scroll_offset, zoom);
+                    return;
+                }
                 if (blend_item.blur_radius > 0.0) {
                     try self.drawBlurredChildren(
                         context,
@@ -1602,17 +1782,18 @@ pub const Renderer = struct {
                 }
             },
             .transform => |t| {
+                const translation = DisplayItem.scaledTranslation(t, zoom, .nearest);
                 // A viewport-attached group starts a fresh frame coordinate
                 // space. Its own translate still applies, but the root page
                 // scroll and any ancestor document translation do not.
                 const new_scroll_offset = if (t.scroll_attachment == .frame_viewport)
-                    0 - self.scalePxWithZoom(t.translate_y, zoom)
+                    0 - translation.y
                 else
-                    scroll_offset - self.scalePxWithZoom(t.translate_y, zoom);
+                    scroll_offset - translation.y;
                 const new_x_offset = if (t.scroll_attachment == .frame_viewport)
-                    self.scalePxWithZoom(t.translate_x, zoom)
+                    translation.x
                 else
-                    self.scalePxWithZoom(t.translate_x, zoom);
+                    translation.x;
                 for (t.children) |child| {
                     // Recursively draw children with adjusted offset
                     // For x translation, we need to handle it differently since scroll is y-only
@@ -1860,6 +2041,10 @@ pub const Renderer = struct {
                 try context.stroke();
             },
             .blend => |blend_item| {
+                if (blend_item.overflow_clip != null) {
+                    try self.drawIsolatedBlendForLayer(context, item, -x_offset, scroll_offset, zoom);
+                    return;
+                }
                 if (blend_item.blur_radius > 0.0) {
                     try self.drawBlurredChildren(
                         context,
@@ -1952,17 +2137,18 @@ pub const Renderer = struct {
                 }
             },
             .transform => |t| {
+                const translation = DisplayItem.scaledTranslation(t, zoom, .nearest);
                 // A viewport attachment cancels the inherited root-scroll
                 // basis exactly once. Nested document transforms then compose
                 // normally inside that fresh coordinate space.
                 const child_scroll = if (t.scroll_attachment == .frame_viewport)
-                    0 - self.scalePxWithZoom(t.translate_y, zoom)
+                    0 - translation.y
                 else
-                    scroll_offset - self.scalePxWithZoom(t.translate_y, zoom);
+                    scroll_offset - translation.y;
                 const child_x = if (t.scroll_attachment == .frame_viewport)
-                    self.scalePxWithZoom(t.translate_x, zoom)
+                    translation.x
                 else
-                    x_offset + self.scalePxWithZoom(t.translate_x, zoom);
+                    x_offset + translation.x;
                 for (t.children) |child| {
                     try self.drawDisplayItemZ2dContextWithTransform(
                         context,
@@ -2136,7 +2322,7 @@ pub const Renderer = struct {
                 context.resetPath();
             },
             .blend => |blend_item| {
-                if (rasterBlendNeedsIsolation(
+                if (blend_item.overflow_clip != null or rasterBlendNeedsIsolation(
                     blend_item.needs_compositing,
                     blend_item.blend_mode,
                     blend_item.children.len,
@@ -2219,18 +2405,19 @@ pub const Renderer = struct {
                 // They would have been handled by the compositing pass
             },
             .transform => |t| {
+                const translation = DisplayItem.scaledTranslation(t, zoom, .nearest);
                 // Document rasters express their origin as `layer_x/y`.
                 // Viewport-attached groups deliberately discard that origin,
                 // so a one-viewport raster can contain both scrolled page
                 // pixels and fixed pixels without moving the latter.
                 const child_layer_x = if (t.scroll_attachment == .frame_viewport)
-                    0 - self.scalePxWithZoom(t.translate_x, zoom)
+                    0 - translation.x
                 else
-                    layer_x - self.scalePxWithZoom(t.translate_x, zoom);
+                    layer_x - translation.x;
                 const child_layer_y = if (t.scroll_attachment == .frame_viewport)
-                    0 - self.scalePxWithZoom(t.translate_y, zoom)
+                    0 - translation.y
                 else
-                    layer_y - self.scalePxWithZoom(t.translate_y, zoom);
+                    layer_y - translation.y;
                 for (t.children) |child| {
                     try self.drawDisplayItemZ2dContextForLayer(
                         context,

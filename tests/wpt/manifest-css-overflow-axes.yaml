@@ -1,0 +1,47 @@
+# Physical overflow pairs, clipping, programmatic element scrolling, automatic
+# minima and body-to-viewport propagation. All unchanged upstream files are
+# already covered by the default manifest's css directory; expectations stay
+# PASS. Preserve the two shared-sizing manifests and their reports separately.
+# Whole mixed files retain logical-axis parsing, RTL scrolling and stylesheet
+# CSSOM assertions as explicit prerequisites; do not count ignored behavior as
+# proof of those capabilities. Selection excludes TestRendered/testdriver,
+# scrollIntoView/window-scroll APIs, containment and overflow-clip-margin work.
+tests:
+  - css/css-overflow/parsing/overflow-valid.html
+  - css/css-overflow/parsing/overflow-invalid.html
+  - css/css-overflow/parsing/overflow-computed.html
+  - css/css-overflow/overflow-shorthand-001.html
+  - css/cssom/overflow-serialization.html
+  - css/css-overflow/single-axis-scroll-apis-programmatic.html
+  - css/css-overflow/single-axis-scroll-apis-dynamic.html
+  - css/css-overflow/overflow-clip-hit-testing.html
+  - css/css-overflow/overflow-clip-no-off-axis-scrollbar.html
+  - css/css-overflow/scrollable-overflow-zero-one-axis.html
+  - css/cssom-view/scrollWidthHeight-negative-margin-001.html
+  - css/css-flexbox/flexbox-min-height-auto-003.html
+  - css/css-flexbox/flexbox-min-height-auto-004.html
+  - css/css-grid/grid-items/grid-item-minimum-size-single-axis-scroll-container.html
+reftests:
+  - css/css-flexbox/flexbox-min-width-auto-003.html
+  - css/css-flexbox/flexbox-min-width-auto-004.html
+  - css/css-flexbox/min-size-auto-overflow-clip.html
+  - css/css-grid/min-size-auto-overflow-clip.html
+  - css/css-overflow/clip-001.html
+  - css/css-overflow/clip-002.html
+  - css/css-overflow/clip-004.html
+  - css/css-overflow/clip-006.html
+  - css/css-overflow/overflow-clip-cant-scroll.html
+  - css/css-overflow/overflow-clipped-transparent-border-clip.html
+  - css/css-overflow/dynamic-visible-to-clip-001.html
+  - css/css-overflow/dynamic-visible-to-clip-002.html
+  - css/css-overflow/overflow-body-propagation-001.html
+  - css/css-overflow/overflow-body-propagation-002.html
+  - css/css-overflow/overflow-body-propagation-004.html
+  - css/css-overflow/overflow-body-propagation-007.html
+  - css/css-overflow/overflow-body-propagation-008.html
+  - css/css-overflow/overflow-body-propagation-009.html
+  - css/css-overflow/overflow-body-propagation-012.html
+  - css/css-overflow/overflow-body-propagation-014.html
+crashtests:
+  - css/css-overflow/overflow-clip-001-crash.html
+  - css/css-overflow/overflow-clip-002-crash.html

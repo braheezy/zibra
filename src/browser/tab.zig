@@ -1275,9 +1275,16 @@ fn refreshFocusState(self: *Tab) !void {
 }
 
 pub fn clampScrollForFrame(self: *const Tab, frame: *const Frame, scroll: i32) i32 {
+    if (frame.scrollport_height > 0) return std.math.clamp(scroll, 0, @max(0, frame.content_height -| frame.scrollport_height));
     const zoom = if (self.accessibility.zoom > 0) self.accessibility.zoom else 1.0;
     const viewport_height = if (frame.viewport_height > 0) frame.viewport_height else self.tab_height;
     return clampScrollOffset(scroll, frame.content_height, viewport_height, zoom);
+}
+
+/// Clamp horizontal layout pixels against the last clean viewport geometry.
+pub fn clampScrollXForFrame(self: *const Tab, frame: *const Frame, scroll: i32) i32 {
+    const port = if (frame.scrollport_width > 0) frame.scrollport_width else scroll_model.viewportHeightCss(if (frame.viewport_width > 0) frame.viewport_width else self.tab_width, self.accessibility.zoom);
+    return std.math.clamp(scroll, 0, @max(0, frame.content_width -| port));
 }
 
 /// Clamp a CSS-pixel scroll offset to the document range visible at `zoom`.
@@ -1304,7 +1311,7 @@ pub fn composeDisplayList(self: *Tab, root: *Frame) IframeComposeError!?[]Displa
     defer combined.deinit(self.allocator);
     errdefer DisplayItem.freeItems(self.allocator, combined.items);
 
-    try self.replaceIframesInList(root, root_list, &combined);
+    try self.replaceIframesInList(root, root_list, null, &combined);
     const composed = try combined.toOwnedSlice(self.allocator);
     DisplayItem.clearSources(composed);
     return composed;
@@ -1314,12 +1321,13 @@ fn replaceIframesInList(
     self: *Tab,
     root: *Frame,
     items: []DisplayItem,
+    viewport_origin: ?@import("render/display_list.zig").TranslationOrigin,
     out: *std.ArrayList(DisplayItem),
 ) IframeComposeError!void {
     for (items) |item| {
         switch (item) {
             .cached_subtree => |cached| {
-                try self.replaceIframesInList(root, cached.list.items, out);
+                try self.replaceIframesInList(root, cached.list.items, viewport_origin, out);
             },
             .iframe => |iframe_item| {
                 try self.appendIframeContent(root, .{ .iframe = iframe_item }, out);
@@ -1328,7 +1336,7 @@ fn replaceIframesInList(
                 var children = std.ArrayList(DisplayItem).empty;
                 defer children.deinit(self.allocator);
                 errdefer DisplayItem.freeItems(self.allocator, children.items);
-                try self.replaceIframesInList(root, blend_item.children, &children);
+                try self.replaceIframesInList(root, blend_item.children, viewport_origin, &children);
 
                 const child_slice = try children.toOwnedSlice(self.allocator);
                 var child_slice_owned = true;
@@ -1347,6 +1355,7 @@ fn replaceIframesInList(
                         .blend_mode = mode_copy,
                         .blur_radius = blend_item.blur_radius,
                         .hit_clip = blend_item.hit_clip,
+                        .overflow_clip = blend_item.overflow_clip,
                         .children = child_slice,
                         .node = blend_item.node,
                         .parent = null,
@@ -1362,7 +1371,7 @@ fn replaceIframesInList(
                 var children = std.ArrayList(DisplayItem).empty;
                 defer children.deinit(self.allocator);
                 errdefer DisplayItem.freeItems(self.allocator, children.items);
-                try self.replaceIframesInList(root, transform_item.children, &children);
+                try self.replaceIframesInList(root, transform_item.children, viewport_origin, &children);
 
                 const child_slice = try children.toOwnedSlice(self.allocator);
                 var child_slice_owned = true;
@@ -1370,9 +1379,10 @@ fn replaceIframesInList(
 
                 try out.append(self.allocator, .{
                     .transform = .{
-                        .translate_x = transform_item.translate_x,
-                        .translate_y = transform_item.translate_y,
-                        .scroll_attachment = transform_item.scroll_attachment,
+                        .translate_x = transform_item.translate_x +| (if (root.parent != null and transform_item.scroll_attachment == .frame_viewport) root.scroll_x else @as(i32, 0)),
+                        .translate_y = transform_item.translate_y +| (if (root.parent != null and transform_item.scroll_attachment == .frame_viewport) root.scroll else @as(i32, 0)),
+                        .scroll_attachment = if (root.parent != null) .document else transform_item.scroll_attachment,
+                        .translation_origin = if (root.parent != null and transform_item.scroll_attachment == .frame_viewport) viewport_origin else transform_item.translation_origin,
                         .children = child_slice,
                         .node = transform_item.node,
                         .composited = transform_item.composited,
@@ -1464,14 +1474,14 @@ fn appendIframeContent(
     var expanded_children = std.ArrayList(DisplayItem).empty;
     defer expanded_children.deinit(self.allocator);
     errdefer DisplayItem.freeItems(self.allocator, expanded_children.items);
-    try self.replaceIframesInList(root, child_list, &expanded_children);
+    try self.replaceIframesInList(child_frame.?, child_list, .{ .x = iframe_data.rect.left -| child_frame.?.scroll_x, .y = iframe_data.rect.top -| child_frame.?.scroll }, &expanded_children);
     const expanded_slice = try expanded_children.toOwnedSlice(self.allocator);
     var expanded_slice_owned = true;
     errdefer if (expanded_slice_owned) DisplayItem.freeList(self.allocator, expanded_slice);
 
     const transform_item = DisplayItem{
         .transform = .{
-            .translate_x = iframe_data.rect.left,
+            .translate_x = iframe_data.rect.left -| child_frame.?.scroll_x,
             .translate_y = iframe_data.rect.top -| child_frame.?.scroll,
             .children = expanded_slice,
             .node = null,
@@ -1522,6 +1532,7 @@ test "iframe composition replacement preserves transform scroll attachment" {
     var tab: Tab = undefined;
     tab.allocator = allocator;
     var root: Frame = undefined;
+    root.parent = null;
 
     var children = [_]DisplayItem{.{ .rect = .{
         .x1 = 0,
@@ -1542,12 +1553,29 @@ test "iframe composition replacement preserves transform scroll attachment" {
         output.deinit(allocator);
     }
 
-    try tab.replaceIframesInList(&root, source[0..], &output);
+    try tab.replaceIframesInList(&root, source[0..], null, &output);
     try std.testing.expectEqual(@as(usize, 1), output.items.len);
     try std.testing.expectEqual(
         @import("render/display_list.zig").ScrollAttachment.frame_viewport,
         output.items[0].transform.scroll_attachment,
     );
+
+    // A child browsing context cancels only its own scroll. Its fixed group
+    // must retain the embedding iframe translation and the parent's scroll.
+    var parent: Frame = undefined;
+    root.parent = &parent;
+    root.scroll_x = 100;
+    root.scroll = 200;
+    var embedded = std.ArrayList(DisplayItem).empty;
+    defer {
+        DisplayItem.freeItems(allocator, embedded.items);
+        embedded.deinit(allocator);
+    }
+    try tab.replaceIframesInList(&root, source[0..], .{ .x = -97, .y = -197 }, &embedded);
+    try std.testing.expectEqual(@import("render/display_list.zig").ScrollAttachment.document, embedded.items[0].transform.scroll_attachment);
+    try std.testing.expectEqual(@as(i32, 107), embedded.items[0].transform.translate_x);
+    try std.testing.expectEqual(@as(i32, 209), embedded.items[0].transform.translate_y);
+    try std.testing.expectEqual(@as(i32, -97), embedded.items[0].transform.translation_origin.?.x);
 }
 
 // Re-render the page without reloading (style, layout, paint)
@@ -1599,8 +1627,10 @@ fn resolveHoverAfterLayout(self: *Tab, refresh: bool) !bool {
             const page_device_y = position.viewport_device_y +|
                 DisplayItem.scaleLayoutPx(frame.scroll, zoom);
             try frame.collectHoverPathDevice(
-                position.device_x,
+                position.device_x +| DisplayItem.scaleLayoutPx(frame.scroll_x, zoom),
                 page_device_y,
+                position.device_x,
+                position.viewport_device_y,
                 zoom,
                 &path,
             );
@@ -1619,7 +1649,7 @@ fn resolveHoverAfterLayout(self: *Tab, refresh: bool) !bool {
                 const page_device_y = position.viewport_device_y +|
                     DisplayItem.scaleLayoutPx(frame.scroll, zoom);
                 break :blk self.accessibilityHitTest(
-                    DisplayItem.deviceToLayoutPx(position.device_x, zoom),
+                    DisplayItem.deviceToLayoutPx(position.device_x +| DisplayItem.scaleLayoutPx(frame.scroll_x, zoom), zoom),
                     DisplayItem.deviceToLayoutPx(page_device_y, zoom),
                 );
             } else null
@@ -1880,6 +1910,7 @@ pub fn runAnimationFrameForGeneration(
             .certificate_error = frame.certificate_error,
             .display_list = composed_list,
             .scroll = commit_scroll,
+            .scroll_x = if (commit_scroll != null) frame.scroll_x else null,
             .height = frame.content_height,
             .show_scrollbar = committedViewportScrollbarVisible(frame),
             .zoom = self.accessibility.zoom,
@@ -1917,6 +1948,10 @@ fn advanceScrollAnimations(self: *Tab, now_ns: i96) bool {
     while (frame_it.next()) |frame_ptr| {
         const target_frame = frame_ptr.*;
         const animation = target_frame.scroll_animation orelse continue;
+        if (!target_frame.viewport_overflow.y.allowsUserScroll()) {
+            target_frame.scroll_animation = null;
+            continue;
+        }
         const step = animation.sample(now_ns);
         const next_scroll = self.clampScrollForFrame(target_frame, step.scroll);
         if (next_scroll != target_frame.scroll) {
@@ -2416,8 +2451,8 @@ test "pending hover resolves a retained hit after the layout phase" {
     frame.current_node = try html_parser.parse();
     parser.fixParentPointers(&frame.current_node.?, null);
     try parser.style(allocator, &frame.current_node.?, &.{});
-    frame.publishViewportScrollbarVisibility(
-        Layout.rootViewportScrollbarVisible(&frame.current_node.?),
+    frame.publishViewportOverflow(
+        Layout.rootViewportOverflow(&frame.current_node.?),
     );
     try std.testing.expect(!frame.committedViewportScrollbarVisible());
     frame.publishStyledDocument();
@@ -2443,7 +2478,7 @@ test "pending hover resolves a retained hit after the layout phase" {
     try std.testing.expect(span_node.element.is_hovered);
     try std.testing.expect(frame.current_node.?.element.is_hovered);
     try std.testing.expect(frame.styleNeeded());
-    try std.testing.expect(frame.current_node.?.element.style.?.getPtr("overflow").?.dirty);
+    try std.testing.expect(frame.current_node.?.element.style.?.getPtr("overflow-y").?.dirty);
     // `updateHoveredNode` dirtied the root's computed style, including
     // `overflow`. A same-frame commit must use the clean generation's scalar
     // rather than call its ProtectedField getter.
@@ -3314,21 +3349,35 @@ fn blurWithAccess(self: *Tab, access: JsEventAccess) bool {
 /// Try the clicked scroll box first, then each enclosing scroll box. Returning
 /// false at a boundary lets the caller fall back to the frame/page scroller.
 pub fn scrollElementChain(scroll_start: ?*Node, delta: i32) bool {
+    return scrollElementAxes(scroll_start, 0, delta).y;
+}
+
+pub const ScrollMovement = struct { x: bool = false, y: bool = false };
+
+/// Consume each input axis at its first movable ancestor. An exhausted or
+/// forbidden axis continues independently without moving the consumed axis twice.
+pub fn scrollElementAxes(scroll_start: ?*Node, dx: i32, dy: i32) ScrollMovement {
+    var moved = ScrollMovement{};
     var current = scroll_start;
     while (current) |node| {
         switch (node.*) {
             .element => |*element| {
-                const parent = element.parent;
-                if (element.scrollBy(delta)) {
-                    parser.markPaintForElement(element);
-                    return true;
+                var changed = false;
+                if (!moved.x and element.scrollByAxis(.x, dx)) {
+                    moved.x = true;
+                    changed = true;
                 }
-                current = parent;
+                if (!moved.y and element.scrollByAxis(.y, dy)) {
+                    moved.y = true;
+                    changed = true;
+                }
+                if (changed) parser.markPaintForElement(element);
+                current = element.parent;
             },
             .text => |text| current = text.parent,
         }
     }
-    return false;
+    return moved;
 }
 
 fn findBodyElement(node: *Node) ?*parser.Element {
@@ -3362,6 +3411,18 @@ fn frameScrollBehavior(frame: *Frame) scroll_model.Behavior {
     return documentScrollBehavior(root);
 }
 
+// A live policy mutation must be published before user input decides which
+// axes can move. Unlaid-out test/source documents have no retained geometry.
+fn refreshScrollLayout(self: *Tab, b: *Browser, frame: *Frame) bool {
+    if (frame.document.lastValue().* == null) return true;
+    if (!frame.styleNeeded() and !frame.layoutNeeded()) return true;
+    self.render(b) catch |err| {
+        std.log.warn("Scroll layout failed: {}", .{err});
+        return false;
+    };
+    return true;
+}
+
 /// Arrow-key scroll entry point. Element offsets are tab-worker-owned and need
 /// only repaint; an exhausted element chain delegates to the existing frame
 /// scroll model (including iframe and root interest-region behavior).
@@ -3369,12 +3430,14 @@ pub fn scrollFocused(self: *Tab, b: *Browser, delta: i32) void {
     if (!b.tabIsActive(self)) return;
     self.noteKeyboardInteraction();
     const frame = self.focused_frame orelse self.root_frame orelse return;
+    if (!self.refreshScrollLayout(b, frame)) return;
     if (scrollElementChain(frame.scroll_focus, delta)) {
         frame.scroll_animation = null;
         self.setNeedsPaint();
         return;
     }
 
+    if (!frame.viewport_overflow.y.allowsUserScroll()) return;
     if (!self.accessibility.reduce_motion and frameScrollBehavior(frame) == .smooth) {
         const base_scroll = if (frame.scroll_animation) |animation|
             animation.target_scroll
@@ -3406,8 +3469,37 @@ pub fn scrollFocused(self: *Tab, b: *Browser, delta: i32) void {
 pub fn scrollImmediate(self: *Tab, b: *Browser, delta: i32) void {
     if (!b.tabIsActive(self)) return;
     const frame = self.focused_frame orelse self.root_frame orelse return;
+    if (!self.refreshScrollLayout(b, frame)) return;
     frame.scroll_animation = null;
+    if (scrollElementChain(frame.scroll_focus, delta)) {
+        _ = frame.updateSticky();
+        self.setNeedsPaint();
+        return;
+    }
     b.handleScrollForTab(self, delta);
+}
+
+/// Wheel events carry only scalar deltas. Resolve the current hovered frame
+/// and DOM chain on this worker after publishing any pending style/layout work.
+pub fn scrollWheel(self: *Tab, b: *Browser, dx: i32, dy: i32) void {
+    if (!b.tabIsActive(self)) return;
+    if (self.renderPhasesNeeded()) self.render(b) catch |err| {
+        std.log.warn("Wheel layout failed: {}", .{err});
+        return;
+    };
+    var frame = self.root_frame orelse return;
+    while (frame.hovered_node) |node| {
+        const child = frame.findFrameByElement(node) orelse break;
+        if (child.hovered_node == null) break;
+        frame = child;
+    }
+    frame.scroll_animation = null;
+    const moved = scrollElementAxes(frame.hovered_node orelse frame.scroll_focus, dx, dy);
+    if (moved.x or moved.y) {
+        _ = frame.updateSticky();
+        self.setNeedsPaint();
+    }
+    b.handleViewportScrollForTab(self, frame, if (moved.x) 0 else dx, if (moved.y) 0 else dy);
 }
 
 // Handle keypress in focused input
@@ -3785,7 +3877,7 @@ fn frameOffsetToRoot(self: *Tab, frame: *Frame) struct { x: i32, y: i32 } {
         if (current.frame_element) |elem| {
             for (parent.iframe_bounds.items) |entry| {
                 if (entry.node == elem) {
-                    x += entry.bounds.x;
+                    x += entry.bounds.x - current.scroll_x;
                     y += entry.bounds.y - current.scroll;
                     break;
                 }

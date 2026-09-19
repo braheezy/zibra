@@ -12,6 +12,26 @@ const Glyph = font.Glyph;
 pub const GlyphPixelMode = font.GlyphPixelMode;
 const Node = @import("../../document/parser.zig").Node;
 
+pub const TranslationOrigin = struct { x: i32 = 0, y: i32 = 0 };
+pub const PixelRounding = enum { truncate, nearest };
+
+fn scaleTranslationAxis(value: i32, origin: ?i32, zoom_value: f32, rounding: PixelRounding) i32 {
+    const zoom = if (std.math.isFinite(zoom_value) and zoom_value > 0) zoom_value else 1.0;
+    const base: i64 = origin orelse 0;
+    const end = base + @as(i64, value);
+    const end_wide = @as(f64, @floatFromInt(end)) * zoom;
+    const base_wide = @as(f64, @floatFromInt(base)) * zoom;
+    const end_narrow = @as(f32, @floatFromInt(end)) * zoom;
+    const base_narrow = @as(f32, @floatFromInt(base)) * zoom;
+    const scaled_end = if (rounding == .truncate and std.math.isFinite(end_narrow)) @as(f64, end_narrow) else end_wide;
+    const scaled_base = if (rounding == .truncate and std.math.isFinite(base_narrow)) @as(f64, base_narrow) else base_wide;
+    const result = switch (rounding) {
+        .nearest => @round(scaled_end) - @round(scaled_base),
+        .truncate => @trunc(scaled_end) - @trunc(scaled_base),
+    };
+    return @intFromFloat(std.math.clamp(result, std.math.minInt(i32), std.math.maxInt(i32)));
+}
+
 pub const Color = struct {
     r: u8,
     g: u8,
@@ -347,6 +367,61 @@ pub const RoundedHitClip = struct {
     radius: f64,
 };
 
+/// Scalar content clip in its enclosing command coordinate space. Disabled
+/// axes remain unbounded; raster callers intersect enabled axes with finite
+/// content bounds before allocating a surface.
+pub const AxisClip = struct {
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    clip_x: bool = true,
+    clip_y: bool = true,
+    radius: f64 = 0.0,
+
+    pub fn contains(self: AxisClip, x: i32, y: i32, zoom: f32) bool {
+        if (self.clip_x and (x < DisplayItem.scaleLayoutPx(self.x1, zoom) or
+            x >= DisplayItem.scaleLayoutPx(self.x2, zoom))) return false;
+        if (self.clip_y and (y < DisplayItem.scaleLayoutPx(self.y1, zoom) or
+            y >= DisplayItem.scaleLayoutPx(self.y2, zoom))) return false;
+        return !self.clip_x or !self.clip_y or self.radius <= 0 or
+            DisplayItem.pointInRoundedRect(x, y, self, zoom);
+    }
+
+    pub fn intersectBounds(self: AxisClip, bounds: Rect, zoom: f32) Rect {
+        var result = bounds;
+        if (self.clip_x) {
+            result.left = @max(result.left, DisplayItem.scaleLayoutPx(self.x1, zoom));
+            result.right = @min(result.right, DisplayItem.scaleLayoutPx(self.x2, zoom));
+        }
+        if (self.clip_y) {
+            result.top = @max(result.top, DisplayItem.scaleLayoutPx(self.y1, zoom));
+            result.bottom = @min(result.bottom, DisplayItem.scaleLayoutPx(self.y2, zoom));
+        }
+        return result;
+    }
+};
+
+test "axis clips preserve the visible direction and round only dual-axis corners" {
+    var clip = AxisClip{ .x1 = 10, .y1 = 20, .x2 = 30, .y2 = 40, .clip_y = false, .radius = 10 };
+    try std.testing.expect(clip.contains(10, -1000, 1));
+    try std.testing.expect(clip.contains(15, 1000, 1));
+    try std.testing.expect(!clip.contains(30, 25, 1));
+    try std.testing.expectEqual(Rect{ .left = 10, .top = -1000, .right = 30, .bottom = 1000 }, clip.intersectBounds(
+        .{ .left = -100, .top = -1000, .right = 100, .bottom = 1000 },
+        1,
+    ));
+    clip.clip_x = false;
+    clip.clip_y = true;
+    try std.testing.expect(clip.contains(-1000, 20, 1));
+    try std.testing.expect(!clip.contains(20, 40, 1));
+    clip.clip_x = true;
+    try std.testing.expect(!clip.contains(10, 20, 1));
+    try std.testing.expect(clip.contains(20, 20, 1));
+    clip.x2 = clip.x1;
+    try std.testing.expect(!clip.contains(10, 30, 1));
+}
+
 /// Coordinate space to which an owning transform group is attached.
 ///
 /// Document-attached groups inherit the page cache's scroll origin.
@@ -428,6 +503,7 @@ pub const DisplayItem = union(enum) {
         blend_mode: ?[]const u8,
         blur_radius: f64 = 0.0,
         hit_clip: ?RoundedHitClip = null,
+        overflow_clip: ?AxisClip = null,
         children: []DisplayItem,
         node: ?*anyopaque = null,
         parent: ?*const DisplayItem = null,
@@ -447,6 +523,9 @@ pub const DisplayItem = union(enum) {
     transform: struct {
         translate_x: i32,
         translate_y: i32,
+        /// An enclosing frame translation whose rounding must cancel before
+        /// rebased fixed content is placed. This is copied scalar geometry.
+        translation_origin: ?TranslationOrigin = null,
         scroll_attachment: ScrollAttachment = .document,
         children: []DisplayItem,
         node: ?*anyopaque = null,
@@ -576,7 +655,7 @@ pub const DisplayItem = union(enum) {
     pub fn fuseCompositedLayerDraw(self: DisplayItem) ?DisplayItem {
         if (self != .blend) return null;
         const blend_item = self.blend;
-        if (blend_item.blend_mode != null or blend_item.blur_radius > 0.0) return null;
+        if (blend_item.blend_mode != null or blend_item.blur_radius > 0.0 or blend_item.overflow_clip != null) return null;
         if (blend_item.opacity >= 1.0 or blend_item.children.len != 1) return null;
         if (blend_item.children[0] != .draw_composited_layer) return null;
 
@@ -686,6 +765,16 @@ pub const DisplayItem = union(enum) {
         return @intFromFloat(@as(f32, @floatFromInt(value)) * zoom);
     }
 
+    /// Preserve the caller's established pixel rounding while cancelling a
+    /// rebased frame origin before rounding the final fixed translation.
+    pub fn scaledTranslation(transform: anytype, zoom: f32, rounding: PixelRounding) TranslationOrigin {
+        const origin = transform.translation_origin;
+        return .{
+            .x = scaleTranslationAxis(transform.translate_x, if (origin) |value| value.x else null, zoom, rounding),
+            .y = scaleTranslationAxis(transform.translate_y, if (origin) |value| value.y else null, zoom, rounding),
+        };
+    }
+
     pub fn rasterScale(source_zoom_value: f32, target_zoom_value: f32) f32 {
         const source_zoom = if (std.math.isFinite(source_zoom_value) and source_zoom_value > 0)
             source_zoom_value
@@ -743,15 +832,15 @@ pub const DisplayItem = union(enum) {
     /// Hit test only transform subtrees attached to the owning frame viewport.
     ///
     /// `document_x` and `document_y` describe the normal page-space pointer,
-    /// while `frame_viewport_y` is the same pointer before the Frame's root
-    /// scroll translation. Root scrolling is vertical, so the viewport x
-    /// coordinate remains `document_x`. Normal document-attached items are
+    /// while `frame_viewport_x/y` are the same pointer before the Frame's root
+    /// scroll translation. Normal document-attached items are
     /// deliberately ignored here; callers use `hitTestDevice` as their normal
     /// fallback so existing layout and painted hit testing keep their behavior.
     pub fn hitTestFrameViewportDevice(
         items: []const DisplayItem,
         document_x: i32,
         document_y: i32,
+        frame_viewport_x: i32,
         frame_viewport_y: i32,
         zoom_value: f32,
     ) ?HitResult {
@@ -760,7 +849,7 @@ pub const DisplayItem = union(enum) {
             items,
             document_x,
             document_y,
-            document_x,
+            frame_viewport_x,
             frame_viewport_y,
             zoom,
         );
@@ -802,6 +891,9 @@ pub const DisplayItem = union(enum) {
                     if (blend_item.hit_clip) |clip| {
                         if (!pointInRoundedRect(document_x, document_y, clip, zoom)) continue;
                     }
+                    if (blend_item.overflow_clip) |clip| {
+                        if (!clip.contains(document_x, document_y, zoom)) continue;
+                    }
                     const is_dst_in = if (blend_item.blend_mode) |mode|
                         std.mem.eql(u8, mode, "dst_in")
                     else
@@ -832,9 +924,9 @@ pub const DisplayItem = union(enum) {
                 .transform => |transform_item| {
                     if (transform_item.scroll_attachment == .frame_viewport) {
                         const local_x = frame_viewport_x -
-                            scaleLayoutPx(transform_item.translate_x, zoom);
+                            scaledTranslation(transform_item, zoom, .truncate).x;
                         const local_y = frame_viewport_y -
-                            scaleLayoutPx(transform_item.translate_y, zoom);
+                            scaledTranslation(transform_item, zoom, .truncate).y;
                         // The full existing hit-test walker owns the subtree's
                         // masks, clips, and ordinary transforms after the
                         // coordinate reset. This transform establishes the
@@ -843,8 +935,8 @@ pub const DisplayItem = union(enum) {
                         continue;
                     }
 
-                    const local_x = document_x - scaleLayoutPx(transform_item.translate_x, zoom);
-                    const local_y = document_y - scaleLayoutPx(transform_item.translate_y, zoom);
+                    const local_x = document_x - scaledTranslation(transform_item, zoom, .truncate).x;
+                    const local_y = document_y - scaledTranslation(transform_item, zoom, .truncate).y;
                     if (hitTestFrameViewportDeviceList(
                         transform_item.children,
                         local_x,
@@ -879,6 +971,9 @@ pub const DisplayItem = union(enum) {
                     if (blend_item.hit_clip) |clip| {
                         if (!pointInRoundedRect(x, y, clip, zoom)) continue;
                     }
+                    if (blend_item.overflow_clip) |clip| {
+                        if (!clip.contains(x, y, zoom)) continue;
+                    }
                     const is_dst_in = if (blend_item.blend_mode) |mode|
                         std.mem.eql(u8, mode, "dst_in")
                     else
@@ -902,8 +997,8 @@ pub const DisplayItem = union(enum) {
                     if (hitTestDeviceList(blend_item.children, x, y, zoom)) |hit| return hit;
                 },
                 .transform => |transform_item| {
-                    const local_x = x - scaleLayoutPx(transform_item.translate_x, zoom);
-                    const local_y = y - scaleLayoutPx(transform_item.translate_y, zoom);
+                    const local_x = x - scaledTranslation(transform_item, zoom, .truncate).x;
+                    const local_y = y - scaledTranslation(transform_item, zoom, .truncate).y;
                     if (hitTestDeviceList(transform_item.children, local_x, local_y, zoom)) |hit| return hit;
                 },
                 else => {
@@ -937,6 +1032,9 @@ pub const DisplayItem = union(enum) {
                 if (blend_item.hit_clip) |clip| {
                     if (!pointInRoundedRect(x, y, clip, zoom)) break :blk false;
                 }
+                if (blend_item.overflow_clip) |clip| {
+                    if (!clip.contains(x, y, zoom)) break :blk false;
+                }
                 const is_dst_in = if (blend_item.blend_mode) |mode|
                     std.mem.eql(u8, mode, "dst_in")
                 else
@@ -958,8 +1056,8 @@ pub const DisplayItem = union(enum) {
                 break :blk listContainsPaintedPoint(blend_item.children, x, y, zoom);
             },
             .transform => |transform_item| blk: {
-                const local_x = x - scaleLayoutPx(transform_item.translate_x, zoom);
-                const local_y = y - scaleLayoutPx(transform_item.translate_y, zoom);
+                const local_x = x - scaledTranslation(transform_item, zoom, .truncate).x;
+                const local_y = y - scaledTranslation(transform_item, zoom, .truncate).y;
                 break :blk listContainsPaintedPoint(transform_item.children, local_x, local_y, zoom);
             },
             else => containsPrimitivePoint(item, x, y, zoom),
@@ -1344,8 +1442,9 @@ test "viewport attachment hit testing resets page scroll in reverse paint order"
 
     const hit = DisplayItem.hitTestFrameViewportDevice(
         roots[0..],
-        8,
+        108,
         200,
+        8,
         8,
         1.0,
     ) orelse return error.TestExpectedEqual;
@@ -1367,8 +1466,9 @@ test "viewport attachment hit testing resets page scroll in reverse paint order"
     } }};
     try std.testing.expect(DisplayItem.hitTestFrameViewportDevice(
         document_only[0..],
-        8,
+        108,
         200,
+        8,
         8,
         1.0,
     ) == null);
@@ -1458,4 +1558,20 @@ test "viewport attachment detection visits nested owning and cached subtrees" {
     try std.testing.expect(!DisplayItem.hasViewportAttachedPaint(document_only[0..]));
     try std.testing.expect(DisplayItem.hasViewportAttachedPaint(roots[0..]));
     try std.testing.expect(DisplayItem.hasViewportAttachedPaint(fixed_background[0..]));
+}
+
+test "frame translation origin cancels before either pixel rounding policy" {
+    var children = [_]DisplayItem{};
+    const item = DisplayItem{ .transform = .{
+        .translate_x = 1,
+        .translate_y = 1,
+        .translation_origin = .{ .x = 2, .y = 6 },
+        .children = &children,
+    } };
+    try std.testing.expectEqual(TranslationOrigin{ .x = 0, .y = 0 }, DisplayItem.scaledTranslation(item.transform, 0.75, .nearest));
+    try std.testing.expectEqual(TranslationOrigin{ .x = 1, .y = 1 }, DisplayItem.scaledTranslation(item.transform, 0.75, .truncate));
+    var extreme = item.transform;
+    extreme.translate_x = std.math.maxInt(i32);
+    extreme.translation_origin = .{ .x = std.math.maxInt(i32) };
+    try std.testing.expectEqual(std.math.maxInt(i32), DisplayItem.scaledTranslation(extreme, 2, .nearest).x);
 }

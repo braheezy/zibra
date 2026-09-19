@@ -202,6 +202,18 @@ const WptFixture = struct {
 
 const wpt_fixtures = [_]WptFixture{
     .{
+        .fixture = "tests/wpt/css-overflow-viewport.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-overflow-viewport.jsonl",
+    },
+    .{
+        .fixture = "tests/manual/css-overflow-axes.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-overflow-axes.jsonl",
+    },
+    .{
         .fixture = "tests/manual/css-nested-sizing.html",
         .status = "PASS",
         .timeout_ms = 10_000,

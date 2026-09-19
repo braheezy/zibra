@@ -1,6 +1,6 @@
 rect x1=13 y1=18 x2=63 y2=28 color=#ccccccff
 rect x1=13 y1=28 x2=213 y2=90 color=#eeeeffff
-hit-clip rounded x1=13 y1=28 x2=113 y2=48 radius=8
+blend opacity=1 mode=normal
   rounded-rect x1=13 y1=28 x2=113 y2=48 radius=8 color=#008800ff
 rect x1=13 y1=48 x2=175 y2=90 color=#aaaaffff
 quad x1=13 y1=48 x2=175 y2=48 x3=169 y3=54 x4=19 y4=54 color=#0000aaff

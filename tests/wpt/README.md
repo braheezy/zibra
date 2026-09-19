@@ -1047,6 +1047,76 @@ interaction checks. See the
 [reviewed design](../../docs/plans/shared-sizing-alignment-followup.md) for
 ownership, supported topology and validation boundaries.
 
+## Independent overflow axes
+
+[`manifest-css-overflow-axes.yaml`](manifest-css-overflow-axes.yaml) selects
+36 unchanged upstream files: 14 testharness, 20 reftests and two crashtests.
+It covers physical longhands and shorthand CSSOM, computed pairs, independent
+programmatic scrolling, live policy changes, clipping, recursive overflow
+extents, root/body propagation, and flex/grid automatic minima. The six
+axis-dependent automatic-minimum failures preserved in the earlier sizing
+selection remain selected here. All paths already belong to the default
+manifest's CSS directory; no default additions or expectation overrides are
+needed. Preserve the 37- and 49-file sizing manifests and reports separately.
+
+```sh
+python3 tests/wpt/run.py tests/wpt/manifest-css-overflow-axes.yaml --mode all --jobs 1 --browser ./zig-out/bin/zibra --report /tmp/zibra-overflow-axes.json
+```
+
+The pinned pair tests follow the current Overflow draft: `clip` stays
+independently non-scrollable beside `auto`, `hidden` or `scroll`; only `visible`
+coerces to `auto`. Viewport propagation separately interprets clip as hidden.
+Keep the whole upstream files, including their unsupported logical-axis and
+RTL assertions. The serialization file also includes stylesheet CSSOM
+assertions, separate from its direct inline-style cases. The selected clip
+hit-test harness requires the missing `document.elementFromPoint` API; native
+layout and painted-command tests exercise the underlying clip/hit behavior.
+An off-axis scrollbar test can pass because element scrollbar widgets are
+absent, so that pass alone does not establish independent-axis geometry.
+
+Excluded candidates require Window scrolling methods, `scrollIntoView`,
+`document.scrollingElement`, containment, clip-margin, unsupported rendered-event
+hooks or testdriver. These omissions do not imply that every remaining selected
+failure has a prerequisite explanation; inspect the unchanged semantic and
+pixel results individually. Horizontal LTR nonnegative origins are the supported
+scroll model; reverse-origin scrolling, scrollbar widgets and styling, smooth
+scrolling and scroll events remain separate work.
+
+The final matching implementation run passes 31/36 files and 97/113
+harness subtests, compared with 13/36 and 30/113 before: testharness files improve
+from 3/14 to 9/14, reftests from 8/20 to 20/20, and crashes remain 2/2.
+The remaining 16 subtests are identified precisely: four valid-value and
+five computed-value checks for logical overflow longhands; five accesses to
+unimplemented indexed stylesheet rule objects in the serialization file;
+one RTL negative horizontal-offset check; and the missing
+`document.elementFromPoint` call. The other RTL case scrolls only its vertical
+axis and does not establish negative-origin support. All five inline-element
+serialization cases pass. All reached LTR geometry checks and all reftests pass
+in that run, but the stated broader scope limits still apply.
+
+The same 36 file/mode pairs and 113 ordered harness subtests gain 67 passes and
+lose none. One passing subtest changes its generated name: the negative-margin
+file includes `wrapper.style.cssText` in the name, which now contains the newly
+admitted `overflow: clip;` declaration. Compare that case by its unchanged
+source position; do not claim every assertion name is identical. Neither run
+has harness-level errors, timeouts, crashes or infrastructure failures; missing
+API calls remain caught subtest failures.
+
+Regression runs preserve the 37-file nested-sizing set at 22/37 files and
+142/191 subtests. The original 49-file set improves from 27/49 to 30/49 files
+and 221/329 to 227/329 subtests, with no losses. Its six automatic-minimum gains
+overlap this overflow selection and are not additional to the 67 reported here.
+
+The [manual page](../manual/css-overflow-axes.html) checks pairs, metrics,
+offset resets/clamps, flex panel sizing, nested/atomic bounds and descendant
+geometry through the local WPT gate. It also exposes visible-axis link hits,
+inline controls and real horizontal/vertical wheel input for manual checks.
+The [pipeline fixture](../pipeline/css-overflow-axes.html) checks stationary
+borders, independent padding-edge clips and rounded dual-axis clipping without
+font dependencies. Native tests retain owners across style and size changes.
+See the [reviewed plan](../../docs/plans/css-overflow-axes.md) for viewport,
+ownership and validation boundaries.
+
 ## Ordinary block aspect ratios
 
 `manifest-aspect-ratio-blocks.yaml` isolates shared property parsing/computed

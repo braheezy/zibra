@@ -30,6 +30,8 @@ const box_alignment = @import("box_alignment.zig");
 const css_sizing = @import("../../document/css_sizing.zig");
 const css_alignment = @import("../../document/css_alignment.zig");
 const css_display = @import("../../document/css_display.zig");
+const css_overflow = @import("../../document/css_overflow.zig");
+const overflow_geometry = @import("overflow_geometry.zig");
 const grid_format = @import("grid_format.zig");
 const intrinsic_measure = @import("intrinsic_width.zig");
 const paint_effects = @import("paint_effects.zig");
@@ -526,6 +528,7 @@ const EmbedLayout = struct {
 /// measurement tree. The payload can move safely with the line buffer.
 const InlineBlockLayout = struct {
     snapshot: inline_snapshot.Snapshot,
+    overflow: overflow_geometry.Bounds = .{},
     width: i32,
     height: i32,
     ascent: i32,
@@ -1264,6 +1267,10 @@ fn setTestStyleValue(
     value: []const u8,
 ) !void {
     std.debug.assert(node.* == .element);
+    if (std.mem.eql(u8, property, "overflow")) {
+        try setTestStyleValue(allocator, node, "overflow-x", value);
+        return setTestStyleValue(allocator, node, "overflow-y", value);
+    }
     if (node.element.style == null) node.element.style = parser.StyleMap.init(allocator);
     var field = ProtectedField([]const u8).init(value);
     field.set(value);
@@ -2463,8 +2470,8 @@ font_size_css: f64 = 16.0,
 /// unitless values are resolved against the current element's font size.
 line_height_css: ?f64 = null,
 /// Whether this browsing context reserves the browser's viewport scrollbar
-/// gutter. Root `overflow: hidden` suppresses the rail but intentionally does
-/// not disable the document's scroll range.
+/// gutter. A used hidden vertical viewport policy suppresses the rail while
+/// preserving programmatic document scrolling.
 viewport_scrollbar_reserved: bool = true,
 /// The block-level inline formatting strut. It has no paint payload: it only
 /// supplies the inherited baseline/leading for every line, as CSS requires.
@@ -2517,6 +2524,9 @@ fragment_targets: std.ArrayList(FragmentTarget),
 // Inspection commands serialize geometry only; they do not need interactive
 // hit-test state or DOM-parent walks.
 collect_hit_test_bounds: bool = true,
+/// Preliminary formatting allocations must not clamp live DOM scroll state.
+/// Final placement republishes both geometry axes with the used policy.
+publish_scroll_geometry: bool = true,
 
 // Cumulative transform offset for hit testing (tracks nested transforms)
 transform_offset_x: i32 = 0,
@@ -2734,22 +2744,45 @@ fn layoutScrollbarWidth(self: *const Layout) i32 {
         0;
 }
 
-/// Return whether the document root permits the browser's viewport scrollbar.
-/// This is deliberately root-only: element `overflow` remains a layout clip
-/// or element-local scroll container and must not affect browser chrome.
-pub fn rootViewportScrollbarVisible(root: *const Node) bool {
-    const element = switch (root.*) {
-        .element => |*value| value,
-        .text => return true,
+fn computedOverflow(element: *const parser.Element) css_overflow.Pair {
+    const styles = if (element.style) |*map| map else return .{};
+    return .{
+        .x = css_overflow.parse(styleValue(styles, "overflow-x") orelse "visible") orelse .visible,
+        .y = css_overflow.parse(styleValue(styles, "overflow-y") orelse "visible") orelse .visible,
     };
-    if (!std.ascii.eqlIgnoreCase(element.tag, "html")) return true;
-    const styles = if (element.style) |*value| value else return true;
-    const overflow = std.mem.trim(
-        u8,
-        styleValue(styles, "overflow") orelse "visible",
-        " \t\r\n",
-    );
-    return !std.ascii.eqlIgnoreCase(overflow, "hidden");
+}
+
+const ViewportOverflow = struct { donor: ?*const Node = null, pair: css_overflow.Pair = .{ .x = .auto, .y = .auto } };
+
+fn viewportOverflow(root: *const Node) ViewportOverflow {
+    if (root.* != .element or !std.ascii.eqlIgnoreCase(root.element.tag, "html")) return .{};
+    const root_styles = if (root.element.style) |*styles| styles else null;
+    if (root_styles) |styles| if (flex_format.eq(styleValue(styles, "display") orelse "block", "none")) return .{};
+    var donor = root;
+    var pair = computedOverflow(&root.element);
+    if (pair.x == .visible and pair.y == .visible) {
+        // Only the first direct body is eligible, even when it has no box.
+        for (root.element.children.items) |*child| {
+            if (child.* != .element or !std.ascii.eqlIgnoreCase(child.element.tag, "body")) continue;
+            const displayed = if (child.element.style) |styles| !flex_format.eq(styleValue(&styles, "display") orelse "block", "none") else true;
+            if (displayed) {
+                donor = child;
+                pair = computedOverflow(&child.element);
+            }
+            break;
+        }
+    }
+    return .{ .donor = donor, .pair = pair.forViewport() };
+}
+
+/// Read during a clean style phase; callers crossing a commit boundary copy
+/// this scalar viewport policy instead of retaining the selected DOM donor.
+pub fn rootViewportOverflow(root: *const Node) css_overflow.Pair {
+    return viewportOverflow(root).pair;
+}
+
+pub fn rootViewportScrollbarVisible(root: *const Node) bool {
+    return rootViewportOverflow(root).y.allowsUserScroll();
 }
 
 /// Apply an already-resolved root viewport overflow choice before document
@@ -3560,11 +3593,14 @@ fn measureAtomicInline(self: *Layout, node: *Node, element: *const parser.Elemen
     }
     result.width = root.width.get().*;
     result.height = root.height.get().*;
+    const root_bounds = root.propagatedOverflow().translated(root.position_offset.x, root.position_offset.y);
+    const root_translation = resolvedBlockEffects(root).translation orelse paint_effects.Offset{};
+    result.overflow = root_bounds.unionWith(root_bounds.translated(root_translation.x, root_translation.y));
     // Flex/grid export their first set even when scrollable. Ordinary
     // inline-blocks export their last line only with visible overflow.
     const baseline = if (root.used_formatting_context)
         blockBaseline(root, false)
-    else if (flex_format.eq(styleValue(styles, "overflow") orelse "visible", "visible"))
+    else if (root.usedOverflow().x == .visible and root.usedOverflow().y == .visible)
         blockBaseline(root, true)
     else
         null;
@@ -3596,7 +3632,7 @@ fn registerIntrinsicDependencies(node: *Node, target: *ProtectedField(i32)) void
                 std.mem.startsWith(u8, name, "min-") or std.mem.startsWith(u8, name, "max-") or std.mem.eql(u8, name, "aspect-ratio") or
                 std.mem.eql(u8, name, "white-space") or std.mem.eql(u8, name, "zoom") or
                 std.mem.eql(u8, name, "position") or std.mem.eql(u8, name, "float") or std.mem.eql(u8, name, "clear") or
-                std.mem.eql(u8, name, "overflow") or std.mem.eql(u8, name, "box-sizing") or
+                std.mem.startsWith(u8, name, "overflow-") or std.mem.eql(u8, name, "box-sizing") or
                 std.mem.startsWith(u8, name, "flex-") or std.mem.startsWith(u8, name, "grid-") or
                 std.mem.endsWith(u8, name, "-gap") or std.mem.eql(u8, name, "order") or
                 std.mem.startsWith(u8, name, "align-") or std.mem.startsWith(u8, name, "justify-"))
@@ -3666,6 +3702,24 @@ fn resolvedBlockEffects(block: *const BlockLayout) paint_effects.ResolvedEffects
     );
 }
 
+fn blockContentClip(block: *const BlockLayout, absolute: bool) ?@import("display_list.zig").AxisClip {
+    const used = block.usedOverflow();
+    if (!used.x.clips() and !used.y.clips()) return null;
+    const effects = resolvedBlockEffects(block);
+    const x = if (absolute) block.x.get().* else 0;
+    const y = if (absolute) block.y.get().* else 0;
+    const radius_inset: f64 = @floatFromInt(@max(@max(block.border.left, block.border.right), @max(block.border.top, block.border.bottom)));
+    return .{
+        .x1 = x +| block.border.left,
+        .y1 = y +| block.border.top,
+        .x2 = x +| block.width.get().* -| block.border.right,
+        .y2 = y +| block.height.get().* -| block.border.bottom,
+        .clip_x = used.x.clips(),
+        .clip_y = used.y.clips(),
+        .radius = if (used.x.clips() and used.y.clips()) @max(effects.border_radius - radius_inset, 0) else 0,
+    };
+}
+
 fn blockHitScrollY(block: *const BlockLayout) i32 {
     const element = liveBlockElement(block) orelse return 0;
     return if (element.scroll_container) @max(element.scroll_y, 0) else 0;
@@ -3690,19 +3744,12 @@ fn blockPaintZIndex(block: *const BlockLayout) paint_order.ZIndex {
 /// Return whether this block establishes its own normal-flow box alongside
 /// external floats. Ordinary blocks keep their containing-block width and
 /// only their inline line boxes flow around outside floats. Tables and
-/// non-visible overflow boxes instead establish a bounded formatting context,
-/// so their border boxes avoid the surrounding float area.
+/// boxes with a scrollable used overflow axis establish a formatting context,
+/// so their border boxes avoid the surrounding float area. Clip alone does not.
 fn blockAvoidsExternalFloats(block: *const BlockLayout) bool {
     if (block.formattingKind() != null) return true;
     if (block.tableRole() == .table) return true;
-    const element = liveBlockElement(block) orelse return false;
-    const styles = if (element.style) |*style_map| style_map else return false;
-    const overflow = std.mem.trim(
-        u8,
-        styleValue(styles, "overflow") orelse "visible",
-        " \t\r\n",
-    );
-    return !std.ascii.eqlIgnoreCase(overflow, "visible");
+    return block.usedOverflow().establishesFormattingContext();
 }
 
 /// A static ordinary block can split its background/border from its content
@@ -3719,7 +3766,7 @@ fn isStaticPaintPhaseCandidate(block: *const BlockLayout) bool {
     // paint effect.
     if (block.zoom.dirty) return false;
     const effects = resolvedBlockEffects(block);
-    return !effects.needsBlendGroup() and effects.translation == null;
+    return !effects.needsBlendGroup() and !effects.clipsOverflow() and effects.translation == null;
 }
 
 /// Return whether a static descendant introduces one of the CSS-like paint
@@ -4250,6 +4297,14 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             item.ascent,
             item.height,
         );
+
+        if (self.inline_block) |block| {
+            const bounds = if (item.payload == .inline_block)
+                item.payload.inline_block.overflow.translated(item.x -| block.x.get().*, final_y +| item.payload.inline_block.margin.top -| block.y.get().*)
+            else
+                overflow_geometry.Bounds.box(item.x -| block.x.get().*, final_y -| block.y.get().*, item.width, item.height);
+            block.inline_overflow = block.inline_overflow.unionWith(bounds);
+        }
 
         const bounds_x = item.x + item.hit_offset_x;
         const bounds_y = final_y + item.hit_offset_y;
@@ -6000,12 +6055,19 @@ fn displayListLayoutBounds(
                 .right = translate_x + outline.rect.right + outline.thickness,
                 .bottom = translate_y + outline.rect.bottom + outline.thickness,
             },
-            .blend => |blend| displayListLayoutBounds(
-                engine,
-                blend.children,
-                translate_x,
-                translate_y,
-            ),
+            .blend => |blend| blk: {
+                var bounds = displayListLayoutBounds(engine, blend.children, translate_x, translate_y) orelse break :blk null;
+                if (blend.overflow_clip) |clip| {
+                    var shifted = clip;
+                    shifted.x1 +|= translate_x;
+                    shifted.x2 +|= translate_x;
+                    shifted.y1 +|= translate_y;
+                    shifted.y2 +|= translate_y;
+                    bounds = shifted.intersectBounds(bounds, 1);
+                    if (bounds.width() <= 0 or bounds.height() <= 0) break :blk null;
+                }
+                break :blk bounds;
+            },
             .transform => |transform| displayListLayoutBounds(
                 engine,
                 transform.children,
@@ -6714,6 +6776,14 @@ pub const DocumentLayout = struct {
     viewport_width: i32 = 0,
     viewport_height: i32 = 0,
     sticky_scroll_y: i32 = 0,
+    sticky_scroll_x: i32 = 0,
+    /// Clean-layout scroll metrics include page insets but exclude reserved
+    /// viewport chrome. Flow width/height above retain their existing meaning.
+    content_width: i32 = 0,
+    content_height: i32 = 0,
+    scrollport_width: i32 = 0,
+    scrollport_height: i32 = 0,
+    overflow_donor: ?*const Node = null,
 
     zoom: ProtectedField(f32),
     x: ProtectedField(i32),
@@ -6792,6 +6862,10 @@ pub const DocumentLayout = struct {
     }
 
     pub fn layout(self: *DocumentLayout, engine: *Layout) !void {
+        const policy = viewportOverflow(self.node_ptr);
+        const gutter_changed = engine.setViewportScrollbarReservation(policy.pair.y.allowsUserScroll());
+        if (self.overflow_donor != policy.donor or gutter_changed) self.mark();
+        self.overflow_donor = policy.donor;
         if (!self.layoutNeeded()) return;
         self.paint_dirty = true;
         self.in_layout = true;
@@ -6802,6 +6876,8 @@ pub const DocumentLayout = struct {
         self.page_zoom = engine.zoom();
         self.viewport_width = engine.layoutWindowWidth() - engine.layoutScrollbarWidth();
         self.viewport_height = engine.layoutWindowHeight();
+        self.scrollport_width = self.viewport_width;
+        self.scrollport_height = self.viewport_height;
         const x_value = scaleCssPixel(h_offset, zoom_value, engine.zoom());
         const y_value = scaleCssPixel(v_offset, zoom_value, engine.zoom());
         const width_value = engine.layoutWindowWidth() - engine.layoutScrollbarWidth() - (2 * x_value);
@@ -6844,22 +6920,35 @@ pub const DocumentLayout = struct {
         // Set height after child layout completes
         // Use .read() to register invalidation dependency on child's height
         self.height.set(block.height.read(&self.height, self.allocator).*);
+        const translation = resolvedBlockEffects(block).translation orelse paint_effects.Offset{};
+        const root_bounds = block.propagatedOverflow().translated(
+            block.x.get().* +| block.position_offset.x,
+            block.y.get().* +| block.position_offset.y,
+        );
+        const extent = root_bounds.unionWith(root_bounds.translated(translation.x, translation.y));
+        self.content_width = @max(self.scrollport_width, extent.x2 +| x_value);
+        self.content_height = @max(self.scrollport_height, extent.y2 +| y_value);
 
         // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
-        _ = self.updateSticky(self.sticky_scroll_y);
+        _ = self.updateStickyAxes(self.sticky_scroll_x, self.sticky_scroll_y);
     }
 
     /// On the serialized document worker after style and layout are clean.
     /// Refresh visual offsets for painting, hit testing and CSSOM together;
     /// normal-flow fields and their dependents stay clean during scrolling.
     pub fn updateSticky(self: *DocumentLayout, scroll_y: i32) bool {
+        return self.updateStickyAxes(self.sticky_scroll_x, scroll_y);
+    }
+
+    pub fn updateStickyAxes(self: *DocumentLayout, scroll_x: i32, scroll_y: i32) bool {
         std.debug.assert(!self.layoutNeeded());
         self.sticky_scroll_y = scroll_y;
+        self.sticky_scroll_x = scroll_x;
         var changed = false;
         const viewport = element_geometry.Rect{ .width = @floatFromInt(self.viewport_width), .height = @floatFromInt(self.viewport_height) };
         for (self.children.items) |child| {
-            changed = child.updateSticky(viewport, .{ .y = 0 -| scroll_y }) or changed;
+            changed = child.updateSticky(viewport, .{ .x = 0 -| scroll_x, .y = 0 -| scroll_y }) or changed;
         }
         return changed;
     }
@@ -7140,6 +7229,9 @@ const BlockLayout = struct {
     content_height: i32 = 0,
     content_height_definite: bool = false,
     natural_content_height: i32 = 0,
+    /// Bounds are local to this border box and independent of CSSOM fragments.
+    scroll_overflow: overflow_geometry.Bounds = .{},
+    inline_overflow: overflow_geometry.Bounds = .{},
     /// Visual movement applied after normal-flow geometry. Keeping this
     /// separate from x/y prevents relative positioning from moving the slot
     /// used by a following sibling.
@@ -7811,7 +7903,15 @@ const BlockLayout = struct {
                             if (style_map.getPtr("height")) |field| block.height.addDependency(field, style_map.allocator);
                             if (style_map.getPtr("min-height")) |field| block.height.addDependency(field, style_map.allocator);
                             if (style_map.getPtr("max-height")) |field| block.height.addDependency(field, style_map.allocator);
-                            if (style_map.getPtr("overflow")) |field| block.height.addDependency(field, style_map.allocator);
+                            for ([_][]const u8{ "overflow-x", "overflow-y" }) |property| {
+                                if (style_map.getPtr(property)) |field| {
+                                    block.height.addDependency(field, style_map.allocator);
+                                    block.width.addDependency(field, style_map.allocator);
+                                }
+                            }
+                            // Authored transform edits change scrollable extents. Live
+                            // compositor animation scalars do not publish this field.
+                            if (style_map.getPtr("transform")) |field| block.height.addDependency(field, style_map.allocator);
                             if (style_map.getPtr("position")) |field| {
                                 block.x.addDependency(field, style_map.allocator);
                                 block.y.addDependency(field, style_map.allocator);
@@ -7987,54 +8087,59 @@ const BlockLayout = struct {
         };
     }
 
-    fn updateScrollGeometry(
-        self: *BlockLayout,
-        specified_height: ?i32,
-        natural_height: i32,
-    ) void {
-        _ = specified_height;
-        const node_ptr = self.node_ptr orelse return;
-        switch (node_ptr.*) {
-            .element => |*element| {
-                const overflow = if (element.style) |*style_map|
-                    styleValue(style_map, "overflow") orelse "visible"
-                else
-                    "visible";
-                const normalized = std.mem.trim(u8, overflow, " \t\r\n");
-                const enabled = (node_ptr != self.document.node_ptr or !std.ascii.eqlIgnoreCase(element.tag, "html")) and
-                    (std.ascii.eqlIgnoreCase(normalized, "scroll") or
-                        std.ascii.eqlIgnoreCase(normalized, "auto") or
-                        std.ascii.eqlIgnoreCase(normalized, "hidden"));
-                element.setScrollGeometry(
-                    enabled,
-                    self.height.get().* -| self.border.vertical(),
-                    natural_height -| self.border.vertical(),
-                );
-                if (std.ascii.eqlIgnoreCase(normalized, "hidden")) element.scroll_interactive = false;
-                if (enabled) element.setHorizontalScrollGeometry(
-                    self.width.get().* -| self.border.horizontal(),
-                    self.scrollOverflowRight() -| self.x.get().* -| self.border.left +| self.padding.right,
-                );
-            },
-            .text => {},
-        }
-    }
-
-    fn scrollOverflowRight(self: *const BlockLayout) i32 {
-        var right = self.x.get().* +| self.width.get().* -| self.border.right -| self.padding.right;
-        for (self.geometry_fragments.items) |fragment| {
-            const end = std.math.clamp(fragment.rect.x + fragment.rect.width, std.math.minInt(i32), std.math.maxInt(i32));
-            right = @max(right, @as(i32, @intFromFloat(end)));
-        }
+    fn updateScrollGeometry(self: *BlockLayout, publish: bool) void {
+        const x = self.x.get().*;
+        const y = self.y.get().*;
+        const width = self.width.get().*;
+        const height = self.height.get().*;
+        const content_x = self.border.left +| self.padding.left;
+        const content_y = self.border.top +| self.padding.top;
+        var content = overflow_geometry.Bounds.box(content_x, content_y, self.content_width, self.natural_content_height);
+        content = content.unionWith(self.inline_overflow);
         for (self.children.items) |child| switch (child) {
             .block => |block| {
-                right = @max(right, block.x.get().* +| block.width.get().*);
-                if (liveBlockElement(block)) |element| if (element.scroll_container) continue;
-                right = @max(right, block.scrollOverflowRight());
+                if (block.positionMode() == .fixed) continue;
+                const translation = resolvedBlockEffects(block).translation orelse paint_effects.Offset{};
+                const position = if (block.positionMode() == .sticky) PositionOffset{} else block.position_offset;
+                const untransformed = block.propagatedOverflow().translated(
+                    block.x.get().* -| x +| position.x,
+                    block.y.get().* -| y +| position.y,
+                );
+                // Transforms can extend the scrollable area, never shrink it.
+                var bounds = untransformed.unionWith(untransformed.translated(translation.x, translation.y));
+                if (self.formattingKind() != null) {
+                    bounds.x2 +|= @max(block.margin.right, 0);
+                    bounds.y2 +|= @max(block.margin.bottom, 0);
+                }
+                content = content.unionWith(bounds);
             },
-            .line => {},
+            .line => |line| {
+                content = content.unionWith(overflow_geometry.Bounds.box(line.x.get().* -| x, line.y.get().* -| y, line.width.get().*, line.height.get().*));
+            },
         };
-        return right;
+        content.x2 +|= self.padding.right;
+        content.y2 +|= self.padding.bottom;
+        self.scroll_overflow = content.unionWith(.{
+            .x1 = self.border.left,
+            .y1 = self.border.top,
+            .x2 = width -| self.border.right,
+            .y2 = height -| self.border.bottom,
+        });
+        if (!publish) return;
+        const node = self.node_ptr orelse return;
+        if (node.* != .element) return;
+        const allow_user = if (node.element.style) |*styles| !styleVisibilityHidden(styles) else true;
+        node.element.setScrollGeometry(self.usedOverflow(), allow_user, .{
+            .client_width = width -| self.border.horizontal(),
+            .client_height = height -| self.border.vertical(),
+            .content_width = self.scroll_overflow.x2 -| self.border.left,
+            .content_height = self.scroll_overflow.y2 -| self.border.top,
+        });
+    }
+
+    fn propagatedOverflow(self: *const BlockLayout) overflow_geometry.Bounds {
+        const used = self.usedOverflow();
+        return self.scroll_overflow.propagated(self.width.get().*, self.height.get().*, used.x.clips(), used.y.clips());
     }
 
     fn initAnonymous(
@@ -8544,7 +8649,15 @@ const BlockLayout = struct {
         var port = nearest_port;
         if (liveBlockElement(self)) |element| {
             if (element.scroll_container) {
-                port = .{ .x = @floatFromInt(self.x.get().* +| ancestor.x +| self.border.left), .y = @floatFromInt(self.y.get().* +| ancestor.y +| self.border.top), .width = @floatFromInt(self.width.get().* -| self.border.horizontal()), .height = @floatFromInt(self.height.get().* -| self.border.vertical()) };
+                const used = self.usedOverflow();
+                if (used.x.isScrollable()) {
+                    port.x = @floatFromInt(self.x.get().* +| ancestor.x +| self.border.left);
+                    port.width = @floatFromInt(self.width.get().* -| self.border.horizontal());
+                }
+                if (used.y.isScrollable()) {
+                    port.y = @floatFromInt(self.y.get().* +| ancestor.y +| self.border.top);
+                    port.height = @floatFromInt(self.height.get().* -| self.border.vertical());
+                }
                 ancestor.x -|= element.scroll_x;
                 ancestor.y -|= element.scroll_y;
             }
@@ -9251,6 +9364,7 @@ const BlockLayout = struct {
         self.display_list.clearRetainingCapacity();
 
         self.geometry_fragments.clearRetainingCapacity();
+        self.inline_overflow = .{};
 
         const owns_float_context = self.establishesFloatContext();
         if (owns_float_context) {
@@ -9476,8 +9590,8 @@ const BlockLayout = struct {
         else
             parent_content_y;
         // The automatic minimum in the dependent axis prevents visible
-        // content overflow; an explicit minimum or scroll container opts out.
-        if (ratio_height and min_height == null and flex_format.eq(self.formatStyle("overflow", "visible"), "visible")) {
+        // content overflow; an explicit minimum or scrollable computed axis opts out.
+        if (ratio_height and min_height == null and !self.computedOverflowTracked().y.isScrollable()) {
             self.content_height = constrainDimension(@max(self.content_height, natural_height), min_height, max_height);
             self.height.set(self.content_height +| self.padding.vertical() +| self.border.vertical());
         }
@@ -9537,7 +9651,7 @@ const BlockLayout = struct {
         try recordElementFocusBounds(engine, self);
 
         self.natural_content_height = natural_height;
-        self.updateScrollGeometry(specified_height, natural_height + self.padding.vertical() + self.border.vertical());
+        self.updateScrollGeometry(engine.publish_scroll_geometry);
 
         // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
@@ -9835,6 +9949,19 @@ const BlockLayout = struct {
         return used_height;
     }
 
+    fn computedOverflowTracked(self: *BlockLayout) css_overflow.Pair {
+        return .{
+            .x = css_overflow.parse(self.formatStyle("overflow-x", "visible")) orelse .visible,
+            .y = css_overflow.parse(self.formatStyle("overflow-y", "visible")) orelse .visible,
+        };
+    }
+
+    fn usedOverflow(self: *const BlockLayout) css_overflow.Pair {
+        if (self.node_ptr == self.document.overflow_donor) return .{};
+        const element = liveBlockElement(self) orelse return .{};
+        return computedOverflow(element);
+    }
+
     fn formatStyle(self: *BlockLayout, property: []const u8, default: []const u8) []const u8 {
         const element = liveBlockElement(self) orelse return default;
         const styles = if (element.style) |*map| map else return default;
@@ -9919,7 +10046,9 @@ const BlockLayout = struct {
         content_main_min: f64,
         content_main_max: f64,
         natural_replaced_main: ?f64,
-        scrollable: bool,
+        scrollable_x: bool,
+        scrollable_y: bool,
+        column: bool,
         replaced: bool,
         ratio: ?f64,
         ratio_border_box: bool,
@@ -9936,7 +10065,7 @@ const BlockLayout = struct {
                 .specified = self.specified_main,
                 .transferred = self.transferred_main,
                 .maximum = self.main.max,
-                .scrollable = self.scrollable,
+                .scrollable = if (self.column) self.scrollable_y else self.scrollable_x,
                 .replaced = self.replaced,
             }));
         }
@@ -9993,7 +10122,7 @@ const BlockLayout = struct {
         var basis = if (basis_length) |b| b + if (border_box) @as(f64, 0) else main_edges else if (basis_content) |b| b + main_edges else if (content_basis) if (column) y_edges else intrinsic.max + x_edges else if (column) height else width;
         const authored_main = if (column) authored_height else authored_width;
         const alignment = child.formatStyle("align-self", "auto");
-        const overflow = child.formatStyle("overflow", "visible");
+        const overflow = child.computedOverflowTracked();
         const replaced = child.node == .element and (child.node.element.image_data != null or flex_format.eq(child.node.element.tag, "img"));
         var ratio: ?f64 = null;
         const aspect = replaced_sizing.parseAspectRatio(child.formatStyle("aspect-ratio", "auto")) orelse replaced_sizing.AspectRatio.auto;
@@ -10072,7 +10201,9 @@ const BlockLayout = struct {
             .content_main_min = content_main_min,
             .content_main_max = content_main_max,
             .natural_replaced_main = natural_replaced_main,
-            .scrollable = flex_format.eq(overflow, "hidden") or flex_format.eq(overflow, "scroll") or flex_format.eq(overflow, "auto"),
+            .scrollable_x = overflow.x.isScrollable(),
+            .scrollable_y = overflow.y.isScrollable(),
+            .column = column,
             .replaced = replaced,
             .ratio = ratio,
             .ratio_border_box = border_box and !replaced and !aspect.use_intrinsic,
@@ -10164,8 +10295,13 @@ const BlockLayout = struct {
         const main_gap = if (column) row_gap else column_gap;
         const cross_gap = if (column) column_gap else row_gap;
         const collect = engine.collect_hit_test_bounds;
-        defer engine.collect_hit_test_bounds = collect;
+        const publish_scroll = engine.publish_scroll_geometry;
+        defer {
+            engine.collect_hit_test_bounds = collect;
+            engine.publish_scroll_geometry = publish_scroll;
+        }
         engine.collect_hit_test_bounds = false;
+        engine.publish_scroll_geometry = false;
         if (column) {
             for (items) |*item| {
                 const available = @as(f64, @floatFromInt(self.content_width)) - item.cross_before - item.cross_after;
@@ -10214,7 +10350,7 @@ const BlockLayout = struct {
                     const constraints = sizing.Constraints{ .min = item.min_cross, .max = item.max_cross };
                     const ratio_height = if (!item.height_authored) item.ratioHeight(placement.size) else null;
                     try self.placeFormatItem(engine, item, 0, 0, placement.size, if (ratio_height) |height| constraints.clamp(height) else null, .{ .height_definite = item.height_authored or ratio_height != null });
-                    if (ratio_height != null and !item.replaced and !item.scrollable and flex_format.eq(item.block.formatStyle("min-height", "auto"), "auto")) {
+                    if (ratio_height != null and !item.replaced and !item.scrollable_y and flex_format.eq(item.block.formatStyle("min-height", "auto"), "auto")) {
                         const height = constraints.clamp(@max(item.height, @as(f64, @floatFromInt(item.block.natural_content_height)) + item.y_edges));
                         if (height != item.height) try self.placeFormatItem(engine, item, 0, 0, placement.size, height, .{ .height_definite = true });
                     }
@@ -10241,6 +10377,7 @@ const BlockLayout = struct {
         const distribution = if (wrap) box_alignment.distribute(align_content, if (stretch_lines) 0 else free_cross, lines.items.len, wrap_reverse) else box_alignment.Distribution{};
         var cursor = distribution.offset;
         engine.collect_hit_test_bounds = collect;
+        engine.publish_scroll_geometry = publish_scroll;
         for (lines.items) |line| {
             const line_cross = line.cross + if (stretch_lines) free_cross / @as(f64, @floatFromInt(lines.items.len)) else @as(f64, 0);
             for (items[line.start..line.end], used[line.start..line.end]) |*item, placement| {
@@ -10279,7 +10416,7 @@ const BlockLayout = struct {
 
     fn gridItemMinimum(item: FormatItem, track: grid_format.Track) f64 {
         if (!item.automatic_main) return item.main.min;
-        const minimum = if (track.min_kind == .auto and !item.scrollable) item.main.min else item.x_edges;
+        const minimum = if (track.min_kind == .auto and !item.scrollable_x) item.main.min else item.x_edges;
         return if (track.max_kind == .fixed) @max(item.x_edges, @min(minimum, (track.max orelse track.min) - item.main.before - item.main.after)) else minimum;
     }
 
@@ -10348,8 +10485,13 @@ const BlockLayout = struct {
             if (track.max) |max| track.max = max * scale;
         }
         const collect = engine.collect_hit_test_bounds;
-        defer engine.collect_hit_test_bounds = collect;
+        const publish_scroll = engine.publish_scroll_geometry;
+        defer {
+            engine.collect_hit_test_bounds = collect;
+            engine.publish_scroll_geometry = publish_scroll;
+        }
         engine.collect_hit_test_bounds = false;
+        engine.publish_scroll_geometry = false;
         for (items, 0..) |*item, i| {
             const col = i % column_count;
             const row = i / column_count;
@@ -10359,8 +10501,8 @@ const BlockLayout = struct {
             try self.placeFormatItem(engine, item, 0, 0, width, ratio_height, .{ .area_width = widths[col], .grid_area = true, .height_definite = item.height_authored or ratio_height != null });
             const outer = item.cross_before + item.cross_after;
             const auto_min = flex_format.eq(item.block.formatStyle("min-height", "auto"), "auto");
-            if (ratio_height != null and auto_min and !item.scrollable) item.height = @max(item.height, @as(f64, @floatFromInt(item.block.natural_content_height)) + item.y_edges);
-            var minimum = if (item.height_authored or (auto_min and rows[row].min_kind == .auto and !item.scrollable)) @max(item.min_cross, @min(item.height, item.max_cross)) else item.min_cross;
+            if (ratio_height != null and auto_min and !item.scrollable_y) item.height = @max(item.height, @as(f64, @floatFromInt(item.block.natural_content_height)) + item.y_edges);
+            var minimum = if (item.height_authored or (auto_min and rows[row].min_kind == .auto and !item.scrollable_y)) @max(item.min_cross, @min(item.height, item.max_cross)) else item.min_cross;
             if (auto_min and rows[row].max_kind == .fixed) minimum = @max(item.y_edges, @min(minimum, (rows[row].max orelse rows[row].min) - outer));
             natural[row].minimum = @max(natural[row].minimum, minimum + outer);
             natural[row].min_content = @max(natural[row].min_content, item.height + outer);
@@ -10384,6 +10526,7 @@ const BlockLayout = struct {
         const column_distribution = box_alignment.distribute(justify_content, @as(f64, @floatFromInt(self.content_width)) - total_width, column_count, false);
         const row_distribution = box_alignment.distribute(align_content, (if (definite_height) |h| @as(f64, @floatFromInt(h)) else total_height) - total_height, row_count, false);
         engine.collect_hit_test_bounds = collect;
+        engine.publish_scroll_geometry = publish_scroll;
         var x = column_distribution.offset;
         var y = row_distribution.offset;
         for (items, 0..) |*item, i| {
@@ -10402,7 +10545,7 @@ const BlockLayout = struct {
             const normal_exception = flex_format.eq(item.cross_align, "normal") and (item.replaced or item.ratio != null);
             const stretch = item.cross_auto and !normal_exception and !item.cross_auto_before and !item.cross_auto_after and stretchesAlignment(item.cross_align);
             const ratio_height = item.ratioHeight(width) orelse natural_height;
-            const ratio_minimum = flex_format.eq(item.block.formatStyle("min-height", "auto"), "auto") and !item.scrollable;
+            const ratio_minimum = flex_format.eq(item.block.formatStyle("min-height", "auto"), "auto") and !item.scrollable_y;
             const preferred_height = if (item.ratio != null) if (ratio_minimum) @max(natural_height, ratio_height) else ratio_height else natural_height;
             const height = (sizing.Constraints{ .min = item.min_cross, .max = item.max_cross }).clamp(if (stretch) available else if (item.height_authored) item.height else preferred_height);
             const alignment = item.block.formatStyle("justify-self", "auto");
@@ -10745,10 +10888,8 @@ const BlockLayout = struct {
             .position_offset = .{ .x = self.position_offset.x, .y = self.position_offset.y },
             .transform_translation = .{ .x = translation.x, .y = translation.y },
             .opacity = effects.opacity,
-            .clip = .{
-                .enabled = effects.border_radius > 0.0 or effects.clips_overflow,
-                .radius = effects.border_radius,
-            },
+            .border_radius = effects.border_radius,
+            .content_clip = blockContentClip(self, false),
             .scroll_y = blockHitScrollY(self),
             .scroll_x = if (liveBlockElement(self)) |element| element.scroll_x else 0,
         }) orelse return null;
@@ -10756,15 +10897,15 @@ const BlockLayout = struct {
         const content_point = localized.content;
         const origin = HitPoint{ .x = self.x.get().*, .y = self.y.get().* };
         var order = layout_hit.ReverseOrder.init(self.hit_order.items, self.children.items.len);
-        while (order.next()) |document_index| {
+        if (localized.hits_content) while (order.next()) |document_index| {
             if (self.children.items[document_index].hitTest(content_point, origin)) |hit| return hit;
-        }
+        };
 
         // Inline-mode blocks still use the legacy inline formatter and do not
         // retain LineLayout/TextLayout children. Their local leaf query uses
         // the cached paint commands, preserving fragment gaps, controls, and
         // rich-button descendants until that TODO is removed.
-        if (self.display_list.items.len > 0) {
+        if (localized.hits_content and self.display_list.items.len > 0) {
             const absolute_content_point = layout_hit.addOffset(content_point, .{
                 .x = self.x.get().*,
                 .y = self.y.get().*,
@@ -10885,9 +11026,19 @@ test "layout hit testing localizes nested transforms and reverses sibling order"
     const old_location = document.hitTest(45, 65).?;
     try std.testing.expect(old_location.node == &root_node);
 
-    // Point queries read the live computed transform rather than the stale
-    // BlockLayout node snapshot, matching compositor-only movement.
-    transformed_node.element.style.?.getPtr("transform").?.set("translate(120px, 40px)");
+    // Compositor samples move the visual box without publishing an authored
+    // style field. The live DOM animation is absent from the layout snapshot.
+    transformed_node.element.animations = std.StringHashMap(parser.Animation).init(allocator);
+    var motion = parser.TransformAnimation.initWithEasing(
+        .{ .x = 100, .y = 30 },
+        .{ .x = 140, .y = 50 },
+        2,
+        .linear,
+    );
+    try std.testing.expect(!motion.advance());
+    try transformed_node.element.animations.?.put("transform", .{ .transform = motion });
+    try std.testing.expect(!transformed.height.dirty);
+    try std.testing.expect(!document.layoutNeeded());
     const moved_hit = document.hitTest(165, 105).?;
     try std.testing.expect(moved_hit.node == &nested_node);
     try std.testing.expectEqual(@as(i32, 5), moved_hit.local_x);
@@ -10898,6 +11049,12 @@ test "layout hit testing localizes nested transforms and reverses sibling order"
     setTestLayoutBox(later, 160, 100, 20, 20);
     const overlap_hit = document.hitTest(165, 105).?;
     try std.testing.expect(overlap_hit.node == &later_node);
+
+    // Authored edits must refresh scrollable extents before the next hit query.
+    // Full retained reflow is covered by the overflow extent regressions.
+    transformed_node.element.style.?.getPtr("transform").?.set("translate(120px, 40px)");
+    try std.testing.expect(transformed.height.dirty);
+    try std.testing.expect(document.layoutNeeded());
 }
 
 test "position offsets share geometry with layout hit testing" {
@@ -10967,7 +11124,7 @@ test "layout hit testing localizes nested overflow scrolling" {
     var scroll_node = Node{ .element = try parser.Element.init(allocator, "section", null) };
     defer scroll_node.deinit(allocator);
     try setTestStyleValue(allocator, &scroll_node, "overflow", "scroll");
-    scroll_node.element.setScrollGeometry(true, 50, 120);
+    scroll_node.element.setScrollGeometry(.{ .x = .scroll, .y = .scroll }, true, .{ .client_width = 50, .content_width = 50, .client_height = 50, .content_height = 120 });
     try std.testing.expect(scroll_node.element.scrollBy(40));
     var child_node = Node{ .element = try parser.Element.init(allocator, "button", null) };
     defer child_node.deinit(allocator);
@@ -11972,7 +12129,7 @@ pub fn buildDocument(self: *Layout, root: *Node) !*DocumentLayout {
 }
 
 pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
-    const content_height = documentScrollHeight(document.height.get().*);
+    const content_height = document.content_height;
     self.content_height = content_height;
 
     if (document.paint_dirty) {
@@ -12483,6 +12640,8 @@ fn writeDisplayItemsDebug(writer: *std.Io.Writer, items: []const DisplayItem, in
             .blend => |blend| {
                 if (blend.blur_radius > 0.0) {
                     try writer.print("filter blur({d}px)\n", .{blend.blur_radius});
+                } else if (blend.overflow_clip) |clip| {
+                    try writer.print("blend opacity={d} overflow-clip=({d},{d},{d},{d}) axes={s}{s} radius={d}\n", .{ blend.opacity, clip.x1, clip.y1, clip.x2, clip.y2, if (clip.clip_x) @as([]const u8, "x") else "", if (clip.clip_y) @as([]const u8, "y") else "", clip.radius });
                 } else if (blend.hit_clip) |clip| {
                     try writer.print("hit-clip rounded x1={d} y1={d} x2={d} y2={d} radius={d}\n", .{ clip.x1, clip.y1, clip.x2, clip.y2, clip.radius });
                 } else {
@@ -12794,23 +12953,24 @@ fn paintBlockTreeRecursive(
 }
 
 /// Keep the element's own background stationary while moving all of its
-/// painted content. The enclosing overflow clip is installed below by
-/// applyPaintEffects, so translated descendants cannot escape the box.
+/// painted content, then clip only that suffix at the padding edge. The
+/// complete list retains whole-box opacity/filter/transform effects.
 fn applyElementScroll(
     block: *BlockLayout,
     commands: *std.ArrayList(DisplayItem),
     content_start: usize,
 ) !void {
-    const element = liveBlockElement(block) orelse return;
+    const element = liveBlockElement(block);
     try paint_effects.wrapScrolledSuffix(
         block.allocator,
         commands,
         content_start,
-        if (element.scroll_container) @max(element.scroll_x, 0) else 0,
-        if (element.scroll_container) @max(element.scroll_y, 0) else 0,
+        if (element) |e| e.scroll_x else 0,
+        if (element) |e| e.scroll_y else 0,
         opaqueElementForNode(block.node_ptr),
         displaySource(block, block.node_ptr),
     );
+    if (blockContentClip(block, true)) |clip| try paint_effects.wrapOverflowSuffix(block.allocator, commands, content_start, clip, displaySource(block, block.node_ptr));
 }
 
 /// Transfer an owned block command list into the command-level effect builder.

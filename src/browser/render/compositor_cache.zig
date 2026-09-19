@@ -39,7 +39,7 @@ fn collectDirectPaintInfo(items: []const DisplayItem, info: *DirectPaintInfo) bo
                 if (!collectDirectPaintInfo(transform.children, info)) return false;
             },
             .blend => |blend| {
-                if (blend.blend_mode != null or blend.blur_radius > 0.0) return false;
+                if (blend.blend_mode != null or blend.blur_radius > 0.0 or blend.overflow_clip != null) return false;
                 if (blend.opacity < 1.0 or blend.compositor_id != null) {
                     info.grouped_opacity = true;
                 }

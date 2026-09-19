@@ -86,7 +86,7 @@ pub const Compositor = struct {
         switch (item) {
             .blend => |blend_item| {
                 // Use the pre-computed needs_compositing flag
-                const needs_layer = blend_item.needs_compositing;
+                const needs_layer = blend_item.needs_compositing or blend_item.overflow_clip != null;
 
                 if (needs_layer) {
                     const is_dst_in = if (blend_item.blend_mode) |mode|
@@ -94,7 +94,7 @@ pub const Compositor = struct {
                     else
                         false;
 
-                    if (is_dst_in) {
+                    if (is_dst_in or blend_item.overflow_clip != null) {
                         const cloned = try self.cloneDisplayItem(item);
                         var cloned_owned = true;
                         errdefer if (cloned_owned) {
@@ -205,6 +205,7 @@ pub const Compositor = struct {
                         .blend_mode = mode_copy,
                         .blur_radius = blend_item.blur_radius,
                         .hit_clip = blend_item.hit_clip,
+                        .overflow_clip = blend_item.overflow_clip,
                         .children = children,
                         .node = blend_item.node,
                         .parent = null,
@@ -220,6 +221,7 @@ pub const Compositor = struct {
                     .transform = .{
                         .translate_x = transform_item.translate_x,
                         .translate_y = transform_item.translate_y,
+                        .translation_origin = transform_item.translation_origin,
                         .scroll_attachment = transform_item.scroll_attachment,
                         .children = children,
                         .node = transform_item.node,
@@ -258,7 +260,7 @@ pub const Compositor = struct {
         for (items) |item| {
             switch (item) {
                 .blend => |blend_item| {
-                    if (blend_item.needs_compositing) {
+                    if (blend_item.needs_compositing or blend_item.overflow_clip != null) {
                         // Composited blends stay as-is (they'll create their own layer)
                         const cloned = try self.cloneDisplayItem(item);
                         var cloned_owned = true;
@@ -291,6 +293,7 @@ pub const Compositor = struct {
                             .transform = .{
                                 .translate_x = transform_item.translate_x,
                                 .translate_y = transform_item.translate_y,
+                                .translation_origin = transform_item.translation_origin,
                                 .scroll_attachment = transform_item.scroll_attachment,
                                 .children = children_copy,
                                 .node = transform_item.node,
@@ -425,6 +428,7 @@ pub const Compositor = struct {
                     .bottom = 0,
                 };
                 if (b.blur_radius > 0.0) bounds = bounds.outset(self.blurOutset(b.blur_radius, zoom));
+                if (b.overflow_clip) |clip| bounds = clip.intersectBounds(bounds, zoom);
                 break :blk bounds;
             },
             .draw_composited_layer => |dcl| dcl.layer.bounds,
@@ -440,8 +444,9 @@ pub const Compositor = struct {
                     bounds.bottom = @max(bounds.bottom, child_bounds.bottom);
                 }
                 // Apply translation to get absolute bounds
-                const dx = self.scalePxWithZoom(t.translate_x, zoom);
-                const dy = self.scalePxWithZoom(t.translate_y, zoom);
+                const translation = DisplayItem.scaledTranslation(t, zoom, .nearest);
+                const dx = translation.x;
+                const dy = translation.y;
                 break :blk Rect{
                     .left = saturatingAdd(bounds.left, dx),
                     .top = saturatingAdd(bounds.top, dy),
@@ -470,7 +475,7 @@ pub const Compositor = struct {
         switch (item) {
             .blend => |blend_item| {
                 // Use the pre-computed needs_compositing flag
-                if (blend_item.needs_compositing) {
+                if (blend_item.needs_compositing or blend_item.overflow_clip != null) {
                     // Emit a DrawCompositedLayer pointing to the corresponding layer
                     if (layer_index.* < self.layers.items.len) {
                         try self.draw_list.append(self.allocator, .{
@@ -514,6 +519,7 @@ pub const Compositor = struct {
                         .transform = .{
                             .translate_x = transform_item.translate_x,
                             .translate_y = transform_item.translate_y,
+                            .translation_origin = transform_item.translation_origin,
                             .scroll_attachment = transform_item.scroll_attachment,
                             .children = children_copy,
                             .node = transform_item.node,
@@ -621,6 +627,32 @@ test "compositor cloning and draw-list building preserve transform scroll attach
         display_commands.ScrollAttachment.frame_viewport,
         compositor.draw_list.items[0].transform.scroll_attachment,
     );
+}
+
+test "axis clips survive compositor cloning and retain only enabled bounds" {
+    var compositor = Compositor.init(std.testing.allocator);
+    defer compositor.deinit();
+    var children = [_]DisplayItem{.{ .rect = .{
+        .x1 = -100,
+        .y1 = -200,
+        .x2 = 100,
+        .y2 = 200,
+        .color = .{ .r = 1, .g = 2, .b = 3 },
+    } }};
+    const source = DisplayItem{ .blend = .{
+        .opacity = 1,
+        .blend_mode = null,
+        .children = &children,
+        .overflow_clip = .{ .x1 = 10, .y1 = 20, .x2 = 30, .y2 = 40, .clip_y = false },
+        .needs_compositing = true,
+    } };
+    const cloned = try compositor.cloneDisplayItem(source);
+    defer {
+        var owned = [_]DisplayItem{cloned};
+        DisplayItem.freeItems(std.testing.allocator, &owned);
+    }
+    try std.testing.expect(!cloned.blend.overflow_clip.?.clip_y);
+    try std.testing.expectEqual(Rect{ .left = 10, .top = -200, .right = 30, .bottom = 200 }, compositor.getDisplayItemBounds(cloned, 1));
 }
 
 test "compositor bounds tolerate empty and overflowing transforms" {

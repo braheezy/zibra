@@ -1103,12 +1103,23 @@ pub fn Application(
                             }
                         }
 
+                        // Resolve the two axes from this cascade's specified
+                        // values, never from the prior pass's computed coercion.
+                        const overflow = @import("css_overflow.zig");
+                        const overflow_pair = overflow.compute(.{
+                            .x = overflow.parse(new_style.get("overflow-x") orelse "visible") orelse .visible,
+                            .y = overflow.parse(new_style.get("overflow-y") orelse "visible") orelse .visible,
+                        });
+                        try new_style.put("overflow-x", overflow_pair.x.text());
+                        try new_style.put("overflow-y", overflow_pair.y.text());
+
                         for (CSS_PROPERTIES) |prop| {
                             if (style_map.getPtr(prop.name)) |field| {
                                 const value = new_style.get(prop.name) orelse prop.default_value;
                                 field.set(try retainComputedValue(e, allocator, value, prop.default_value));
                             }
                         }
+                        e.refreshScrollUserPolicy(std.ascii.eqlIgnoreCase(new_style.get("visibility") orelse "visible", "visible"));
                         var animation_values: [8][]const u8 = undefined;
                         for (css_animation.names, 0..) |name, index| animation_values[index] = new_style.get(name).?;
                         var important_mask: u8 = 0;

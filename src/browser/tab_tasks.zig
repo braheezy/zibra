@@ -208,6 +208,7 @@ pub fn Contexts(comptime Browser: type) type {
                 backspace,
                 scroll: i32,
                 immediate_scroll: i32,
+                wheel_scroll: struct { x: i32, y: i32 },
                 blur,
                 history: union(enum) {
                     direction: HistoryDirection,
@@ -274,6 +275,7 @@ pub fn Contexts(comptime Browser: type) type {
                     .backspace => try self.tab.backspace(self.browser),
                     .scroll => |delta| self.tab.scrollFocused(self.browser, delta),
                     .immediate_scroll => |delta| self.tab.scrollImmediate(self.browser, delta),
+                    .wheel_scroll => |delta| self.tab.scrollWheel(self.browser, delta.x, delta.y),
                     .blur => if (self.tab.blur()) {
                         self.tab.updateAccessibilityFocus(self.browser);
                         self.tab.setNeedsRender();

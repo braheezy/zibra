@@ -1,0 +1,36 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Overflow child-frame support</title>
+<style>
+html { overflow:hidden }
+body { margin:0 }
+#ordinary { width:1200px; height:900px; background:#dbeafe }
+#fixed { position:fixed; left:8px; top:10px; width:24px; height:18px; background:green }
+</style></head><body>
+<div id="ordinary"></div><div id="fixed"></div>
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+  var results=[],root=document.documentElement;
+  var ordinary=document.getElementById('ordinary'),fixed=document.getElementById('fixed');
+  var normalBefore=ordinary.getBoundingClientRect(),fixedBefore=fixed.getBoundingClientRect();
+  function equal(actual,expected){if(actual!==expected)throw Error(String(actual)+' != '+String(expected));}
+  function check(name,fn){try{fn();results.push({name:name,status:0});}catch(error){results.push({name:name,status:1,message:String(error)});}}
+  check('child viewport reports its own overflow dimensions',function(){
+    if(root.scrollWidth<1200||root.scrollHeight<900)throw Error('child overflow missing');
+  });
+  check('child root scroll offsets are independently addressable',function(){
+    root.scrollTo(50,40);equal(root.scrollLeft,50);equal(root.scrollTop,40);
+  });
+  check('ordinary child geometry moves in its own viewport',function(){
+    var box=ordinary.getBoundingClientRect();equal(box.x,normalBefore.x-50);equal(box.y,normalBefore.y-40);
+  });
+  check('fixed child geometry remains in its own viewport',function(){
+    var box=fixed.getBoundingClientRect();equal(box.x,fixedBefore.x);equal(box.y,fixedBefore.y);
+  });
+  check('child root relative scrolling preserves both axis origins',function(){
+    root.scrollBy(15,20);equal(root.scrollLeft,65);equal(root.scrollTop,60);
+    var box=ordinary.getBoundingClientRect();equal(box.x,normalBefore.x-65);equal(box.y,normalBefore.y-60);
+    var pinned=fixed.getBoundingClientRect();equal(pinned.x,fixedBefore.x);equal(pinned.y,fixedBefore.y);
+  });
+  window.parent.postMessage({kind:'overflow-viewport-child',results:results},'*');
+});
+</script></body></html>

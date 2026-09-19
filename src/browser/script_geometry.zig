@@ -30,15 +30,19 @@ pub fn Callbacks(comptime Browser: type) type {
                 const element = &target.element;
                 const root = target == document.node_ptr;
                 const scale: f64 = frame.inherited_css_zoom * (if (root) @as(f32, 1) else box_model.effectiveCssZoomForNode(target));
+                const metrics = try geometry.measureMetrics(document, target, frame.inherited_css_zoom, .{ .width = @floatFromInt(document.scrollport_width), .height = @floatFromInt(document.scrollport_height) }, allocator);
+                if (!root and !metrics.has_box) return;
                 if (query == .scroll_set) {
-                    const current_x = if (root) @as(i32, 0) else element.scroll_x;
+                    const current_x = if (root) frame.scroll_x else element.scroll_x;
                     const current_y = if (root) frame.scroll else element.scroll_y;
                     const x = scrollCoordinate(out.scroll_x, current_x, scale, out.scroll_relative);
                     const y = scrollCoordinate(out.scroll_y, current_y, scale, out.scroll_relative);
                     const moved = if (root) changed: {
                         const next = tab.clampScrollForFrame(frame, y);
-                        if (next == frame.scroll) break :changed false;
+                        const next_x = tab.clampScrollXForFrame(frame, x);
+                        if (next == frame.scroll and next_x == frame.scroll_x) break :changed false;
                         frame.scroll = next;
+                        frame.scroll_x = next_x;
                         if (frame.parent == null) tab.scroll_changed_in_tab = true;
                         break :changed true;
                     } else element.scrollTo(x, y);
@@ -48,9 +52,8 @@ pub fn Callbacks(comptime Browser: type) type {
                         tab.setNeedsPaint();
                     }
                 } else {
-                    const metrics = try geometry.measureMetrics(document, target, frame.inherited_css_zoom, .{ .width = @floatFromInt(document.viewport_width), .height = @floatFromInt(document.viewport_height) }, allocator);
                     out.scroll = if (root)
-                        .{ 0, @as(f64, @floatFromInt(frame.scroll)) / scale, @as(f64, @floatFromInt(document.viewport_width)) / scale, @as(f64, @floatFromInt(@max(document.height.get().* +| document.y.get().* *| 2, document.viewport_height))) / scale }
+                        .{ @as(f64, @floatFromInt(frame.scroll_x)) / scale, @as(f64, @floatFromInt(frame.scroll)) / scale, @as(f64, @floatFromInt(document.content_width)) / scale, @as(f64, @floatFromInt(document.content_height)) / scale }
                     else
                         .{ @as(f64, @floatFromInt(element.scroll_x)) / scale, @as(f64, @floatFromInt(element.scroll_y)) / scale, @max(metrics.client.width, @as(f64, @floatFromInt(element.scroll_content_width)) / scale), @max(metrics.client.height, @as(f64, @floatFromInt(element.scroll_content_height)) / scale) };
                 }
@@ -68,7 +71,7 @@ pub fn Callbacks(comptime Browser: type) type {
                 out.offset_x = metrics.offset_x;
                 out.offset_y = metrics.offset_y;
                 if (metrics.offset_parent) |parent| out.offset_parent = try js.captureNodeHandleFromNativeCallback(ctx.window_id, parent);
-            } else try geometry.collect(document, target, frame.inherited_css_zoom, frame.scroll, query == .offset_rects, allocator, &out.rects);
+            } else try geometry.collectScrolled(document, target, frame.inherited_css_zoom, frame.scroll_x, frame.scroll, query == .offset_rects, allocator, &out.rects);
         }
 
         fn flushAncestors(browser: *Browser, frame: anytype, rebuild_media: bool) anyerror!void {

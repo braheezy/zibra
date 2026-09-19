@@ -73,6 +73,7 @@ pub fn cloneItem(
                 .blend_mode = blend_mode,
                 .blur_radius = blend.blur_radius,
                 .hit_clip = blend.hit_clip,
+                .overflow_clip = blend.overflow_clip,
                 .children = children,
                 .node = blend.node,
                 .parent = null,
@@ -84,6 +85,7 @@ pub fn cloneItem(
         .transform => |transform| .{ .transform = .{
             .translate_x = transform.translate_x,
             .translate_y = transform.translate_y,
+            .translation_origin = transform.translation_origin,
             .scroll_attachment = transform.scroll_attachment,
             .children = try cloneList(allocator, transform.children),
             .node = transform.node,
@@ -132,6 +134,7 @@ test "materialization recursively owns nested containers and metadata" {
         .blend_mode = blend_mode,
         .blur_radius = 3.0,
         .hit_clip = .{ .x1 = 0, .y1 = 0, .x2 = 40, .y2 = 40, .radius = 8 },
+        .overflow_clip = .{ .x1 = 2, .y1 = 3, .x2 = 38, .y2 = 39, .clip_y = false },
         .children = blend_children,
     } }};
 
@@ -142,6 +145,8 @@ test "materialization recursively owns nested containers and metadata" {
     try std.testing.expectEqualStrings("multiply", snapshot[0].blend.blend_mode.?);
     try std.testing.expectEqual(@as(f64, 3.0), snapshot[0].blend.blur_radius);
     try std.testing.expectEqual(@as(f64, 8), snapshot[0].blend.hit_clip.?.radius);
+    try std.testing.expect(!snapshot[0].blend.overflow_clip.?.clip_y);
+    try std.testing.expectEqual(@as(i32, 2), snapshot[0].blend.overflow_clip.?.x1);
     try std.testing.expectEqual(@as(i32, 5), snapshot[0].blend.children[0].transform.translate_x);
     try std.testing.expectEqual(
         display_list.ScrollAttachment.frame_viewport,

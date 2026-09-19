@@ -15,6 +15,87 @@ fn value(node: *document.Node, property: []const u8) []const u8 {
     return node.element.style.?.getPtr(property).?.get().*;
 }
 
+test "overflow computed pairs follow current single-axis semantics across retained mutations" {
+    const allocator = std.testing.allocator;
+    var root = try parsed("<div style='overflow:visible scroll'><span style='overflow:inherit'></span></div>");
+    defer root.deinit(allocator);
+    document.fixParentPointers(&root, null);
+    try document.style(allocator, &root, &.{});
+    const child = &root.element.children.items[0];
+    try std.testing.expectEqualStrings("auto", value(&root, "overflow-x"));
+    try std.testing.expectEqualStrings("scroll", value(child, "overflow-y"));
+    try std.testing.expectEqualStrings("auto", value(child, "overflow-x"));
+    const axes = [_][]const u8{ "visible", "hidden", "clip", "scroll", "auto" };
+    for (axes) |x| for (axes) |y| {
+        const authored = try std.fmt.allocPrint(allocator, "overflow-x:{s};overflow-y:{s}", .{ x, y });
+        defer allocator.free(authored);
+        try root.element.putOwnedAttribute(allocator, "style", authored);
+        dom.dirtyStyleForElement(&root.element);
+        try document.style(allocator, &root, &.{});
+        const x_scrollable = std.mem.eql(u8, x, "hidden") or std.mem.eql(u8, x, "scroll") or std.mem.eql(u8, x, "auto");
+        const y_scrollable = std.mem.eql(u8, y, "hidden") or std.mem.eql(u8, y, "scroll") or std.mem.eql(u8, y, "auto");
+        const expected_x = if (std.mem.eql(u8, x, "visible") and y_scrollable) "auto" else x;
+        const expected_y = if (std.mem.eql(u8, y, "visible") and x_scrollable) "auto" else y;
+        try std.testing.expectEqualStrings(expected_x, value(&root, "overflow-x"));
+        try std.testing.expectEqualStrings(expected_y, value(&root, "overflow-y"));
+        try std.testing.expectEqualStrings(expected_x, value(child, "overflow-x"));
+        try std.testing.expectEqualStrings(expected_y, value(child, "overflow-y"));
+    };
+    try root.element.putOwnedAttribute(allocator, "style", "overflow:visible");
+    dom.dirtyStyleForElement(&root.element);
+    try document.style(allocator, &root, &.{});
+    try std.testing.expectEqualStrings("visible", value(&root, "overflow-x"));
+    try std.testing.expectEqualStrings("visible", value(&root, "overflow-y"));
+}
+
+test "overflow shorthand substitution CSS-wide values and used policy preserve computed ownership" {
+    const allocator = std.testing.allocator;
+    var root = try parsed("<div style='--axes:visible hidden;overflow:var(--axes)'><span style='overflow:unset'></span></div>");
+    defer root.deinit(allocator);
+    document.fixParentPointers(&root, null);
+    try document.style(allocator, &root, &.{});
+    try std.testing.expectEqualStrings("auto", value(&root, "overflow-x"));
+    try std.testing.expectEqualStrings("hidden", value(&root, "overflow-y"));
+    try std.testing.expectEqualStrings("visible", value(&root.element.children.items[0], "overflow-x"));
+    root.element.setScrollGeometry(.{}, true, .{ .client_width = 20, .content_width = 50 });
+    try std.testing.expectEqualStrings("auto", value(&root, "overflow-x"));
+    try root.element.putOwnedAttribute(allocator, "style", "--axes:clip scroll;overflow:var(--axes);overflow-y:initial");
+    dom.dirtyStyleForElement(&root.element);
+    try document.style(allocator, &root, &.{});
+    try std.testing.expectEqualStrings("clip", value(&root, "overflow-x"));
+    try std.testing.expectEqualStrings("visible", value(&root, "overflow-y"));
+    try root.element.putOwnedAttribute(allocator, "style", "overflow-x:hidden!important;overflow:clip visible");
+    dom.dirtyStyleForElement(&root.element);
+    try document.style(allocator, &root, &.{});
+    try std.testing.expectEqualStrings("hidden", value(&root, "overflow-x"));
+    try std.testing.expectEqualStrings("auto", value(&root, "overflow-y"));
+}
+
+test "overflow user permission follows paint-only visibility changes without resetting offsets" {
+    const allocator = std.testing.allocator;
+    var root = try parsed("<div style='overflow:auto;visibility:visible'></div>");
+    defer root.deinit(allocator);
+    document.fixParentPointers(&root, null);
+    try document.style(allocator, &root, &.{});
+    root.element.setScrollGeometry(.{ .x = .auto, .y = .auto }, true, .{ .client_width = 20, .content_width = 100, .client_height = 20, .content_height = 100 });
+    try std.testing.expect(root.element.scrollTo(30, 40));
+    try root.element.putOwnedAttribute(allocator, "style", "overflow:auto;visibility:hidden");
+    dom.dirtyStyleForElement(&root.element);
+    try document.style(allocator, &root, &.{});
+    try std.testing.expect(!root.element.scrollByAxis(.x, 10));
+    try std.testing.expect(!root.element.scrollByAxis(.y, 10));
+    try std.testing.expectEqual(@as(i32, 30), root.element.scroll_x);
+    try std.testing.expectEqual(@as(i32, 40), root.element.scroll_y);
+    try std.testing.expect(root.element.scrollTo(35, 45));
+    try root.element.putOwnedAttribute(allocator, "style", "overflow:auto;visibility:visible");
+    dom.dirtyStyleForElement(&root.element);
+    try document.style(allocator, &root, &.{});
+    try std.testing.expect(root.element.scrollByAxis(.x, 10));
+    try std.testing.expect(root.element.scrollByAxis(.y, 10));
+    try std.testing.expectEqual(@as(i32, 45), root.element.scroll_x);
+    try std.testing.expectEqual(@as(i32, 55), root.element.scroll_y);
+}
+
 test "HTML hints cascade between user agent and author rules and survive attribute replacement" {
     const allocator = std.testing.allocator;
     const CSSParser = @import("../document/css_parser.zig").CSSParser;

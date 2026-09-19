@@ -101,6 +101,7 @@ pub const RasterSnapshot = struct {
                     .blend_mode = mode_copy,
                     .blur_radius = blend_item.blur_radius,
                     .hit_clip = blend_item.hit_clip,
+                    .overflow_clip = blend_item.overflow_clip,
                     .children = children,
                     .node = null,
                     .parent = null,
@@ -112,6 +113,7 @@ pub const RasterSnapshot = struct {
             .transform => |transform_item| .{ .transform = .{
                 .translate_x = transform_item.translate_x,
                 .translate_y = transform_item.translate_y,
+                .translation_origin = transform_item.translation_origin,
                 .scroll_attachment = transform_item.scroll_attachment,
                 .children = try self.cloneList(transform_item.children),
                 .node = null,

@@ -13,6 +13,7 @@ const value_tokens = @import("css_value_tokens.zig");
 const css_values = @import("css_values.zig");
 const custom_properties = @import("custom_properties.zig");
 const css_flex = @import("css_flex.zig");
+const css_overflow = @import("css_overflow.zig");
 const grid_tracks = @import("grid_tracks.zig");
 
 const cascade = @import("css_cascade.zig");
@@ -403,7 +404,7 @@ pub fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     if (std.mem.eql(u8, property, "position")) return keywordIn(raw_value, &.{ "static", "relative", "absolute", "fixed", "sticky" });
     if (std.mem.eql(u8, property, "float")) return keywordIn(raw_value, &.{ "none", "left", "right" });
     if (std.mem.eql(u8, property, "clear")) return keywordIn(raw_value, &.{ "none", "left", "right", "both" });
-    if (std.mem.eql(u8, property, "overflow")) return keywordIn(raw_value, &.{ "visible", "hidden", "scroll", "auto" });
+    if (std.mem.eql(u8, property, "overflow-x") or std.mem.eql(u8, property, "overflow-y")) return css_overflow.parse(raw_value) != null;
     if (std.mem.eql(u8, property, "visibility")) return keywordIn(raw_value, &.{ "visible", "hidden" });
     // The UA stylesheet uses legacy HTML alignment values to position block
     // children too; ordinary CSS text-align only positions inline content.
@@ -909,6 +910,18 @@ fn putCanonical(map: anytype, property: []const u8, raw_declaration: Declaration
         }
         if (pending) {
             try putLonghand(map, property, declaration);
+            return;
+        }
+    }
+    if (std.mem.eql(u8, property, "overflow")) {
+        const pair = css_overflow.parsePair(declaration.value) orelse return;
+        try putLonghand(map, "overflow-x", .{ .value = pair.x.text(), .important = declaration.important });
+        try putLonghand(map, "overflow-y", .{ .value = pair.y.text(), .important = declaration.important });
+        return;
+    }
+    if (std.mem.eql(u8, property, "overflow-x") or std.mem.eql(u8, property, "overflow-y")) {
+        if (css_overflow.parse(declaration.value)) |value| {
+            try putLonghand(map, property, .{ .value = value.text(), .important = declaration.important });
             return;
         }
     }

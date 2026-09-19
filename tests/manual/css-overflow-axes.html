@@ -1,0 +1,79 @@
+<!doctype html>
+<!-- How to verify: status must say PASS. Use a trackpad horizontally over the
+     card strip and vertically over the flex panel; each moves only its allowed
+     axis. The green vertical and horizontal spill areas stay clickable, while
+     the clipped sides do not. Scroll the inline badge, click its link and button,
+     toggle clip repeatedly, then resize. Counts must still update. -->
+<html><head><meta charset="utf-8"><title>Independent overflow axes</title>
+<style>
+body { margin:20px; font:16px sans-serif; color:#17202a; background:white }
+h1 { font-size:24px; margin:0 0 12px }
+p { margin:8px 0 }
+#hits { display:flex; gap:120px; height:160px; margin-top:12px }
+.hit { width:80px; height:60px; border:2px solid #334155; background:#fef3c7 }
+.hit a { display:block; width:160px; height:120px; background:#86efac }
+#clip-x { overflow:clip visible }
+#clip-y { overflow:visible clip }
+#matrix { display:flex; flex-wrap:wrap; gap:20px; margin:16px 0 }
+.panel { width:80px; height:60px; background:#dcfce7 }
+.fill { width:160px; height:120px; background:#15803d }
+#workspace { display:flex; flex-direction:column; width:220px; height:100px; border:2px solid #334155 }
+#workspace-head { flex:none; height:20px; background:#cbd5e1 }
+#workspace-panel { overflow:clip auto }
+#workspace-content { height:160px; background:#dcfce7 }
+#strip { display:flex; width:120px; height:50px; overflow:auto clip; border:2px solid #334155 }
+.card { flex:none; width:80px; height:50px; background:#86efac }
+.card + .card { background:#15803d }
+#outer,#atomic-outer { width:100px; height:80px; overflow:auto; font-size:0; line-height:0 }
+#inner { width:40px; height:30px; overflow:clip visible }
+#nested-content { width:200px; height:120px; background:#86efac }
+#atomic { display:inline-flex; vertical-align:bottom; width:40px; height:30px; overflow:clip visible }
+#atomic-content { flex:none; width:200px; height:120px; background:#15803d }
+#actions { display:inline-flex; width:140px; height:50px; overflow:auto clip; background:#dcfce7 }
+#action { display:block; flex:none; width:160px; height:50px }
+#action-button { flex:none; width:70px; height:40px }
+</style></head><body>
+<h1 id="status">Checking overflow axes</h1>
+<p id="details"></p>
+<p>Green spill stays clickable only on the visible axis.</p>
+<div id="hits"><div id="clip-x" class="hit"><a id="vertical-link" href="#hits">Vertical spill</a></div><div id="clip-y" class="hit"><a id="horizontal-link" href="#hits">Horizontal spill</a></div></div>
+<button id="toggle">Toggle first panel clip</button><button id="reset">Reset offsets</button>
+<div id="matrix"><div id="visible-clip" class="panel" style="overflow:visible clip"><div class="fill"></div></div><div id="clip-visible" class="panel" style="overflow:clip visible"><div class="fill"></div></div><div id="auto-clip" class="panel" style="overflow:auto clip"><div class="fill"></div></div><div id="clip-auto" class="panel" style="overflow:clip auto"><div class="fill"></div></div><div id="hidden-hidden" class="panel" style="overflow:hidden"><div id="resized" class="fill"></div></div><div id="visible-hidden" class="panel" style="overflow:visible hidden"><div class="fill"></div></div></div>
+<p>Fixed-height workspace: scroll the green panel vertically.</p>
+<div id="workspace"><div id="workspace-head"></div><div id="workspace-panel"><div id="workspace-content">Panel top<br><br><br><br><br>Panel bottom</div></div></div>
+<p>Card strip: scroll sideways.</p><div id="strip"><div class="card"></div><div class="card"></div><div class="card"></div></div>
+<p>Nested and atomic boxes preserve their unclipped axis.</p>
+<div id="outer"><div id="inner"><div id="nested-content"></div></div></div>
+<div id="atomic-outer"><span id="atomic"><span id="atomic-content"></span></span></div>
+<p>Inline badge: scroll sideways to reveal the button.</p><div id="actions"><a id="action" href="#actions">Link</a><button id="action-button">Count</button></div>
+<p id="interaction">Links: 0, Count: 0</p>
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+  var links=0,counts=0,clipped=false;
+  function el(id){return document.getElementById(id);}
+  function rect(id){return el(id).getBoundingClientRect();}
+  function equal(a,b){if(a!==b)throw Error(String(a)+' != '+String(b));}
+  function movement(id,x,y){el(id).scrollTo(x,y);}
+  var results=[];
+  function check(name,fn){try{fn();results.push({name:name,status:0});}catch(error){results.push({name:name,status:1,message:String(error)});}}
+  function metrics(id,w,h){equal(el(id).scrollWidth,w);equal(el(id).scrollHeight,h);}
+  [['visible-clip','visible','clip',0,0],['clip-visible','clip','visible',0,0],['auto-clip','auto','clip',50,0],['clip-auto','clip','auto',0,40],['hidden-hidden','hidden','hidden',50,40],['visible-hidden','auto','hidden',50,40]].forEach(function(c){check('computed pair, dimensions and movement: '+c[0],function(){var box=el(c[0]),style=getComputedStyle(box);equal(style.overflowX,c[1]);equal(style.overflowY,c[2]);equal(box.clientWidth,80);equal(box.clientHeight,60);metrics(c[0],160,120);movement(c[0],50,40);equal(box.scrollLeft,c[3]);equal(box.scrollTop,c[4]);movement(c[0],0,0);});});
+  check('flex workspace automatic minimum permits its vertical panel to shrink',function(){equal(rect('workspace-panel').height,80);equal(el('workspace-panel').scrollHeight,160);movement('workspace-panel',30,40);equal(el('workspace-panel').scrollLeft,0);equal(el('workspace-panel').scrollTop,40);movement('workspace-panel',0,0);});
+  check('horizontal card strip preserves height and scrolls all cards',function(){metrics('strip',240,50);movement('strip',100,40);equal(el('strip').scrollLeft,100);equal(el('strip').scrollTop,0);movement('strip',0,0);});
+  check('nested clipped axis stops propagation but retains its own overflow',function(){metrics('outer',100,120);metrics('inner',200,120);});
+  check('atomic snapshot propagates overflow independently from CSSOM descendants',function(){metrics('atomic-outer',100,120);metrics('atomic',200,120);equal(rect('atomic-content').width,200);});
+  check('axis policy mutation preserves one offset and resets the forbidden one',function(){var box=el('hidden-hidden');movement('hidden-hidden',50,40);box.style.overflowY='clip';equal(box.scrollLeft,50);equal(box.scrollTop,0);metrics('hidden-hidden',160,120);box.style.overflowY='hidden';movement('hidden-hidden',0,0);});
+  check('content mutation clamps retained scroll offset',function(){movement('hidden-hidden',70,40);el('resized').style.width='100px';equal(el('hidden-hidden').scrollLeft,20);equal(el('hidden-hidden').scrollTop,40);el('resized').style.width='160px';movement('hidden-hidden',0,0);});
+  check('atomic scrolling moves descendant geometry once',function(){var before=rect('action-button');movement('actions',70,0);equal(rect('action-button').x,before.x-70);movement('actions',0,0);});
+  var failures=results.filter(function(r){return r.status!==0;});
+  el('status').textContent=failures.length?'FAIL: '+failures[0].name:'PASS: independent overflow axes';
+  el('status').style.color=failures.length?'red':'green';
+  el('details').textContent=failures.map(function(r){return r.message;}).join('; ');
+  function interaction(){el('interaction').textContent='Links: '+links+', Count: '+counts;}
+  ['vertical-link','horizontal-link','action'].forEach(function(id){el(id).addEventListener('click',function(event){event.preventDefault();links++;interaction();});});
+  el('action-button').addEventListener('click',function(){counts++;interaction();});
+  el('toggle').addEventListener('click',function(){clipped=!clipped;el('visible-clip').style.overflowX=clipped?'clip':'visible';});
+  el('reset').addEventListener('click',function(){['auto-clip','clip-auto','hidden-hidden','visible-hidden','workspace-panel','strip','actions'].forEach(function(id){movement(id,0,0);});});
+  if(typeof completion_callback==='function')completion_callback(results,{status:0});
+});
+</script></body></html>

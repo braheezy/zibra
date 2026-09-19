@@ -9,6 +9,7 @@ const std = @import("std");
 const zigimg = @import("zigimg");
 const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
 const css_length = @import("length.zig");
+const css_overflow = @import("css_overflow.zig");
 const canvas_module = @import("canvas.zig");
 const animation_module = @import("animation.zig");
 const html_serialization = @import("html_serialization.zig");
@@ -38,6 +39,15 @@ pub const CssAnimationState = animation_module.CssAnimationState;
 pub const cssAnimationPropertyBit = animation_module.cssAnimationPropertyBit;
 pub const css_animation_properties = animation_module.css_animation_properties;
 pub const StyleMap = std.StringHashMap(ProtectedField([]const u8));
+
+/// Latest padding-box and scrollable-overflow dimensions in layout pixels.
+/// Metrics remain meaningful even when one or both axes cannot scroll.
+pub const ScrollGeometry = struct {
+    client_width: i32 = 0,
+    content_width: i32 = 0,
+    client_height: i32 = 0,
+    content_height: i32 = 0,
+};
 
 fn parseCanvasDimension(raw: []const u8) ?i32 {
     const text = std.mem.trim(u8, raw, " \t\r\n");
@@ -314,8 +324,10 @@ pub const Element = struct {
     is_visited: bool = false,
     // Persistent element-local scroll state. Layout refreshes the geometry,
     // while input changes only offsets and requests a repaint.
+    used_overflow: ?css_overflow.Pair = null,
     scroll_container: bool = false,
-    scroll_interactive: bool = false,
+    scroll_user_x: bool = false,
+    scroll_user_y: bool = false,
     scroll_x: i32 = 0,
     scroll_y: i32 = 0,
     scroll_client_width: i32 = 0,
@@ -760,47 +772,43 @@ pub const Element = struct {
         return false;
     }
 
-    /// Publish the latest layout overflow for an `overflow: scroll` box and
-    /// preserve its offset across paint/layout passes, clamped to the new
-    /// range. Disabling scrolling resets all element-local scroll state.
+    /// Publish layout's used overflow and both dimensions together. Clamp
+    /// offsets independently, retaining reported overflow on forbidden axes.
+    /// The caller refreshes paint/sticky state if publication moved an offset.
     pub fn setScrollGeometry(
         self: *Element,
-        enabled: bool,
-        client_height: i32,
-        content_height: i32,
+        used: css_overflow.Pair,
+        allow_user: bool,
+        geometry: ScrollGeometry,
     ) void {
-        if (!enabled) {
-            self.scroll_container = false;
-            self.scroll_interactive = false;
-            self.scroll_x = 0;
-            self.scroll_y = 0;
-            self.scroll_client_width = 0;
-            self.scroll_content_width = 0;
-            self.scroll_client_height = 0;
-            self.scroll_content_height = 0;
-            return;
-        }
+        self.used_overflow = used;
+        self.scroll_container = used.establishesFormattingContext();
+        self.refreshScrollUserPolicy(allow_user);
+        self.scroll_client_width = @max(0, geometry.client_width);
+        self.scroll_client_height = @max(0, geometry.client_height);
+        self.scroll_content_width = @max(self.scroll_client_width, geometry.content_width);
+        self.scroll_content_height = @max(self.scroll_client_height, geometry.content_height);
+        self.scroll_x = std.math.clamp(self.scroll_x, 0, self.maxScrollX());
+        self.scroll_y = std.math.clamp(self.scroll_y, 0, self.maxScrollY());
+    }
 
-        self.scroll_container = true;
-        self.scroll_interactive = true;
-        self.scroll_client_height = @max(0, client_height);
-        self.scroll_content_height = @max(0, content_height);
-        self.scroll_y = @min(@max(0, self.scroll_y), self.maxScrollY());
+    /// Visibility can change during a paint-only style pass. Refresh user
+    /// permission without changing offsets, used overflow or layout metrics.
+    pub fn refreshScrollUserPolicy(self: *Element, allow_user: bool) void {
+        const used = self.used_overflow orelse css_overflow.Pair{};
+        self.scroll_user_x = allow_user and used.x.allowsUserScroll();
+        self.scroll_user_y = allow_user and used.y.allowsUserScroll();
     }
 
     pub fn maxScrollY(self: *const Element) i32 {
-        if (!self.scroll_container or self.scroll_content_height <= self.scroll_client_height) return 0;
-        return self.scroll_content_height - self.scroll_client_height;
-    }
-
-    pub fn setHorizontalScrollGeometry(self: *Element, client: i32, content: i32) void {
-        self.scroll_client_width = @max(0, client);
-        self.scroll_content_width = @max(self.scroll_client_width, content);
-        self.scroll_x = std.math.clamp(self.scroll_x, 0, self.maxScrollX());
+        const used = self.used_overflow orelse return 0;
+        if (!used.y.isScrollable()) return 0;
+        return @max(0, self.scroll_content_height -| self.scroll_client_height);
     }
 
     pub fn maxScrollX(self: *const Element) i32 {
-        if (!self.scroll_container) return 0;
+        const used = self.used_overflow orelse return 0;
+        if (!used.x.isScrollable()) return 0;
         return @max(0, self.scroll_content_width -| self.scroll_client_width);
     }
 
@@ -815,16 +823,26 @@ pub const Element = struct {
         return true;
     }
 
-    /// Move within this element's current scroll range. Returns false at a
-    /// boundary so keyboard input can bubble to an enclosing scroll box.
-    pub fn scrollBy(self: *Element, delta: i32) bool {
-        if (!self.scroll_container or !self.scroll_interactive or delta == 0) return false;
-        const maximum = self.maxScrollY();
-        const candidate = @as(i64, self.scroll_y) + @as(i64, delta);
+    pub fn allowsUserScroll(self: *const Element, axis: css_overflow.Axis) bool {
+        return if (axis == .x) self.scroll_user_x else self.scroll_user_y;
+    }
+
+    /// Move one user-scrollable axis. False at a boundary lets input continue
+    /// to an enclosing scrollport without consuming movement in the other axis.
+    pub fn scrollByAxis(self: *Element, axis: css_overflow.Axis, delta: i32) bool {
+        if (!self.allowsUserScroll(axis) or delta == 0) return false;
+        const offset = if (axis == .x) &self.scroll_x else &self.scroll_y;
+        const maximum = if (axis == .x) self.maxScrollX() else self.maxScrollY();
+        const candidate = @as(i64, offset.*) + @as(i64, delta);
         const next: i32 = @intCast(std.math.clamp(candidate, 0, @as(i64, maximum)));
-        if (next == self.scroll_y) return false;
-        self.scroll_y = next;
+        if (next == offset.*) return false;
+        offset.* = next;
         return true;
+    }
+
+    /// Existing vertical keyboard callers share the axis-aware user policy.
+    pub fn scrollBy(self: *Element, delta: i32) bool {
+        return self.scrollByAxis(.y, delta);
     }
 
     /// Checkbox state lives in the DOM attribute map so layout, activation,
@@ -1506,6 +1524,52 @@ test "HTML token-list attributes are whitespace-separated and case-insensitive" 
     try std.testing.expect(link.attributeHasToken("rel", "APPENDIX"));
     try std.testing.expect(!link.attributeHasToken("rel", "style"));
     try std.testing.expect(!link.attributeHasToken("missing", "stylesheet"));
+}
+
+test "overflow axes retain geometry and clamp only forbidden offsets" {
+    var element = Element{ .tag = "div", .children = .empty };
+    const geometry = ScrollGeometry{ .client_width = 100, .content_width = 300, .client_height = 80, .content_height = 280 };
+    element.setScrollGeometry(.{ .x = .auto, .y = .scroll }, true, geometry);
+    try std.testing.expect(element.scrollTo(40, 50));
+    element.setScrollGeometry(.{ .x = .clip, .y = .scroll }, true, geometry);
+    try std.testing.expectEqual(@as(i32, 0), element.scroll_x);
+    try std.testing.expectEqual(@as(i32, 50), element.scroll_y);
+    try std.testing.expectEqual(@as(i32, 300), element.scroll_content_width);
+    try std.testing.expectEqual(@as(i32, 280), element.scroll_content_height);
+    try std.testing.expectEqual(@as(i32, 0), element.maxScrollX());
+    try std.testing.expectEqual(@as(i32, 200), element.maxScrollY());
+    try std.testing.expect(!element.scrollByAxis(.x, 30));
+    try std.testing.expect(element.scrollByAxis(.y, 30));
+    try std.testing.expectEqual(@as(i32, 80), element.scroll_y);
+    element.setScrollGeometry(.{ .x = .hidden, .y = .clip }, true, geometry);
+    try std.testing.expectEqual(@as(i32, 0), element.scroll_y);
+    try std.testing.expect(element.scrollTo(90, 90));
+    try std.testing.expectEqual(@as(i32, 90), element.scroll_x);
+    try std.testing.expectEqual(@as(i32, 0), element.scroll_y);
+    try std.testing.expect(!element.scrollByAxis(.x, 30));
+    element.setScrollGeometry(.{}, true, geometry);
+    try std.testing.expect(!element.scroll_container);
+    try std.testing.expectEqual(@as(i32, 0), element.scroll_x);
+    try std.testing.expectEqual(@as(i32, 300), element.scroll_content_width);
+    try std.testing.expectEqual(@as(i32, 280), element.scroll_content_height);
+}
+
+test "overflow user policy preserves programmatic scrolling and saturates deltas" {
+    var element = Element{ .tag = "div", .children = .empty };
+    const geometry = ScrollGeometry{ .client_width = 100, .content_width = 300, .client_height = 100, .content_height = 300 };
+    element.setScrollGeometry(.{ .x = .auto, .y = .auto }, false, geometry);
+    try std.testing.expect(!element.scrollByAxis(.x, 10));
+    try std.testing.expect(!element.scrollBy(10));
+    try std.testing.expect(element.scrollTo(40, 50));
+    element.setScrollGeometry(.{ .x = .auto, .y = .auto }, true, geometry);
+    try std.testing.expect(element.scrollByAxis(.x, std.math.maxInt(i32)));
+    try std.testing.expectEqual(@as(i32, 200), element.scroll_x);
+    try std.testing.expect(!element.scrollByAxis(.x, 1));
+    try std.testing.expect(element.scrollByAxis(.x, std.math.minInt(i32)));
+    try std.testing.expectEqual(@as(i32, 0), element.scroll_x);
+    element.setScrollGeometry(.{ .x = .auto, .y = .auto }, true, .{ .client_width = 120, .content_width = 20, .client_height = 20, .content_height = 30 });
+    try std.testing.expectEqual(@as(i32, 120), element.scroll_content_width);
+    try std.testing.expectEqual(@as(i32, 10), element.scroll_y);
 }
 
 test "HTML attributes normalize CR newlines" {

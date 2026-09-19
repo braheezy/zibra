@@ -774,7 +774,7 @@ Important geometry contracts:
   owner includes floats in auto height. Ordinary normal-flow block border
   boxes retain their containing-block geometry beneath external floats; only
   their inline line ranges are excluded. Floats themselves and bounded
-  formatting contexts (non-visible overflow and block table/flex/grid)
+  formatting contexts (a used scrollable overflow axis and block table/flex/grid)
   avoid the external float area as whole boxes.
 - Direct ordinary block children use a synchronous, pointer-free vertical
   margin cursor. Its pure strut retains the largest positive and most-negative
@@ -806,16 +806,10 @@ Important geometry contracts:
   numeric transforms and never mutate sticky DOM/layout state. Retained block
   boxes support both physical axes in horizontal LTR layout; fragmented and
   temporary atomic-inline sticky boxes need a retained constraint contract.
-- `overflow: scroll`, `auto` and `hidden` blocks preserve natural overflow
-  dimensions and clamped horizontal/vertical offsets as DOM scroll geometry,
-  translate only their content, and clip it. The present bounded implementation
-  clips to the layout block bounds. On the root `html` block hidden overflow
-  suppresses the viewport scrollbar gutter and rail without disabling the
-  frame's scroll range; layout resolves that boolean before page geometry and
-  commits it as scalar presentation state for browser/raster consumers. The
-  Frame retains the last successfully laid-out value, so a post-layout hover
-  or DOM invalidation never makes an animation commit read a dirty root style
-  map.
+- Physical overflow axes preserve independent clipping, scroll permission and
+  reported dimensions. Layout publishes used policy and scroll geometry;
+  content-only paint/hit clips and browser viewport policy consume that same
+  clean generation. See the overflow contract below.
 - A paint-phase root containing a float or positioned descendant uses the
   bounded phase sequence: negative positioned, static block
   backgrounds/borders, floats, inline/content, positioned auto/zero, then
@@ -1107,9 +1101,8 @@ zoom when converted into page coordinates.
 
 This remains horizontal layout with existing row/column reverse and wrapping.
 Intrinsic block-axis keywords, width `fit-content(<length-percentage>)`, full
-column/orthogonal baseline sharing, independent overflow axes, and complete
-cyclic intrinsic track sizing remain
-separate capabilities. Complete nested flex/grid intrinsic ratio contributions,
+column/orthogonal baseline sharing and complete cyclic intrinsic track sizing
+remain separate capabilities. Complete nested flex/grid intrinsic ratio contributions,
 orthogonal ratio transfer and general cyclic ratio/percentage resolution also
 remain limited. Table-specific content floors and replaced ratio resolution
 remain separate policies over the common measurements.
@@ -1119,6 +1112,124 @@ to the embedded Surface. Canvas drawing runs on the serialized tab worker.
 Every pixel-changing command dirties the nearest retained paint owner. Paint
 copies live canvas pixels into an immutable owning command; committed state
 never borrows the mutable backing surface.
+
+## Overflow policy, geometry and clipping
+
+`document/css_overflow.zig` owns physical overflow grammar and pointer-free
+`Value`/`Pair` policy. The computed registry contains `overflow-x` and
+`overflow-y`; `overflow` is a real shorthand shared by stylesheet declarations,
+inline CSSOM and computed shorthand serialization. `overlay` canonicalizes to
+`auto`. After substitution and CSS-wide resolution, `style_application.zig`
+computes the pair once from the current winning specified values, then publishes
+both protected fields. It never reuses the previous pass's coerced pair as
+specified input. The current CSS Overflow draft preserves `clip` beside a
+scrollable value; only `visible` becomes `auto`. Changing one axis can therefore
+change both computed fields.
+
+The style pair and layout's used pair are distinct. Automatic flex/grid minima
+use the computed value in the relevant axis, even without actual overflow;
+flex chooses its main axis and grid retains its existing track eligibility
+rules. Persistent intrinsic/formatting owners subscribe to both fields.
+Float/BFC policy asks whether either used axis is scrollable. `clip visible`
+does not establish a BFC but does remain an atomic paint subtree. Ordinary
+inline-block baseline policy and first/last flex/grid baseline exports retain
+their separate rules; a current scroll offset never changes the exported
+initial-position baseline.
+
+`Element.used_overflow` is optional scalar layout output. Layout publishes it
+with both client and content dimensions through `setScrollGeometry`; no CSSOM
+computed field is overwritten. The root/body viewport donor publishes a local
+visible pair. Paint consumes this used pair, falling back to computed style only
+when no layout policy has been published, as in direct effect tests. It never
+walks the DOM to select a viewport donor. New layout refreshes the policy before
+paint; no used-policy borrow crosses a generation or thread boundary.
+
+`Layout.publish_scroll_geometry` separates measurement from publication.
+Preliminary flex/grid allocations suppress Element policy/geometry publication
+and offset clamps, with that suppression inherited recursively by nested and
+atomic formatting. They still compute scalar overflow bounds. Final allocations
+restore publication, so a temporary natural height cannot erase a scroll offset
+before the actual scrollport is known. Temporary atomic-tree retirement does
+not clear the live Element's scalar scroll state.
+
+Element scroll metrics and offsets are authored-zoom-scaled layout pixels.
+Visible and clipped axes still retain their client and overflow dimensions.
+Programmatic maxima are zero on visible/clip axes; hidden/scroll/auto axes can
+scroll even when user interaction is disabled. `scroll_user_x/y` separately
+record scroll/auto eligibility and visibility. Publishing new geometry clamps
+each offset independently, resetting a newly forbidden axis without destroying
+the other offset or the reported overflow. User methods select one axis;
+programmatic `scrollTo` selects both. Browser adapters refresh sticky state and
+paint after movement. Layout publication must also reflect any offset clamp in
+the resulting paint/sticky state.
+The style publisher also refreshes user permission from the retained used pair
+after visibility changes, which may require only paint. Hiding/showing a box
+updates wheel eligibility without requiring reflow or resetting its offsets.
+
+`render/overflow_geometry.zig` owns pointer-free bounds operations; retained
+layout owns the synchronous traversal. Each block retains local scrollable
+overflow and inline-run bounds. Child borders contribute to the parent's
+extent, but descendant overflow propagates only through that child's visible
+axes. Include existing inline content, flex/grid margins, padding and supported
+position/translation offsets; exclude fixed viewport descendants and ink-only
+effects. Saturate scalar arithmetic and retain the existing nonnegative LTR
+scroll-origin model. Atomic-inline measurement captures separate propagated
+overflow bounds before its temporary root retires. CSSOM fragment rectangles
+stay unclipped and must not be reused as those propagation bounds.
+For ordinary children, document roots and atomic roots, union the bounds before
+and after the supported translation: transforms may enlarge scrollable overflow
+but cannot shrink it. Authored `transform` field changes subscribe through the
+persistent block geometry owner so those extents are refreshed. Compositor-only
+animation sampling remains a scalar presentation path and does not republish
+computed fields or trigger that authored-style dependency.
+
+`DocumentLayout` retains only the generation-bound root/body donor identity and
+numeric content/scrollport extents. Root overflow propagates to the viewport;
+when both root axes are visible, the first direct body may donate if it has a
+box. A hidden first body does not make a later body eligible. The selected
+donor's computed pair remains unchanged. Viewport visible/clip values become
+auto/hidden, respectively. Resolve this choice during clean style/layout before
+gutter reservation and document geometry, and publish copied scalar policy to
+Frame. Frame/Browser commits use the last successful policy even if hover or a
+later mutation has already dirtied live style. Existing flow dimensions remain
+separate from document overflow dimensions and viewport scrollport dimensions.
+
+Overflow clipping belongs to the translated content suffix. The element's own
+background and border remain stationary and outside its padding-box content
+clip; whole-element opacity, filters, positioning and transforms enclose both.
+The content-only blend carries a pointer-free axis clip shared by software
+raster and command hits. Active axes constrain finite child/raster bounds;
+inactive axes never create giant sentinel rectangles or element-sized limits
+on visible overflow. Single-axis clip/visible geometry is unrounded, while
+dual-axis clipping uses the supported padding-edge corner geometry. Layout
+hits preserve own border-box targets even when the point cannot descend past
+the content clip. Both hit paths remove position/transform, test the clip and
+then account for the content scroll translation in the same order.
+
+Retained command clones, temporary atomic snapshots, iframe composition,
+raster snapshots and compositor bounds preserve the clip scalars. None retain
+new DOM/layout pointers. `wrapOwned` consumes its independent command slice on
+success or failure; suffix wrappers preserve the caller's list on allocation
+failure. Masks and clips are not hit targets. Existing rounded-control hit
+metadata remains distinct from overflow clips.
+
+The supported subset is physical axes in horizontal LTR layout, including
+existing Element scrolling APIs and two-axis wheel input. Logical axes,
+negative/reversed scroll origins, clip-margin, containment, new Window scroll
+APIs, scrollIntoView and new scrollbar widgets remain outside this contract.
+Fixed root groups cancel both viewport offsets and child-frame groups use
+their own viewport; arbitrary positioned-descendant escape through ancestor
+clip/effect wrappers remains bounded by the existing containing-block model.
+Rebased child fixed transforms retain optional scalar `translation_origin`
+metadata; `scaledTranslation` cancels the iframe origin and child scroll before
+the consumer's pixel rounding, preventing jitter at fractional zoom. Clones and
+worker snapshots preserve this metadata, and Frame keeps child viewport hit
+coordinates separate from rounded page coordinates.
+Raster plane extraction declines transforms carrying this origin metadata;
+they remain on the assembled rendering path.
+Viewport x transport and raster acceptance follow the browser/thread contracts;
+an x change rerasterizes the viewport-width surface without introducing a 2D
+interest-region cache.
 
 ## Element geometry snapshots
 
@@ -1133,6 +1244,14 @@ geometry. Hidden/offscreen paint suppression must not erase layout boxes.
 Fragments distinguish ordinary inline boxes from atomic/block boxes and retain
 used border widths. Client padding sizes subtract these used edges after
 layout, and offset positions use the first fragment rather than the union.
+
+`Metrics.has_box` distinguishes a missing ordinary layout box from a zero-size
+box. After the normal generation-checked flush, ordinary elements without a box
+expose zero scroll metrics and ignore scroll setters; detached handles likewise
+resolve to no attached target. The document root retains its CSSOM viewport
+special case even when it has no principal box. Do not clear Element scroll
+state merely to enforce these query results: temporary formatting and snapshot
+owners can retire while the live DOM state must survive.
 
 Text inputs and textareas share a pointer-free `control_geometry.TextBox`
 containing used content dimensions, padding, and borders. Inline controls
