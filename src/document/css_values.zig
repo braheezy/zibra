@@ -13,6 +13,11 @@ pub const max_bytes = 1024 * 1024;
 /// retain their keyword; modern colors retain their color space, without changing
 /// custom-property data or case-sensitive identifiers.
 pub fn primitive(allocator: std.mem.Allocator, property: []const u8, input: []const u8) ![]const u8 {
+    const grid_placement = @import("css_grid_placement.zig");
+    if (grid_placement.isLineProperty(property)) return grid_placement.canonicalLine(allocator, input);
+    if (std.mem.eql(u8, property, "grid-auto-flow")) {
+        if (grid_placement.parseFlow(input)) |flow| return grid_placement.canonicalFlow(flow);
+    }
     if (std.mem.startsWith(u8, property, "animation-") and !std.mem.eql(u8, property, "animation-name")) {
         return std.ascii.allocLowerString(allocator, input);
     }

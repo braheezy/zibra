@@ -13,6 +13,8 @@ pub const Track = struct {
     fraction: f64 = 0,
     min_kind: Kind = .auto,
     max_kind: Kind = .auto,
+    auto_fit: bool = false,
+    collapsed: bool = false,
 };
 
 pub const Components = struct {
@@ -96,10 +98,13 @@ fn unresolvedPercentage(raw: []const u8, context: length.ResolutionContext) bool
 
 /// Fills caller storage; null means unsupported/invalid grammar. Auto-repeat
 /// supports a single definite-minimum track, the common responsive-card form.
-pub fn parse(raw: []const u8, context: length.ResolutionContext, gap: f64, item_count: usize, output: []Track) ?usize {
+/// Auto-fit keeps explicit line identities; placement later collapses empty
+/// tracks. The legacy item-count argument no longer determines topology.
+pub fn parse(raw: []const u8, context: length.ResolutionContext, gap: f64, _: usize, output: []Track) ?usize {
     if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw, " \t\r\n"), "none")) return 0;
     var iterator = Components{ .input = raw };
     var count: usize = 0;
+    var auto_repeat: ?usize = null;
     while (iterator.next()) |component| {
         if (std.ascii.startsWithIgnoreCase(component, "repeat(") and component[component.len - 1] == ')') {
             const inner = component[7 .. component.len - 1];
@@ -116,23 +121,41 @@ pub fn parse(raw: []const u8, context: length.ResolutionContext, gap: f64, item_
             }
             if (pattern_count == 0) return null;
             const repetitions = if (std.ascii.eqlIgnoreCase(repeat, "auto-fill") or std.ascii.eqlIgnoreCase(repeat, "auto-fit")) blk: {
-                if (pattern_count != 1 or pattern[0].min_kind != .fixed) return null;
-                const breadth = @max(pattern[0].max orelse pattern[0].min, 1);
-                const available = context.percentage_base orelse breadth;
-                var n: usize = @intFromFloat(std.math.clamp(@floor((available + gap) / (breadth + gap)), 1, max_tracks));
-                if (std.ascii.eqlIgnoreCase(repeat, "auto-fit")) n = @min(n, @max(item_count, 1));
-                break :blk n;
+                if (auto_repeat != null or pattern_count != 1 or pattern[0].min_kind != .fixed) return null;
+                // Leave one placeholder until both leading and trailing fixed
+                // siblings have been parsed. They consume the same extent.
+                auto_repeat = count;
+                pattern[0].auto_fit = std.ascii.eqlIgnoreCase(repeat, "auto-fit");
+                break :blk 1;
             } else std.fmt.parseInt(usize, repeat, 10) catch return null;
-            if (repetitions == 0 or repetitions > (output.len - count) / pattern_count) return null;
+            if (repetitions == 0 or repetitions > (@min(output.len, max_tracks) - count) / pattern_count) return null;
             for (0..repetitions) |_| {
                 @memcpy(output[count .. count + pattern_count], pattern[0..pattern_count]);
                 count += pattern_count;
             }
         } else {
-            if (count == output.len) return null;
+            if (count == @min(output.len, max_tracks)) return null;
             output[count] = parseTrack(component, context) orelse return null;
             count += 1;
         }
+    }
+    if (auto_repeat) |index| {
+        var siblings: f64 = 0;
+        for (output[0..count], 0..) |track, i| {
+            const breadth = if (track.max_kind == .fixed) track.max orelse track.min else if (track.min_kind == .fixed) track.min else return null;
+            if (i != index) siblings += @max(breadth, 0);
+        }
+        const repeated = output[index];
+        const breadth = @max(if (repeated.max_kind == .fixed) repeated.max orelse repeated.min else repeated.min, 1);
+        const capacity = @min(output.len, max_tracks) - (count - 1);
+        const repetitions: usize = if (context.percentage_base) |available|
+            @intFromFloat(std.math.clamp(@floor((available + gap - siblings - gap * @as(f64, @floatFromInt(count - 1))) / (breadth + gap)), 1, @as(f64, @floatFromInt(capacity))))
+        else
+            1;
+        const expanded = count + repetitions - 1;
+        std.mem.copyBackwards(Track, output[index + repetitions .. expanded], output[index + 1 .. count]);
+        @memset(output[index..][0..repetitions], repeated);
+        count = expanded;
     }
     return if (count > 0) count else null;
 }
@@ -150,4 +173,16 @@ test "grid tracks preserve intrinsic functions zero fractions and fit content ca
     try std.testing.expectEqual(Kind.auto, parseTrack("50%", .{}).?.min_kind);
     try std.testing.expectEqual(@as(f64, 0), parseTrack("50%", .{ .percentage_base = 0 }).?.min);
     try std.testing.expect(parseTrack("minmax(1fr, 20px)", .{}) == null);
+}
+
+test "grid auto-repeat reserves fixed siblings and every live gutter" {
+    var output: [max_tracks]Track = undefined;
+    try std.testing.expectEqual(@as(?usize, 3), parse("100px repeat(auto-fill, 100px)", .{ .percentage_base = 300 }, 0, 0, &output));
+    try std.testing.expectEqual(@as(?usize, 3), parse("repeat(auto-fill, 100px) 100px", .{ .percentage_base = 300 }, 0, 0, &output));
+    try std.testing.expectEqual(@as(?usize, 4), parse("40px repeat(auto-fit, minmax(50px, 1fr)) 60px", .{ .percentage_base = 230 }, 10, 1, &output));
+    try std.testing.expect(!output[0].auto_fit and output[1].auto_fit and output[2].auto_fit and !output[3].auto_fit);
+    try std.testing.expectEqual(@as(f64, 60), output[3].min);
+    try std.testing.expectEqual(@as(?usize, 3), parse("40px repeat(auto-fit, 50px) 60px", .{}, 10, 0, &output));
+    try std.testing.expect(parse("repeat(auto-fill, 20px) repeat(auto-fit, 20px)", .{ .percentage_base = 100 }, 0, 0, &output) == null);
+    try std.testing.expect(parse("1fr repeat(auto-fit, 20px)", .{ .percentage_base = 100 }, 0, 0, &output) == null);
 }

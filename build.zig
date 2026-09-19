@@ -214,6 +214,12 @@ const wpt_fixtures = [_]WptFixture{
         .output_basename = "wpt-css-overflow-axes.jsonl",
     },
     .{
+        .fixture = "tests/manual/css-grid-placement.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-grid-placement.jsonl",
+    },
+    .{
         .fixture = "tests/manual/css-nested-sizing.html",
         .status = "PASS",
         .timeout_ms = 10_000,

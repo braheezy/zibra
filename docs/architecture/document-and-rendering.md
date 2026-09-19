@@ -757,11 +757,12 @@ Important geometry contracts:
   direction/order, gaps, automatic minima, both axes' auto margins, and
   positional/distribution alignment. Grid sizing supports fixed, intrinsic,
   fractional, `minmax`, `fit-content()`, integer `repeat`, and
-  bounded definite-minimum `auto-fill`/`auto-fit` tracks, row-major placement,
-  gaps, and item/track alignment. Measurement passes do not publish hit-test
+  bounded definite-minimum `auto-fill`/`auto-fit` tracks, numeric line placement,
+  spans, row/column sparse or dense auto-placement, gaps, and item/track
+  alignment. Measurement passes do not publish hit-test
   bounds; only final allocated boxes do. Child topology changes rebuild these
-  contexts conservatively. Inline flex/grid, explicit grid placement/spans,
-  subgrid, general writing modes/RTL, and complete nested flex/grid intrinsic
+  contexts conservatively. Named grid lines/areas, subgrid, general writing
+  modes/RTL, and complete cyclic flex/grid intrinsic
   algorithms remain outside this bounded implementation. The shared sizing
   contract below defines the supported row baseline groups and percentage bases.
 - A `display: list-item` reserves the browser's bounded marker indent and
@@ -887,6 +888,10 @@ Pure layout leaves are intentionally separated from retained object state:
   `document/css_display.zig` separates inner formatting from outer block or
   atomic-inline participation; `document/css_flex.zig` and
   `document/grid_tracks.zig` own their borrowed CSS grammar;
+- `render/grid_placement.zig` owns temporary scalar grid areas and implicit
+  track extents, shared by intrinsic measurement and final layout.
+  `document/css_grid_placement.zig` admits numeric lines/spans and auto-flow;
+  neither module owns DOM/layout identities or style subscriptions;
 - `render/sizing.zig` owns scalar content/border-box conversion, intrinsic
   fit-content clamping, constraints and automatic-minimum suggestions;
   `render/box_alignment.zig` owns positional/distribution offsets, automatic
@@ -929,10 +934,7 @@ layout objects.
 
 ### Shared sizing and alignment
 
-The [initial design](../plans/shared-sizing-alignment.md) and reviewed
-[nested formatting follow-up](../plans/shared-sizing-alignment-followup.md)
-record the bounded capability and its verification. This section is the
-authoritative lifetime and used-value contract.
+This section is the authoritative lifetime and used-value contract.
 
 Intrinsic measurements borrow the styled DOM and FontManager synchronously.
 `intrinsic_width.measureContent` returns root natural content widths, excluding
@@ -969,12 +971,40 @@ ratio transfer, keep the normal basis limits. This provenance does not make a
 final allocated height definite.
 Column inline measurement uses cross contributions; intrinsic widths of
 height-constrained wrapping columns remain limited. Grid min-content and
-max-content constraints use separate track passes with single-span row-major
-contributions, including explicit empty tracks and the implicit column policy.
+max-content constraints use separate track passes over the same numeric
+placement used for final layout, including empty explicit tracks and implicit
+tracks before and after the explicit grid.
 `grid-auto-columns` and `grid-auto-rows` admit one track sizing function each;
 cycling a list of implicit track sizes remains outside this bounded topology.
 Intrinsic percentages have no invented containing basis; percentage gaps
 contribute zero until final allocation.
+For column-flow placement, a grid's own resolvable authored height supplies
+the row-template and row-gap basis, including auto-repeat counts. This does
+not use an outside containing height or make an auto-height grid definite.
+
+`grid_placement.place` receives scalar line/span pairs in stable, order-modified
+document order. Its owned result contains one area per input item, track counts,
+and offsets locating explicit line one. Negative lines resolve from the explicit
+grid before implicit tracks are added. Fully definite areas may overlap; the
+remaining items follow the row/column sparse or dense cursor algorithm. Anonymous
+text items always use automatic placement. The plan borrows no DOM, layout or
+protected fields and is freed before the caller returns. Partial allocations
+are reclaimed on error; allocation failure never substitutes another layout.
+Used line coordinates clamp to [-10000, 10000], leaving at least one track for
+an item wholly beyond an edge. Occupancy uses item rectangles, not a two-dimensional
+allocation proportional to the grid's area. Parsed explicit track lists retain
+their separate 256-track bound. CSS integer admission and serialization do not
+truncate authored values to these used-layout limits.
+
+Auto-fit keeps explicit line identities through placement, then collapses only
+unoccupied repeat tracks and their gutters. A spanning item occupies every
+track it crosses. Intrinsic and final sizing share minimum/min-content/max-content
+span contributions, automatic-minimum eligibility, and the all-fixed maximum
+area cap. Spans include internal live gutters. A multi-track span crossing a
+flexible track has a zero automatic content minimum; explicit item minima remain
+independent. Same-length spans publish planned growth together so DOM order
+cannot change track sizes. Final allocation includes distributed track spacing
+in the area used for item percentages and child measurement.
 
 A row flex container with a resolvable authored height supplies its own content
 height as the intrinsic cross-axis percentage basis for direct items. Resolve
@@ -996,9 +1026,13 @@ register dependencies. Structural mutation retires all these borrows through
 the existing layout boundary.
 
 Intrinsic subscriptions include flex/grid tracks, gaps, basis, factors, order,
-alignment and active generated descendants. Floated flex/grid containers select
-auto width through the same intrinsic fit-content and constraint policy; the
-legacy float fallback cannot clamp them below their intrinsic minimum.
+alignment and active generated descendants. Ordinary non-replaced floats and
+floated flex/grid containers select auto width through the same intrinsic
+fit-content and constraint policy. Adjacent inline text runs contribute together,
+and available space cannot clamp the result below its intrinsic minimum; authored
+min/max constraints still apply. Native/replaced and table boxes retain their
+separate sizing paths. See the
+[float shrink-to-fit rule](https://www.w3.org/TR/CSS22/visudet.html#float-width).
 
 Every direct flex/grid item establishes an independent float context. Its
 existing float buffer belongs to the retained item and resets for each
@@ -1029,8 +1063,15 @@ basis. Authored heights and resolvable percentages are definite; content-derived
 nonstretched flex heights remain indefinite. Flex post-flex main sizes become
 definite when the container main size or item basis is definite. Final stretched
 cross sizes become definite for descendant relayout even in auto-height lines.
-Final grid-area dimensions are definite for item layout; unresolved row
-measurement uses no substitute container-height basis. The nonstretched item's
+Final grid-area dimensions are definite for item layout. Before column sizing,
+an area spanning only exact fixed-size rows already supplies a height basis,
+including its internal gaps; both intrinsic measurement and final layout use it
+for percentage-height ratio transfer. Intrinsic measurement revisits children
+through scalar source indices, retaining no DOM pointers in its item vector.
+Rows whose intrinsic or flexible sizing remains unresolved supply no substitute
+container-height basis. A fixed maximum with a different minimum does not yet
+participate in this early transfer; it needs a later column adjustment pass.
+The nonstretched item's
 own auto height can still be indefinite. Table allocation retains its existing
 separate row/cell policy.
 

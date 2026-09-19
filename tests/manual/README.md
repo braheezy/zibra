@@ -22,6 +22,7 @@ tiers and baseline policy.
 | [`css-block-aspect-ratio.html`](css-block-aspect-ratio.html) | Responsive ordinary blocks, content/border boxes, content minimums, scrolling and live ratio edits |
 | [`css-shared-sizing.html`](css-shared-sizing.html) | Intrinsic panel sizing, padding-aware flex shrink, safe overflow, automatic margins, percentage height definiteness, grid area sizing and synthesized baselines |
 | [`css-nested-sizing.html`](css-nested-sizing.html) | Nested flex/grid intrinsic widths, atomic inline wrapping and nowrap, first/last container baselines, live gap/basis/track/display changes, and inline link/control bounds |
+| [`css-grid-placement.html`](css-grid-placement.html) | Numeric dashboard placement, spanning header/sidebar/cards, row/column dense packing, implicit tracks, retained inline-grid sizing and live link bounds |
 | [`css-overflow-axes.html`](css-overflow-axes.html) | Independent clipping and hit targets, horizontal and vertical element scrolling, flex panel minima, nested and atomic overflow metrics, retained axis/size changes, and inline link/control interaction |
 | [`css-cascade-layers.html`](css-cascade-layers.html) | Named/nested layer precedence, important reversal, paused keyframes and live media/order edits |
 | [`css-linear-gradients.html`](css-linear-gradients.html) | Linear/repeating backgrounds, color-space interpolation, hard stops/hints, alpha, tiles, inherited currentcolor/font changes and CSSOM mutation |

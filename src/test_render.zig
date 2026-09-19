@@ -11,6 +11,7 @@ comptime {
     _ = @import("tests/intrinsic_sizing.zig");
     _ = @import("tests/sizing_allocation.zig");
     _ = @import("tests/shared_sizing_alignment.zig");
+    _ = @import("tests/grid_placement.zig");
     _ = @import("tests/atomic_formatting.zig");
     _ = @import("tests/overflow_axes.zig");
     _ = @import("tests/formatting_baselines.zig");

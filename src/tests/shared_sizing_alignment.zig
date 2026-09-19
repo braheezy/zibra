@@ -280,3 +280,66 @@ test "shared sizing first and last flex baselines use the corresponding in flow 
     const last_only = try page.box("only");
     try std.testing.expectEqual(last.y + last.height, last_only.y + last_only.height);
 }
+
+test "shared sizing ordinary float measures the complete styled inline run and retains its owner" {
+    var page = try Page.init("<main style='display:block;width:700px;font-size:16px;line-height:32px'><section style='display:block;overflow:hidden'><div id='float' style='display:block;float:left'>alpha beta <span id='float-text' style='font-size:20px;font-weight:bold'>gamma delta</span> epsilon zeta</div></section><div id='reference' style='display:block;width:max-content'>alpha beta <span id='reference-text' style='font-size:20px;font-weight:bold'>gamma delta</span> epsilon zeta</div></main>");
+    defer page.deinit();
+    try page.render();
+    const initial = try page.box("float");
+    const reference = try page.box("reference");
+    try std.testing.expectEqual(reference.width, initial.width);
+    try std.testing.expectEqual(reference.height, initial.height);
+    const owner = page.node("float").element.layout_ptr;
+    try std.testing.expect(owner != null);
+
+    for ([_][]const u8{ "float-text", "reference-text" }) |id| {
+        const element = &page.node(id).element;
+        try element.putOwnedAttribute(allocator, "style", "font-size:30px;font-weight:bold");
+        parser.dirtyStyleForElement(element);
+    }
+    // Inherited text styles must be republished before intrinsic measurement.
+    try parser.style(allocator, &page.root, &.{});
+    try page.reflow();
+    const changed = try page.box("float");
+    const changed_reference = try page.box("reference");
+    try std.testing.expect(changed.width > initial.width);
+    try std.testing.expectEqual(changed_reference.width, changed.width);
+    try std.testing.expectEqual(changed_reference.height, changed.height);
+    try std.testing.expectEqual(owner, page.node("float").element.layout_ptr);
+}
+
+test "shared sizing ordinary float counts atomic child zoom and box edges once" {
+    var page = try Page.init("<main id='main' style='display:block;overflow:hidden;width:200px;zoom:2;font-size:0;line-height:0'><div id='float' style='display:block;float:left;padding:4px;border:2px solid black;margin:3px'><span id='child' style='display:inline-block;width:60px;height:20px;zoom:1.5'></span></div></main>");
+    defer page.deinit();
+    try page.render();
+    try page.size("child", 180, 60);
+    try page.size("float", 204, 84);
+    try page.offset("float", "main", 6, 6);
+    const owner = page.node("float").element.layout_ptr;
+    try std.testing.expect(owner != null);
+
+    page.set("child", "width", "80px");
+    try page.reflow();
+    try page.size("child", 240, 60);
+    try page.size("float", 264, 84);
+    try page.offset("float", "main", 6, 6);
+    try std.testing.expectEqual(owner, page.node("float").element.layout_ptr);
+}
+
+test "shared sizing ordinary float preserves unbreakable minimum until maximum caps its box" {
+    var page = try Page.init("<main id='main' style='display:block;overflow:hidden;width:40px;font-size:0;line-height:0'><div id='float' style='display:block;float:left;padding:5px;border:1px solid black;margin:3px'><span id='child' style='display:inline-block;width:100px;height:20px'></span></div></main>");
+    defer page.deinit();
+    try page.render();
+    try page.size("float", 112, 32);
+    try page.size("child", 100, 20);
+    try page.offset("float", "main", 3, 3);
+    const owner = page.node("float").element.layout_ptr;
+    try std.testing.expect(owner != null);
+
+    page.set("float", "max-width", "50px");
+    try page.reflow();
+    try page.size("float", 62, 32);
+    try page.size("child", 100, 20);
+    try page.offset("float", "main", 3, 3);
+    try std.testing.expectEqual(owner, page.node("float").element.layout_ptr);
+}

@@ -1,0 +1,98 @@
+<!doctype html>
+<!-- How to verify: status must say PASS. The dashboard header spans all three
+     columns and the sidebar spans both card rows. Toggle card spans and dense
+     packing repeatedly: small tiles fill the first hole only in dense mode.
+     The inline badge grows as one box. Click the card link after each toggle;
+     the count must update. Resizing the window must not change these boxes. -->
+<html><head><meta charset="utf-8"><title>Grid placement dashboard</title>
+<style>
+body { margin:24px; font:16px/20px sans-serif; color:#17202a; background:white }
+h1 { font-size:24px }
+p { margin:12px 0 }
+button { margin-right:8px }
+#dashboard { display:grid; width:420px; grid-template-columns:100px 150px 150px; grid-template-rows:40px 80px 80px; gap:10px; margin-top:16px; background:#e2e8f0 }
+#header { grid-column:1 / -1; grid-row:1; background:#334155; color:white }
+#sidebar { grid-column:1; grid-row:2 / 4; background:#cbd5e1 }
+#card-a { grid-column:2; grid-row:2; background:#86efac }
+#card-b { grid-column:3; grid-row:2; background:#bae6fd }
+#card-c { grid-column:2 / -1; grid-row:3; background:#fde68a }
+.pack { display:grid; width:200px; grid-template-columns:repeat(3,60px); grid-template-rows:repeat(3,40px); gap:10px; background:#f1f5f9 }
+#row-pack { grid-auto-flow:row }
+#column-pack { grid-auto-flow:column }
+.anchor { background:#334155; color:white }
+.wide { background:#86efac }
+.small { background:#fb923c }
+#row-anchor { grid-column:2; grid-row:1 }
+#row-wide { grid-column:span 2 }
+#column-anchor { grid-column:1; grid-row:2 }
+#column-wide { grid-row:span 2 }
+#badge-line { font-size:0; line-height:0; width:200px }
+.prefix,.suffix { display:inline-block; width:20px; height:20px; background:#334155 }
+#badge { display:inline-grid; grid-template-columns:30px 40px; grid-auto-columns:20px; grid-auto-rows:20px; column-gap:5px }
+#badge-span { grid-column:1 / 3; background:#86efac }
+#implicit { display:grid; width:120px; grid-template-columns:40px 40px; grid-auto-columns:20px; grid-auto-rows:20px; background:#f1f5f9 }
+#before { grid-column:-4 / -3; grid-row:1; background:#fb923c }
+#explicit { grid-column:1; grid-row:1; background:#86efac }
+#after { grid-column:4; grid-row:1; background:#bae6fd }
+</style></head><body>
+<h1 id="status">Checking grid placement</h1><p id="details"></p>
+<button id="spans">Toggle card spans</button><button id="density">Toggle dense packing</button>
+<div id="dashboard"><div id="header">Dashboard header</div><div id="sidebar">Navigation<br>Reports<br>Settings</div><div id="card-a">Primary card<br><a id="card-link" href="#dashboard">Open report</a></div><div id="card-b">Second card</div><div id="card-c">Summary card</div></div>
+<p id="interaction">Report links: 0</p>
+<p>Row packing: the orange tile fills the top-left hole in dense mode.</p>
+<div id="row-pack" class="pack"><div id="row-anchor" class="anchor">Fixed</div><div id="row-wide" class="wide">Two columns</div><div id="row-small" class="small">Small</div></div>
+<p>Column packing: the same rule applies down each column.</p>
+<div id="column-pack" class="pack"><div id="column-anchor" class="anchor">Fixed</div><div id="column-wide" class="wide">Two rows</div><div id="column-small" class="small">Small</div></div>
+<p>Inline badge: its span creates an implicit column after toggling card spans.</p>
+<div id="badge-line"><span class="prefix"></span><span id="badge"><span id="badge-span"></span></span><span id="suffix" class="suffix"></span></div>
+<p>Implicit tracks before and after the explicit grid.</p>
+<div id="implicit"><div id="before"></div><div id="explicit"></div><div id="after"></div></div>
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+  var wide=false,dense=false,links=0;
+  function el(id){return document.getElementById(id);}
+  function rect(id){return el(id).getBoundingClientRect();}
+  function equal(actual,expected){if(actual!==expected)throw Error(String(actual)+' != '+String(expected));}
+  function size(id,w,h){var box=rect(id);equal(box.width,w);equal(box.height,h);}
+  function offset(id,parent,x,y){var box=rect(id),outer=rect(parent);equal(box.x-outer.x,x);equal(box.y-outer.y,y);}
+  var dashboardChildren=[el('header'),el('sidebar'),el('card-a'),el('card-b'),el('card-c')];
+  function configure(newWide,newDense){
+    wide=newWide;dense=newDense;
+    el('card-a').style.gridColumn=wide?'2 / -1':'2';
+    el('card-b').style.gridColumn=wide?'2':'3';
+    el('card-b').style.gridRow=wide?'3':'2';
+    el('card-c').style.gridColumn=wide?'3':'2 / -1';
+    el('row-pack').style.gridAutoFlow=dense?'row dense':'row';
+    el('column-pack').style.gridAutoFlow=dense?'column dense':'column';
+    el('badge-span').style.gridColumn=wide?'1 / 4':'1 / 3';
+  }
+  function inspect(){
+    var results=[];
+    function check(name,fn){try{fn();results.push({name:name,status:0});}catch(error){results.push({name:name,status:1,message:String(error)});}}
+    check('header spans all explicit columns',function(){size('dashboard',420,220);size('header',420,40);offset('header','dashboard',0,0);});
+    check('sidebar spans both card rows and their gap',function(){size('sidebar',100,170);offset('sidebar','dashboard',0,50);});
+    check('primary card changes column span',function(){size('card-a',wide?310:150,80);offset('card-a','dashboard',110,50);});
+    check('second card moves to its explicit row and column',function(){size('card-b',150,80);offset('card-b','dashboard',wide?110:270,wide?140:50);});
+    check('summary card changes its span without changing DOM order',function(){size('card-c',wide?150:310,80);offset('card-c','dashboard',wide?270:110,140);var current=document.querySelectorAll('#dashboard > div');equal(current.length,dashboardChildren.length);for(var i=0;i<current.length;i++)equal(current[i],dashboardChildren[i]);});
+    check('row dense flow fills an earlier hole',function(){size('row-wide',130,40);offset('row-wide','row-pack',0,50);offset('row-small','row-pack',dense?0:140,dense?0:50);});
+    check('column dense flow fills an earlier hole',function(){size('column-wide',60,90);offset('column-wide','column-pack',70,0);offset('column-small','column-pack',dense?0:70,dense?0:100);});
+    check('inline grid expands with an implicit spanned column',function(){size('badge',wide?100:75,20);offset('badge','badge-line',20,0);offset('suffix','badge',wide?100:75,0);});
+    check('prepended implicit columns preserve explicit line identity',function(){size('before',20,20);offset('before','implicit',0,0);size('explicit',40,20);offset('explicit','implicit',20,0);size('after',20,20);offset('after','implicit',120,0);});
+    return results;
+  }
+  function present(results){
+    var failures=results.filter(function(result){return result.status!==0;});
+    el('status').textContent=failures.length?'FAIL: '+failures[0].name:'PASS: grid placement dashboard';
+    el('status').style.color=failures.length?'red':'green';
+    el('details').textContent=failures.map(function(result){return result.message;}).join('; ');
+  }
+  var results=inspect();
+  configure(true,true);results=results.concat(inspect());
+  configure(false,false);results=results.concat(inspect());
+  present(results);
+  el('spans').addEventListener('click',function(){configure(!wide,dense);present(inspect());});
+  el('density').addEventListener('click',function(){configure(wide,!dense);present(inspect());});
+  el('card-link').addEventListener('click',function(event){event.preventDefault();links++;el('interaction').textContent='Report links: '+links;});
+  if(typeof completion_callback==='function')completion_callback(results,{status:0});
+});
+</script></body></html>

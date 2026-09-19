@@ -80,6 +80,71 @@ test "alignment declarations canonicalize first baseline after shorthand expansi
     try std.testing.expectEqualStrings("var(--alignment)", pending);
 }
 
+test "numeric grid declarations share priority validation and shortest slash serialization" {
+    const allocator = std.testing.allocator;
+    const block = try create(allocator, "grid-row-start:-3!important;grid-area:1 / +02 / 3 span;grid-column:4 / -1;grid-auto-flow:dense row");
+    defer block.destroy();
+    try std.testing.expectEqualStrings("-3", block.get("grid-row-start").?.value);
+    try std.testing.expectEqualStrings("span 3", block.get("grid-row-end").?.value);
+    try std.testing.expectEqualStrings("4", block.get("grid-column-start").?.value);
+    try std.testing.expectEqualStrings("-1", block.get("grid-column-end").?.value);
+    try std.testing.expectEqualStrings("dense", block.get("grid-auto-flow").?.value);
+    const mixed_priority = try block.propertyValue(allocator, "grid-area");
+    defer allocator.free(mixed_priority);
+    try std.testing.expectEqualStrings("", mixed_priority);
+    for ([_][]const u8{ "0", "span -2", "1.0", "1e2", "header", "span header", "1 / 2 / 3" }) |invalid|
+        try std.testing.expect(!try block.setProperty("grid-row", invalid, ""));
+    try std.testing.expectEqualStrings("-3", block.get("grid-row-start").?.value);
+
+    try std.testing.expect(try block.setProperty("grid-area", "1 / auto / 2 / auto", "important"));
+    const area = try block.propertyValue(allocator, "grid-area");
+    defer allocator.free(area);
+    try std.testing.expectEqualStrings("1 / auto / 2", area);
+    try std.testing.expect(block.propertyImportant("grid-area"));
+    try std.testing.expect(try block.setProperty("grid-row", "2 SpAn", ""));
+    const row = try block.propertyValue(allocator, "grid-row");
+    defer allocator.free(row);
+    try std.testing.expectEqualStrings("span 2", row);
+    try std.testing.expectEqualStrings("auto", block.get("grid-row-end").?.value);
+    try std.testing.expect(try block.setProperty("grid-column", "2/2", ""));
+    const column = try block.propertyValue(allocator, "grid-column");
+    defer allocator.free(column);
+    try std.testing.expectEqualStrings("2 / 2", column);
+    try std.testing.expect(try block.setProperty("grid-column-start", "999999999999999999999999999", ""));
+    try std.testing.expectEqualStrings("999999999999999999999999999", block.get("grid-column-start").?.value);
+    try std.testing.expect(try block.setProperty("grid-auto-flow", "dense column", ""));
+    try std.testing.expectEqualStrings("column dense", block.get("grid-auto-flow").?.value);
+}
+
+test "numeric grid CSSOM pending shorthands clone independently and remove all axes" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const block = try create(allocator, "grid-area:var(--area)!important;grid-column-end:-1!important");
+            defer block.destroy();
+            const copy = try block.clone(allocator);
+            defer copy.destroy();
+            const partial = try copy.propertyValue(allocator, "grid-area");
+            defer allocator.free(partial);
+            try std.testing.expectEqualStrings("", partial);
+            try std.testing.expectEqualStrings("grid-area", copy.get("grid-row-start").?.pending_shorthand.?);
+            try std.testing.expect(try copy.setProperty("grid-area", "inherit", ""));
+            const inherited = try copy.propertyValue(allocator, "grid-area");
+            defer allocator.free(inherited);
+            try std.testing.expectEqualStrings("inherit", inherited);
+            try std.testing.expectEqualStrings("-1", block.get("grid-column-end").?.value);
+            try std.testing.expect(try copy.setProperty("grid-area", "-2 / 2 / span 3", ""));
+            const serialized = try copy.serialize(allocator);
+            defer allocator.free(serialized);
+            const reparsed = try create(allocator, serialized);
+            defer reparsed.destroy();
+            for ([_][]const u8{ "grid-row-start", "grid-column-start", "grid-row-end", "grid-column-end" }) |name|
+                try std.testing.expectEqualStrings(copy.get(name).?.value, reparsed.get(name).?.value);
+            try std.testing.expect(copy.removeProperty("grid-area"));
+            try std.testing.expectEqual(@as(usize, 0), copy.count());
+        }
+    }.run, .{});
+}
+
 test "normalized declaration owners clone and retire independently including allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(allocator: std.mem.Allocator) !void {
@@ -390,6 +455,11 @@ fn shorthandValue(self: *const Block, allocator: std.mem.Allocator, shorthand: p
     }
     const name = shorthand.name;
     const parts = values[0..shorthand.longhands.len];
+    if (std.mem.eql(u8, name, "grid-row") or std.mem.eql(u8, name, "grid-column") or std.mem.eql(u8, name, "grid-area")) {
+        var part_count = parts.len;
+        while (part_count > 1 and std.mem.eql(u8, parts[part_count - 1], "auto")) part_count -= 1;
+        return std.mem.join(allocator, " / ", parts[0..part_count]);
+    }
     if (std.mem.eql(u8, name, "animation")) {
         // A single-name engine may retain unused extra longhand list items.
         // Such lists cannot be losslessly represented by its shorthand.

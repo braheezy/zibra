@@ -15,6 +15,33 @@ fn value(node: *document.Node, property: []const u8) []const u8 {
     return node.element.style.?.getPtr(property).?.get().*;
 }
 
+test "numeric grid placement computes substituted shorthands and retained resets" {
+    const allocator = std.testing.allocator;
+    var root = try parsed("<div style='--area:-2 / +03 / 2 span;grid-area:var(--area);grid-auto-flow:dense column'><span style='grid-area:inherit;grid-auto-flow:inherit'></span></div>");
+    defer root.deinit(allocator);
+    document.fixParentPointers(&root, null);
+    try document.style(allocator, &root, &.{});
+    const child = &root.element.children.items[0];
+    try std.testing.expectEqualStrings("-2", value(&root, "grid-row-start"));
+    try std.testing.expectEqualStrings("3", value(child, "grid-column-start"));
+    try std.testing.expectEqualStrings("span 2", value(child, "grid-row-end"));
+    try std.testing.expectEqualStrings("auto", value(child, "grid-column-end"));
+    try std.testing.expectEqualStrings("column dense", value(child, "grid-auto-flow"));
+    try root.element.putOwnedAttribute(allocator, "style", "--area:1 / span 3;grid-area:var(--area);grid-auto-flow:row dense");
+    dom.dirtyStyleForElement(&root.element);
+    try document.style(allocator, &root, &.{});
+    try std.testing.expectEqualStrings("1", value(child, "grid-row-start"));
+    try std.testing.expectEqualStrings("span 3", value(child, "grid-column-start"));
+    try std.testing.expectEqualStrings("auto", value(child, "grid-row-end"));
+    try std.testing.expectEqualStrings("dense", value(child, "grid-auto-flow"));
+    try root.element.putOwnedAttribute(allocator, "style", "grid-area:unset;grid-auto-flow:unset");
+    dom.dirtyStyleForElement(&root.element);
+    try document.style(allocator, &root, &.{});
+    for ([_][]const u8{ "grid-row-start", "grid-column-start", "grid-row-end", "grid-column-end" }) |name|
+        try std.testing.expectEqualStrings("auto", value(child, name));
+    try std.testing.expectEqualStrings("row", value(child, "grid-auto-flow"));
+}
+
 test "overflow computed pairs follow current single-axis semantics across retained mutations" {
     const allocator = std.testing.allocator;
     var root = try parsed("<div style='overflow:visible scroll'><span style='overflow:inherit'></span></div>");

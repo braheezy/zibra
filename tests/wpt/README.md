@@ -1025,13 +1025,19 @@ mode or Ahem support.
 The implicit-column valid tests retain unsupported `ex`/`vmin` lengths and
 multiple-track lists. Their computed tests also expect simplification of
 `calc()` expressions, including expressions inside track functions. The Gmail
-table case in `row-compat-001.html` requires `table-layout: fixed`. Two further
-reftest failures remain unisolated: `flexbox_nested-flex.html` compares against
-a generated `::after` block, and `grid-inline-margins-no-collapse-001.html`
-compares a body inline grid against a floated paragraph. Their persistent
-failures do not justify classifying them as either corrected geometry or
-missing prerequisites. Keep these tests and all upstream expectations
-intact.
+table case in `row-compat-001.html` requires `table-layout: fixed`.
+`flexbox_nested-flex.html` requires nonempty generated text in its reference:
+`::after { content: "xxx" }` remains inactive under the engine's empty-content
+pseudo-box support. The test's nested flex box is 200 by 32 pixels inside a
+66-pixel-high parent, while the reference paints only a 2-pixel-high empty
+bordered box. This is a reference prerequisite; keep its PASS expectation.
+
+The closing audit isolated `grid-inline-margins-no-collapse-001.html` to the
+floated paragraph in its reference. The legacy float estimator used only the
+longest text fragment (374 pixels), splitting a line whose shared intrinsic
+measurement is 581 pixels across normal and bold runs. Both pages already had
+matching margin origins. Ordinary auto-width floats now consume the shared
+intrinsic sizing path; the unchanged reftest verifies the resulting page pixels.
 
 Additional grid intrinsic candidates require
 `document.fonts.ready`, used track-size CSSOM, or grid spans, so they are not
@@ -1046,6 +1052,49 @@ reset dimensions through the local WPT gate, and exposes inline link/control
 interaction checks. See the
 [reviewed design](../../docs/plans/shared-sizing-alignment-followup.md) for
 ownership, supported topology and validation boundaries.
+
+## Numeric grid placement and spanning
+
+[`manifest-css-grid-placement.yaml`](manifest-css-grid-placement.yaml) selects
+26 unchanged upstream files: 14 testharness, nine reftests and three crashtests.
+The motivating page failure was a dashboard whose header, sidebar and cards
+ignored their authored grid lines and spans. The
+[interactive dashboard](../manual/css-grid-placement.html) now checks initial,
+changed and reset geometry through the local WPT gate; its buttons and report
+link additionally exercise native interaction.
+
+```sh
+python3 tests/wpt/run.py tests/wpt/manifest-css-grid-placement.yaml --mode all --jobs 1 --browser ./zig-out/bin/zibra --report /tmp/zibra-grid-placement.json
+```
+
+This chunk supports numeric positive/negative lines, row/column/area placement
+shorthands, spans, implicit tracks on either side of the explicit grid, and
+row/column sparse/dense flow. Intrinsic and final layout share placement and
+span sizing; auto-fit collapse follows occupied areas. Geometry tests cover
+live placement/order changes, percentages, zoom, gaps, baseline export,
+atomic inline-grid snapshots, and fixed-row percentage-height ratio transfer.
+The grammar, placement and track owners also cover malformed input, bounded
+extreme coordinates and allocation failure cleanup.
+
+The matching [before](results/css-grid-placement-before.json) and
+[after](results/css-grid-placement-after.json) reports improve from **8/26 to 17/26 complete files**
+and **90/391 to 220/391 testharness assertions**, with no previously passing
+file or assertion lost. Reftests improve from 1/9 to 7/9; all three crashtests
+pass before and after. Neither run has errors, timeouts, crashes or
+infrastructure failures. These are focused results, not a new aggregate CSS
+pass rate. All expectations remain PASS. The default manifest already selects
+the whole runnable CSS directory across all three adapters, so no default
+allowlist additions are needed.
+
+The remaining seven mixed grammar files retain 171 unsupported assertions:
+163 involve named placement and eight calculated values. The two remaining
+multi-row reftests use an XHTML reference whose CDATA-wrapped stylesheet is
+unsupported by the current HTML/CSS path. Named lines/areas, subgrid, writing
+modes, general grid shorthands and cyclic track sizing remain outside this
+capability. Early percentage-height ratio transfer requires exact fixed rows;
+intrinsic or flexible rows and unequal minmax bounds need further sizing passes.
+Nearby placement harnesses that await `document.fonts.ready` have a separate
+harness prerequisite and are not part of this iteration selection.
 
 ## Independent overflow axes
 

@@ -233,6 +233,22 @@ test "supports implicit grid columns expose the implemented single track grammar
     try std.testing.expect(try matches(allocator, "(display:inline-grid) and (grid-auto-columns:minmax(0, 1fr))", noSelectors));
 }
 
+test "supports numeric grid placement and sparse or dense flow share declaration admission" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "auto", "-3", "span 2", "2 SPAN", "99999999999999999999999", "inherit", "var(--line)" }) |valid|
+        try std.testing.expect(try property(allocator, "grid-column-start", valid));
+    for ([_][]const u8{ "0", "span", "span 0", "span -2", "1.0", "1e2", "header", "span header" }) |invalid|
+        try std.testing.expect(!try property(allocator, "grid-row-end", invalid));
+    try std.testing.expect(try property(allocator, "grid-area", "1/2/span 3/-1"));
+    try std.testing.expect(try property(allocator, "grid-column", "-2/span 2"));
+    try std.testing.expect(!try property(allocator, "grid-row", "1/2/3"));
+    try std.testing.expect(!try property(allocator, "grid-area", "1/2/3/4/5"));
+    for ([_][]const u8{ "row", "column", "dense", "row dense", "dense column" }) |valid|
+        try std.testing.expect(try property(allocator, "grid-auto-flow", valid));
+    try std.testing.expect(!try property(allocator, "grid-auto-flow", "row column"));
+    try std.testing.expect(!try property(allocator, "grid-auto-flow", "sparse"));
+}
+
 fn allocationQuery(allocator: std.mem.Allocator) !void {
     try std.testing.expect(try conditionText(allocator, "(border:1px solid red) and (--Theme: var(--missing, blue))", noSelectors));
     try std.testing.expect(try conditionText(allocator, "margin:1px 2px", noSelectors));

@@ -1,0 +1,37 @@
+# Numeric grid lines/spans, implicit tracks, and row/column sparse/dense flow.
+# Whole unchanged upstream files; all expectations remain PASS. The default
+# manifest already selects CSS across testharness, reftest, and crashtest.
+# Mixed grammar files retain unsupported named lines and integer math (including
+# sibling-index/container units); those assertions are not geometry coverage.
+# Neighboring sparse/dynamic placement harnesses depend on document.fonts.ready;
+# named areas, vertical writing, subgrid, and Ahem-dependent comparisons are
+# separate prerequisites and are not selected for this bounded iteration.
+tests:
+  - css/css-grid/parsing/grid-auto-flow-valid.html
+  - css/css-grid/parsing/grid-auto-flow-invalid.html
+  - css/css-grid/parsing/grid-auto-flow-computed.html
+  - css/css-grid/parsing/grid-area-valid.html
+  - css/css-grid/parsing/grid-area-invalid.html
+  - css/css-grid/parsing/grid-area-computed.html
+  - css/css-grid/parsing/grid-area-shorthand.html
+  - css/css-grid/parsing/grid-row-shorthand.html
+  - css/css-grid/parsing/grid-row-invalid.html
+  - css/css-grid/parsing/grid-row-shortest-serialization.html
+  - css/css-grid/parsing/grid-column-shorthand.html
+  - css/css-grid/parsing/grid-column-invalid.html
+  - css/css-grid/parsing/grid-column-shortest-serialization.html
+  - css/css-grid/placement/grid-auto-placement-implicit-tracks-001.html
+reftests:
+  - css/css-grid/placement/grid-layout-grid-span.html
+  - css/css-grid/placement/grid-placement-items-spanning-multiple-rows-001.html
+  - css/css-grid/placement/grid-placement-items-spanning-multiple-rows-002.html
+  - css/css-grid/alignment/grid-gutters-explicit-placement.html
+  - css/css-grid/grid-definition/grid-layout-auto-tracks.html
+  - css/css-grid/grid-flex-spanning-items-001.html
+  - css/css-grid/grid-items/grid-layout-z-order-a.html
+  - css/css-grid/grid-items/grid-layout-z-order-b.html
+  - css/css-grid/grid-items/aspect-ratio-002.html
+crashtests:
+  - css/css-grid/grid-definition/grid-add-item-with-positioned-items-crash.html
+  - css/css-grid/grid-stale-layoutbox-crash.html
+  - css/css-grid/grid-formatting-context-fallback-crash.html

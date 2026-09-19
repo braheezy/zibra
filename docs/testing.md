@@ -54,6 +54,14 @@ operation does real work. In particular, a geometry read must synchronously
 update layout before a mutation-and-measure benchmark can measure that layout.
 Unsupported or failed workloads are missing data, never zero-time successes.
 
+For numeric grid placement and spanning, iterate with
+`zig build test-render -Dtest-filter=grid` and the unchanged upstream cases in
+[`manifest-css-grid-placement.yaml`](../tests/wpt/manifest-css-grid-placement.yaml).
+The [grid dashboard](../tests/manual/css-grid-placement.html) runs geometry
+checks before and after placement mutations through `test-wpt`; its buttons and
+report link additionally exercise native interaction. Grid line grammar and
+CSSOM coverage run in `test-css-declarations` and `test-css-supports`.
+
 ## Check tiers
 
 On macOS, `build.zig` uses the same `linkSdl` policy for the browser and native

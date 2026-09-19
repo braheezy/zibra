@@ -97,7 +97,11 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   `css_alignment.zig` owns property-specific box-alignment grammar and the
   multi-token `place-items`/`place-content` split. These helpers retain no DOM
   data; intrinsic block-axis sizing and fit-content functions remain deferred.
-
+- `css_grid_placement.zig` owns numeric grid lines/spans and row/column flow
+  grammar. Placement shorthands expand through the common declaration sink;
+  integer token validation precedes number normalization. Large authored
+  integers keep their CSSOM spelling independently of bounded used placement.
+  Named lines/areas and calculated line numbers remain outside this grammar.
 - `css_math.zig` evaluates bounded typed calculations with explicit unit and
   percentage contexts. Lengths and colors share it; layout-dependent units
   must not be guessed during declaration admission. Its optional transient

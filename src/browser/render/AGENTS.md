@@ -82,6 +82,11 @@ boundaries.
   provenance, final baseline scalars and hit-test collection. Use
   `document/css_display.zig` to distinguish the inner format from an atomic
   inline outer box; inline flex/grid reuse the existing atomic snapshot owner.
+- `grid_placement.zig` owns temporary scalar areas and implicit track extents
+  over numeric line/span pairs. Intrinsic and final layout must use the same
+  item ordering and placement. Keep explicit line identities until auto-fit
+  occupancy is known; collapsed tracks also collapse their gutters. The plan
+  retains no DOM/layout pointers and retires within the measurement/layout call.
 - `intrinsic_width.zig` synchronously borrows DOM and FontManager for bounded
   measurement. `measureContent` returns raw root content; `keywordContent`
   separately transfers definite height through a nonreplaced ratio for width

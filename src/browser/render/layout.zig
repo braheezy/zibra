@@ -33,6 +33,8 @@ const css_display = @import("../../document/css_display.zig");
 const css_overflow = @import("../../document/css_overflow.zig");
 const overflow_geometry = @import("overflow_geometry.zig");
 const grid_format = @import("grid_format.zig");
+const grid_placement = @import("grid_placement.zig");
+const css_grid = @import("../../document/css_grid_placement.zig");
 const intrinsic_measure = @import("intrinsic_width.zig");
 const paint_effects = @import("paint_effects.zig");
 const replaced_paint = @import("replaced_paint.zig");
@@ -9101,27 +9103,6 @@ const BlockLayout = struct {
             self.normal_flow_placement
         else
             null;
-        const formatting_float = float_side != .none and self.formattingKind() != null;
-        const shrink_to_fit_width = if (specified_width == null and
-            (isOutOfFlowPosition(position_mode) or float_side != .none))
-        shrink: {
-            if (formatting_float) {
-                const natural = try self.intrinsicContent(engine, width_scale);
-                const intrinsic = if (self.node_ptr) |node| intrinsic_measure.keywordContent(node, natural, width_scale) else natural;
-                break :shrink constrainDimension(formatCoordinate(sizing.fitContent(.{ .min = intrinsic.min, .max = intrinsic.max }, width_available)), min_width, max_width);
-            }
-            const element = switch (self.node) {
-                .element => |*value| value,
-                .text => break :shrink null,
-            };
-            const css_width = shrinkToFitSpecifiedContentWidth(
-                element,
-                containing_width_css,
-                self.computedFontSizeCss(),
-            ) orelse break :shrink null;
-            break :shrink scaleCssPixel(css_width, zoom_value, engine.zoom());
-        } else null;
-
         var is_block = self.isBlockContainer();
         if (self.node == .element) {
             const element = &self.node.element;
@@ -9137,6 +9118,29 @@ const BlockLayout = struct {
                 is_block = false;
             }
         }
+
+        const intrinsic_float = float_side != .none and
+            (self.formattingKind() != null or
+                (!isOutOfFlowPosition(position_mode) and is_block and self.tableRole() == .ordinary));
+        const shrink_to_fit_width = if (specified_width == null and
+            (isOutOfFlowPosition(position_mode) or float_side != .none))
+        shrink: {
+            if (intrinsic_float) {
+                const natural = try self.intrinsicContent(engine, width_scale);
+                const intrinsic = if (self.node_ptr) |node| intrinsic_measure.keywordContent(node, natural, width_scale) else natural;
+                break :shrink constrainDimension(formatCoordinate(sizing.fitContent(.{ .min = intrinsic.min, .max = intrinsic.max }, width_available)), min_width, max_width);
+            }
+            const element = switch (self.node) {
+                .element => |*value| value,
+                .text => break :shrink null,
+            };
+            const css_width = shrinkToFitSpecifiedContentWidth(
+                element,
+                containing_width_css,
+                self.computedFontSizeCss(),
+            ) orelse break :shrink null;
+            break :shrink scaleCssPixel(css_width, zoom_value, engine.zoom());
+        } else null;
 
         // Parent/first-child top collapse changes the parent's border-top
         // coordinate, so discover the direct child and resolve its current
@@ -9204,8 +9208,8 @@ const BlockLayout = struct {
                     }
 
                     if (float_side != .none) {
-                        // Formatting floats use shared intrinsic widths. Other
-                        // auto floats retain their bounded content fallback.
+                        // Ordinary and formatting floats share intrinsic widths;
+                        // replaced and table boxes retain their own sizing paths.
                         var candidate_width = if (specified_width) |width|
                             @max(width + horizontal_insets, 0)
                         else if (shrink_to_fit_width) |width|
@@ -9274,7 +9278,7 @@ const BlockLayout = struct {
             // positioned overlays) still permits the positioned child to
             // size itself to its contents. Clamping its preferred width to
             // zero would collapse text such as Acid3's score into a column.
-            if (formatting_float or auto_content_width <= 0) width else @min(width, auto_content_width)
+            if (intrinsic_float or auto_content_width <= 0) width else @min(width, auto_content_width)
         else
             auto_content_width;
         const used_content_width = specified_width orelse
@@ -10414,76 +10418,144 @@ const BlockLayout = struct {
         return if (column) main_size else cross_size orelse total_cross;
     }
 
-    fn gridItemMinimum(item: FormatItem, track: grid_format.Track) f64 {
+    fn gridItemMinimum(item: FormatItem, tracks: []const grid_format.Track, gap: f64) f64 {
         if (!item.automatic_main) return item.main.min;
-        const minimum = if (track.min_kind == .auto and !item.scrollable_x) item.main.min else item.x_edges;
-        return if (track.max_kind == .fixed) @max(item.x_edges, @min(minimum, (track.max orelse track.min) - item.main.before - item.main.after)) else minimum;
+        const policy = grid_format.areaPolicy(tracks, gap);
+        const minimum = if (policy.automatic_minimum and !item.scrollable_x) item.main.min else item.x_edges;
+        return if (policy.fixed_maximum) |cap| @max(item.x_edges, @min(minimum, cap - item.main.before - item.main.after)) else minimum;
     }
 
-    fn gridItemWidth(self: *BlockLayout, item: FormatItem, track: grid_format.Track, available: f64) f64 {
+    fn gridItemWidth(self: *BlockLayout, item: FormatItem, tracks: []const grid_format.Track, gap: f64, available: f64) f64 {
         const align_self = item.block.formatStyle("justify-self", "auto");
         const alignment = if (flex_format.eq(align_self, "auto")) self.formatStyle("justify-items", "normal") else align_self;
         const normal_exception = flex_format.eq(alignment, "normal") and (item.replaced or item.ratio != null);
         const stretch = item.width_auto and !normal_exception and !item.main.auto_before and !item.main.auto_after and stretchesAlignment(alignment);
         const inner = @max(available - item.main.before - item.main.after, 0);
         const auto_width = if (item.height_authored and item.transferred_main != null) item.transferred_main.? else sizing.fitContent(item.intrinsic, inner - item.x_edges) + item.x_edges;
-        return (sizing.Constraints{ .min = gridItemMinimum(item, track), .max = item.main.max }).clamp(if (stretch) inner else if (item.width_auto) auto_width else item.width);
+        return (sizing.Constraints{ .min = gridItemMinimum(item, tracks, gap), .max = item.main.max }).clamp(if (stretch) inner else if (item.width_auto) auto_width else item.width);
+    }
+
+    fn gridPlacement(block: *BlockLayout) grid_placement.Item {
+        // Anonymous text items inherit sizing styles, never placement.
+        if (block.inline_nodes != null) return .{};
+        return .{
+            .column = .{ .start = css_grid.parseLine(block.formatStyle("grid-column-start", "auto")) orelse .auto, .end = css_grid.parseLine(block.formatStyle("grid-column-end", "auto")) orelse .auto },
+            .row = .{ .start = css_grid.parseLine(block.formatStyle("grid-row-start", "auto")) orelse .auto, .end = css_grid.parseLine(block.formatStyle("grid-row-end", "auto")) orelse .auto },
+        };
+    }
+
+    fn gridBaseline(items: []const FormatItem, areas: []const grid_placement.Area, last: bool) ?i32 {
+        if (items.len == 0) return null;
+        var occupied_row: usize = if (last) 0 else std.math.maxInt(usize);
+        for (areas) |area| {
+            occupied_row = if (last) @max(occupied_row, area.row_start + area.row_span - 1) else @min(occupied_row, area.row_start);
+        }
+        var selected: ?usize = null;
+        var selected_rank: u8 = 4;
+        var selected_baseline: ?i32 = null;
+        for (items, areas, 0..) |item, area, i| {
+            const first_row = area.row_start;
+            const last_row = first_row + area.row_span - 1;
+            if (occupied_row < first_row or occupied_row > last_row) continue;
+            const own_edge = if (last) last_row else first_row;
+            const opposite_edge = if (last) first_row else last_row;
+            const alignment = if (item.cross_auto_before or item.cross_auto_after) null else baselineKind(item.cross_align);
+            var baseline = blockBaseline(item.block, last);
+            const rank: u8 = if (alignment == last and own_edge == occupied_row) 0 else if (alignment == !last and opposite_edge == occupied_row) opposite: {
+                baseline = blockBaseline(item.block, !last);
+                break :opposite 1;
+            } else if (own_edge != occupied_row) continue else if (baseline != null) 2 else 3;
+            const precedes = if (selected) |index| order: {
+                const chosen = areas[index];
+                if (area.row_start != chosen.row_start) break :order if (last) area.row_start > chosen.row_start else area.row_start < chosen.row_start;
+                break :order if (last) area.column_start >= chosen.column_start else area.column_start < chosen.column_start;
+            } else true;
+            if (rank < selected_rank or (rank == selected_rank and precedes)) {
+                selected = i;
+                selected_rank = rank;
+                selected_baseline = baseline;
+            }
+        }
+        const block = items[selected orelse return null].block;
+        return selected_baseline orelse block.y.get().* +| block.height.get().*;
     }
 
     fn layoutGridItems(self: *BlockLayout, engine: *Layout, items: []FormatItem, definite_height: ?i32, column_gap: f64, row_gap: f64) !f64 {
         const scale = @as(f64, self.zoom.get().*) / self.document.page_zoom;
-        var columns: [grid_format.tracks.max_tracks]grid_format.Track = undefined;
-        var column_count = grid_format.tracks.parse(self.formatStyle("grid-template-columns", "none"), .{ .font_size = self.computedFontSizeCss(), .percentage_base = @as(f64, @floatFromInt(self.content_width)) / scale }, column_gap / scale, items.len, &columns) orelse 0;
-        if (column_count == 0) {
-            column_count = 1;
-            columns[0] = grid_format.tracks.parseTrack(self.formatStyle("grid-auto-columns", "auto"), .{ .font_size = self.computedFontSizeCss(), .percentage_base = @as(f64, @floatFromInt(self.content_width)) / scale }) orelse .{};
-        }
-        for (columns[0..column_count]) |*track| {
+        const width_context = parser.CssLengthResolutionContext{ .font_size = self.computedFontSizeCss(), .percentage_base = @as(f64, @floatFromInt(self.content_width)) / scale };
+        const height_context = parser.CssLengthResolutionContext{ .font_size = self.computedFontSizeCss(), .percentage_base = if (self.content_height_definite) if (definite_height) |h| @as(f64, @floatFromInt(h)) / scale else null else null };
+        var explicit_columns: [grid_format.tracks.max_tracks]grid_format.Track = undefined;
+        var explicit_rows: [grid_format.tracks.max_tracks]grid_format.Track = undefined;
+        const column_count = grid_format.tracks.parse(self.formatStyle("grid-template-columns", "none"), width_context, column_gap / scale, items.len, &explicit_columns) orelse 0;
+        const row_count = grid_format.tracks.parse(self.formatStyle("grid-template-rows", "none"), height_context, row_gap / scale, items.len, &explicit_rows) orelse 0;
+        const placements = try self.allocator.alloc(grid_placement.Item, items.len);
+        defer self.allocator.free(placements);
+        for (items, placements) |item, *placement| placement.* = gridPlacement(item.block);
+        var plan = try grid_placement.place(self.allocator, placements, column_count, row_count, css_grid.parseFlow(self.formatStyle("grid-auto-flow", "row")) orelse .{});
+        defer plan.deinit(self.allocator);
+        const columns = try self.allocator.alloc(grid_format.Track, plan.column_count);
+        defer self.allocator.free(columns);
+        const rows = try self.allocator.alloc(grid_format.Track, plan.row_count);
+        defer self.allocator.free(rows);
+        const auto_column: grid_format.Track = grid_format.tracks.parseTrack(self.formatStyle("grid-auto-columns", "auto"), width_context) orelse .{};
+        const auto_row: grid_format.Track = grid_format.tracks.parseTrack(self.formatStyle("grid-auto-rows", "auto"), height_context) orelse .{};
+        for (columns, 0..) |*track, i| {
+            track.* = if (i >= plan.column_offset and i - plan.column_offset < column_count) explicit_columns[i - plan.column_offset] else auto_column;
             track.min *= scale;
-            if (track.max) |max| track.max = max * scale;
+            if (track.max) |maximum| track.max = maximum * scale;
         }
-        var contributions: [grid_format.tracks.max_tracks]grid_format.Contribution = @splat(.{});
-        for (items, 0..) |item, i| {
-            const column = i % column_count;
-            const min = gridItemMinimum(item, columns[column]);
-            const constraints = sizing.Constraints{ .min = min, .max = item.main.max };
+        for (rows, 0..) |*track, i| {
+            track.* = if (i >= plan.row_offset and i - plan.row_offset < row_count) explicit_rows[i - plan.row_offset] else auto_row;
+            track.min *= scale;
+            if (track.max) |maximum| track.max = maximum * scale;
+        }
+        const contributions = try self.allocator.alloc(grid_format.SpanContribution, items.len);
+        defer self.allocator.free(contributions);
+        const natural = try self.allocator.alloc(grid_format.SpanContribution, items.len);
+        defer self.allocator.free(natural);
+        for (plan.areas, contributions, natural) |area, *column, *row| {
+            column.* = .{ .start = area.column_start, .span = area.column_span };
+            row.* = .{ .start = area.row_start, .span = area.row_span };
+        }
+        grid_format.collapseEmpty(columns, contributions);
+        grid_format.collapseEmpty(rows, natural);
+        for (items, plan.areas) |*item, area| {
+            if (grid_format.fixedAreaSize(rows[area.row_start .. area.row_start + area.row_span], row_gap)) |height| {
+                item.* = try self.formatItem(item.block, engine, false, null, height);
+            }
+        }
+        for (items, contributions) |item, *entry| {
+            const tracks = columns[entry.start .. entry.start + entry.span];
+            const policy = grid_format.areaPolicy(tracks, column_gap);
+            const minimum = gridItemMinimum(item, tracks, column_gap);
+            const constraints = sizing.Constraints{ .min = minimum, .max = item.main.max };
             const outer = item.main.before + item.main.after;
-            const min_content = constraints.clamp(if (item.width_auto) item.intrinsic.min + item.x_edges else item.width) + outer;
-            const max_content = constraints.clamp(if (item.width_auto) item.intrinsic.max + item.x_edges else item.width) + outer;
-            var minimum = if (item.width_auto) min else constraints.clamp(item.width);
-            if (item.automatic_main and columns[column].max_kind == .fixed) minimum = @max(item.x_edges, @min(minimum, (columns[column].max orelse columns[column].min) - outer));
-            contributions[column].minimum = @max(contributions[column].minimum, minimum + outer);
-            contributions[column].min_content = @max(contributions[column].min_content, min_content);
-            contributions[column].max_content = @max(contributions[column].max_content, max_content);
+            const transferred = if (item.width_auto and item.height_authored) item.transferred_main else null;
+            var minimum_contribution = if (item.width_auto) minimum else constraints.clamp(item.width);
+            if (item.automatic_main) if (policy.fixed_maximum) |cap| {
+                minimum_contribution = @max(item.x_edges, @min(minimum_contribution, cap - outer));
+            };
+            entry.contribution = .{
+                .minimum = minimum_contribution + outer,
+                .min_content = constraints.clamp(transferred orelse (if (item.width_auto) item.intrinsic.min + item.x_edges else item.width)) + outer,
+                .max_content = constraints.clamp(transferred orelse (if (item.width_auto) item.intrinsic.max + item.x_edges else item.width)) + outer,
+            };
         }
         const justify_content = self.formatStyle("justify-content", "normal");
         const align_content = self.formatStyle("align-content", "normal");
-        var widths: [grid_format.tracks.max_tracks]f64 = undefined;
-        grid_format.resolve(columns[0..column_count], contributions[0..column_count], @floatFromInt(self.content_width), column_gap, stretchesAlignment(justify_content), widths[0..column_count]);
-        const height_context = parser.CssLengthResolutionContext{ .font_size = self.computedFontSizeCss(), .percentage_base = if (self.content_height_definite) if (definite_height) |h| @as(f64, @floatFromInt(h)) / scale else null else null };
-        var explicit: [grid_format.tracks.max_tracks]grid_format.Track = undefined;
-        const explicit_count = grid_format.tracks.parse(self.formatStyle("grid-template-rows", "none"), height_context, row_gap / scale, (items.len + column_count - 1) / column_count, &explicit) orelse 0;
-        const row_count = @max(explicit_count, (items.len + column_count - 1) / column_count);
-        if (row_count == 0) return 0;
-        const rows = try self.allocator.alloc(grid_format.Track, row_count);
-        defer self.allocator.free(rows);
-        const heights = try self.allocator.alloc(f64, row_count);
+        const widths = try self.allocator.alloc(f64, columns.len);
+        defer self.allocator.free(widths);
+        const heights = try self.allocator.alloc(f64, rows.len);
         defer self.allocator.free(heights);
-        const natural = try self.allocator.alloc(grid_format.Contribution, row_count);
-        defer self.allocator.free(natural);
-        @memset(natural, .{});
-        const first_baselines = try self.allocator.alloc(box_alignment.BaselineGroup, row_count);
+        try grid_format.resolveSpans(self.allocator, columns, contributions, @floatFromInt(self.content_width), column_gap, stretchesAlignment(justify_content), widths);
+        const total_width = grid_format.totalSize(columns, widths, column_gap);
+        const column_distribution = box_alignment.distribute(justify_content, @as(f64, @floatFromInt(self.content_width)) - total_width, grid_format.activeTrackCount(columns), false);
+        const first_baselines = try self.allocator.alloc(box_alignment.BaselineGroup, rows.len);
         defer self.allocator.free(first_baselines);
-        const last_baselines = try self.allocator.alloc(box_alignment.BaselineGroup, row_count);
+        const last_baselines = try self.allocator.alloc(box_alignment.BaselineGroup, rows.len);
         defer self.allocator.free(last_baselines);
         @memset(first_baselines, .{});
         @memset(last_baselines, .{});
-        const auto_row = grid_format.tracks.parseTrack(self.formatStyle("grid-auto-rows", "auto"), height_context) orelse grid_format.Track{};
-        for (rows, 0..) |*track, i| {
-            track.* = if (i < explicit_count) explicit[i] else auto_row;
-            track.min *= scale;
-            if (track.max) |max| track.max = max * scale;
-        }
         const collect = engine.collect_hit_test_bounds;
         const publish_scroll = engine.publish_scroll_geometry;
         defer {
@@ -10492,79 +10564,83 @@ const BlockLayout = struct {
         }
         engine.collect_hit_test_bounds = false;
         engine.publish_scroll_geometry = false;
-        for (items, 0..) |*item, i| {
-            const col = i % column_count;
-            const row = i / column_count;
-            item.* = try self.formatItem(item.block, engine, false, widths[col], null);
-            const width = self.gridItemWidth(item.*, columns[col], widths[col]);
+        for (items, plan.areas, natural) |*item, area, *entry| {
+            const tracks = columns[area.column_start .. area.column_start + area.column_span];
+            const area_width = grid_format.areaSize(columns, widths, area.column_start, area.column_span, column_gap + column_distribution.between);
+            const fixed_height = grid_format.fixedAreaSize(rows[area.row_start .. area.row_start + area.row_span], row_gap);
+            item.* = try self.formatItem(item.block, engine, false, area_width, fixed_height);
+            const width = self.gridItemWidth(item.*, tracks, column_gap, area_width);
             const ratio_height = if (!item.height_authored) item.ratioHeight(width) else null;
-            try self.placeFormatItem(engine, item, 0, 0, width, ratio_height, .{ .area_width = widths[col], .grid_area = true, .height_definite = item.height_authored or ratio_height != null });
+            try self.placeFormatItem(engine, item, 0, 0, width, ratio_height, .{ .area_width = area_width, .area_height = fixed_height, .grid_area = true, .height_definite = item.height_authored or ratio_height != null });
             const outer = item.cross_before + item.cross_after;
             const auto_min = flex_format.eq(item.block.formatStyle("min-height", "auto"), "auto");
-            if (ratio_height != null and auto_min and !item.scrollable_y) item.height = @max(item.height, @as(f64, @floatFromInt(item.block.natural_content_height)) + item.y_edges);
-            var minimum = if (item.height_authored or (auto_min and rows[row].min_kind == .auto and !item.scrollable_y)) @max(item.min_cross, @min(item.height, item.max_cross)) else item.min_cross;
-            if (auto_min and rows[row].max_kind == .fixed) minimum = @max(item.y_edges, @min(minimum, (rows[row].max orelse rows[row].min) - outer));
-            natural[row].minimum = @max(natural[row].minimum, minimum + outer);
-            natural[row].min_content = @max(natural[row].min_content, item.height + outer);
-            natural[row].max_content = @max(natural[row].max_content, item.height + outer);
+            const policy = grid_format.areaPolicy(rows[area.row_start .. area.row_start + area.row_span], row_gap);
+            if (ratio_height != null and auto_min and policy.automatic_minimum and !item.scrollable_y) item.height = @max(item.height, @as(f64, @floatFromInt(item.block.natural_content_height)) + item.y_edges);
+            var minimum = if (item.height_authored or (auto_min and policy.automatic_minimum and !item.scrollable_y)) @max(item.min_cross, @min(item.height, item.max_cross)) else item.min_cross;
+            if (auto_min) if (policy.fixed_maximum) |cap| {
+                minimum = @max(item.y_edges, @min(minimum, cap - outer));
+            };
+            entry.contribution = .{ .minimum = minimum + outer, .min_content = item.height + outer, .max_content = item.height + outer };
             if (!item.cross_auto_before and !item.cross_auto_after) if (baselineKind(item.cross_align)) |last| {
                 const baseline = blockBaselineOffset(item.block, last);
-                if (last) last_baselines[row].add(item.height, baseline, item.cross_before, item.cross_after) else first_baselines[row].add(item.height, baseline, item.cross_before, item.cross_after);
+                if (last) last_baselines[area.row_start + area.row_span - 1].add(item.height, baseline, item.cross_before, item.cross_after) else first_baselines[area.row_start].add(item.height, baseline, item.cross_before, item.cross_after);
             };
         }
-        for (natural, first_baselines, last_baselines) |*contribution, first, last| {
-            const extent = @max(first.size(), last.size());
-            contribution.minimum = @max(contribution.minimum, extent);
-            contribution.min_content = @max(contribution.min_content, extent);
-            contribution.max_content = @max(contribution.max_content, extent);
+        // A baseline shim belongs to the spanning item's contribution, not an
+        // entire item height charged again to its first or last track.
+        for (items, plan.areas, natural) |item, area, *entry| {
+            if (item.cross_auto_before or item.cross_auto_after) continue;
+            if (baselineKind(item.cross_align)) |last| {
+                const baseline = blockBaselineOffset(item.block, last);
+                const shim = @max(if (last)
+                    last_baselines[area.row_start + area.row_span - 1].descent - (item.height - baseline + item.cross_after)
+                else
+                    first_baselines[area.row_start].ascent - baseline - item.cross_before, 0);
+                entry.contribution.minimum += shim;
+                entry.contribution.min_content += shim;
+                entry.contribution.max_content += shim;
+            }
         }
-        grid_format.resolve(rows, natural, if (definite_height) |h| @as(f64, @floatFromInt(h)) else null, row_gap, stretchesAlignment(align_content), heights);
-        var total_width = column_gap * @as(f64, @floatFromInt(column_count - 1));
-        for (widths[0..column_count]) |width| total_width += width;
-        var total_height = row_gap * @as(f64, @floatFromInt(row_count - 1));
-        for (heights) |height| total_height += height;
-        const column_distribution = box_alignment.distribute(justify_content, @as(f64, @floatFromInt(self.content_width)) - total_width, column_count, false);
-        const row_distribution = box_alignment.distribute(align_content, (if (definite_height) |h| @as(f64, @floatFromInt(h)) else total_height) - total_height, row_count, false);
+        try grid_format.resolveSpans(self.allocator, rows, natural, if (definite_height) |h| @as(f64, @floatFromInt(h)) else null, row_gap, stretchesAlignment(align_content), heights);
+        const total_height = grid_format.totalSize(rows, heights, row_gap);
+        const row_distribution = box_alignment.distribute(align_content, (if (definite_height) |h| @as(f64, @floatFromInt(h)) else total_height) - total_height, grid_format.activeTrackCount(rows), false);
+        const x_positions = try self.allocator.alloc(f64, columns.len + 1);
+        defer self.allocator.free(x_positions);
+        const y_positions = try self.allocator.alloc(f64, rows.len + 1);
+        defer self.allocator.free(y_positions);
+        grid_format.positions(columns, widths, column_gap, column_distribution.offset, column_distribution.between, x_positions);
+        grid_format.positions(rows, heights, row_gap, row_distribution.offset, row_distribution.between, y_positions);
         engine.collect_hit_test_bounds = collect;
         engine.publish_scroll_geometry = publish_scroll;
-        var x = column_distribution.offset;
-        var y = row_distribution.offset;
-        for (items, 0..) |*item, i| {
-            const col = i % column_count;
-            const row = i / column_count;
-            if (col == 0) {
-                x = column_distribution.offset;
-                if (row > 0) y += heights[row - 1] + row_gap + row_distribution.between;
-            }
+        for (items, plan.areas) |*item, area| {
+            const tracks = columns[area.column_start .. area.column_start + area.column_span];
+            const area_width = grid_format.areaSize(columns, widths, area.column_start, area.column_span, column_gap + column_distribution.between);
+            const area_height = grid_format.areaSize(rows, heights, area.row_start, area.row_span, row_gap + row_distribution.between);
             const natural_height = item.height;
             const first = blockBaselineOffset(item.block, false);
             const last = blockBaselineOffset(item.block, true);
-            item.* = try self.formatItem(item.block, engine, false, widths[col], heights[row]);
-            const width = self.gridItemWidth(item.*, columns[col], widths[col]);
-            const available = @max(heights[row] - item.cross_before - item.cross_after, 0);
+            item.* = try self.formatItem(item.block, engine, false, area_width, area_height);
+            const width = self.gridItemWidth(item.*, tracks, column_gap, area_width);
+            const available = @max(area_height - item.cross_before - item.cross_after, 0);
             const normal_exception = flex_format.eq(item.cross_align, "normal") and (item.replaced or item.ratio != null);
             const stretch = item.cross_auto and !normal_exception and !item.cross_auto_before and !item.cross_auto_after and stretchesAlignment(item.cross_align);
             const ratio_height = item.ratioHeight(width) orelse natural_height;
-            const ratio_minimum = flex_format.eq(item.block.formatStyle("min-height", "auto"), "auto") and !item.scrollable_y;
+            const ratio_minimum = flex_format.eq(item.block.formatStyle("min-height", "auto"), "auto") and grid_format.areaPolicy(rows[area.row_start .. area.row_start + area.row_span], row_gap).automatic_minimum and !item.scrollable_y;
             const preferred_height = if (item.ratio != null) if (ratio_minimum) @max(natural_height, ratio_height) else ratio_height else natural_height;
             const height = (sizing.Constraints{ .min = item.min_cross, .max = item.max_cross }).clamp(if (stretch) available else if (item.height_authored) item.height else preferred_height);
             const alignment = item.block.formatStyle("justify-self", "auto");
             const justify = if (flex_format.eq(alignment, "auto")) self.formatStyle("justify-items", "normal") else alignment;
-            const horizontal = box_alignment.resolveAutoMargins(widths[col], width, .{ .before = item.main.before, .after = item.main.after, .auto_before = item.main.auto_before, .auto_after = item.main.auto_after }, .grid);
-            const vertical = box_alignment.resolveAutoMargins(heights[row], height, .{ .before = item.cross_before, .after = item.cross_after, .auto_before = item.cross_auto_before, .auto_after = item.cross_auto_after }, .grid);
-            const x_offset = horizontal.before + if (horizontal.suppressed) @as(f64, 0) else box_alignment.position(justify, widths[col] - width - horizontal.before - horizontal.after, false);
-            var y_offset = vertical.before + if (vertical.suppressed) @as(f64, 0) else box_alignment.position(item.cross_align, heights[row] - height - vertical.before - vertical.after, false);
+            const horizontal = box_alignment.resolveAutoMargins(area_width, width, .{ .before = item.main.before, .after = item.main.after, .auto_before = item.main.auto_before, .auto_after = item.main.auto_after }, .grid);
+            const vertical = box_alignment.resolveAutoMargins(area_height, height, .{ .before = item.cross_before, .after = item.cross_after, .auto_before = item.cross_auto_before, .auto_after = item.cross_auto_after }, .grid);
+            const x_offset = horizontal.before + if (horizontal.suppressed) @as(f64, 0) else box_alignment.position(justify, area_width - width - horizontal.before - horizontal.after, false);
+            var y_offset = vertical.before + if (vertical.suppressed) @as(f64, 0) else box_alignment.position(item.cross_align, area_height - height - vertical.before - vertical.after, false);
             if (!item.cross_auto_before and !item.cross_auto_after) if (baselineKind(item.cross_align)) |is_last| {
-                y_offset = if (is_last) heights[row] - last_baselines[row].size() + last_baselines[row].offset(last) else first_baselines[row].offset(first);
+                y_offset = if (is_last) area_height - last_baselines[area.row_start + area.row_span - 1].descent - last else first_baselines[area.row_start].offset(first);
             };
-            try self.placeFormatItem(engine, item, x + x_offset, y + y_offset, width, height, .{ .area_width = widths[col], .area_height = heights[row], .grid_area = true, .height_definite = stretch or item.height_authored or (item.ratio != null and ((!item.width_auto and !isIntrinsicSize(item.block.formatStyle("width", "auto"))) or flex_format.eq(justify, "stretch"))) });
-            x += widths[col] + column_gap + column_distribution.between;
+            try self.placeFormatItem(engine, item, x_positions[area.column_start] + x_offset, y_positions[area.row_start] + y_offset, width, height, .{ .area_width = area_width, .area_height = area_height, .grid_area = true, .height_definite = stretch or item.height_authored or (item.ratio != null and ((!item.width_auto and !isIntrinsicSize(item.block.formatStyle("width", "auto"))) or flex_format.eq(justify, "stretch"))) });
         }
-        if (items.len > 0) {
-            self.first_baseline = formattingBaseline(items[0..@min(column_count, items.len)], false, false, true);
-            const last_start = (items.len - 1) / column_count * column_count;
-            self.last_baseline = formattingBaseline(items[last_start..], true, false, true);
-        }
+        self.first_baseline = gridBaseline(items, plan.areas, false);
+        self.last_baseline = gridBaseline(items, plan.areas, true);
         return total_height;
     }
 

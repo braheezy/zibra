@@ -14,6 +14,8 @@ const css_overflow = @import("../../document/css_overflow.zig");
 const css_flex = @import("../../document/css_flex.zig");
 const flex_format = @import("flex_format.zig");
 const grid_format = @import("grid_format.zig");
+const grid_placement = @import("grid_placement.zig");
+const css_grid = @import("../../document/css_grid_placement.zig");
 
 pub const Width = struct {
     min: f64 = 0,
@@ -201,6 +203,9 @@ const FormattingItem = struct {
     scrollable: bool = false,
     insets: f64 = 0,
     order: i32 = 0,
+    placement: grid_placement.Item = .{},
+    source_index: ?usize = null,
+    grid_transferred: ?f64 = null,
 };
 
 fn formattingItem(node: *const dom.Node, natural_width: Width, scale: f64, definite_cross_height: ?f64) FormattingItem {
@@ -317,24 +322,34 @@ fn formattingItem(node: *const dom.Node, natural_width: Width, scale: f64, defin
         },
         .cross = cross,
         .preferred = if (preferred) |width| width + x_edges else null,
+        .grid_transferred = if (preferred == null) if (transferred) |width| width + x_edges else null else null,
         .automatic_minimum = automatic,
         .scrollable = scrollable,
         .insets = x_edges,
         .order = std.fmt.parseInt(i32, value(styles, "order", "0"), 10) catch 0,
+        .placement = .{
+            .column = .{ .start = css_grid.parseLine(value(styles, "grid-column-start", "auto")) orelse .auto, .end = css_grid.parseLine(value(styles, "grid-column-end", "auto")) orelse .auto },
+            .row = .{ .start = css_grid.parseLine(value(styles, "grid-row-start", "auto")) orelse .auto, .end = css_grid.parseLine(value(styles, "grid-row-end", "auto")) orelse .auto },
+        },
     };
 }
 
-fn gridContribution(item: FormattingItem, track: grid_format.Track) grid_format.Contribution {
+fn gridContribution(item: FormattingItem, tracks: []const grid_format.Track, gap: f64) grid_format.Contribution {
+    const policy = grid_format.areaPolicy(tracks, gap);
     const margins = item.flex.item.before + item.flex.item.after;
-    var minimum = if (item.automatic_minimum and (track.min_kind != .auto or item.scrollable)) item.insets else item.flex.item.min;
-    if (item.automatic_minimum and track.max_kind == .fixed) minimum = @max(item.insets, @min(minimum, (track.max orelse track.min) - margins));
+    var minimum = if (item.automatic_minimum and (!policy.automatic_minimum or item.scrollable)) item.insets else item.flex.item.min;
+    if (item.automatic_minimum) if (policy.fixed_maximum) |cap| {
+        minimum = @max(item.insets, @min(minimum, cap - margins));
+    };
     const limits = sizing.Constraints{ .min = minimum, .max = item.flex.item.max };
     var minimum_contribution = limits.clamp(item.preferred orelse minimum);
-    if (item.automatic_minimum and track.max_kind == .fixed) minimum_contribution = @max(item.insets, @min(minimum_contribution, (track.max orelse track.min) - margins));
+    if (item.automatic_minimum) if (policy.fixed_maximum) |cap| {
+        minimum_contribution = @max(item.insets, @min(minimum_contribution, cap - margins));
+    };
     return .{
         .minimum = minimum_contribution + margins,
-        .min_content = limits.clamp(item.cross.min - margins) + margins,
-        .max_content = limits.clamp(item.cross.max - margins) + margins,
+        .min_content = limits.clamp(item.grid_transferred orelse (item.cross.min - margins)) + margins,
+        .max_content = limits.clamp(item.grid_transferred orelse (item.cross.max - margins)) + margins,
     };
 }
 
@@ -356,7 +371,7 @@ fn measureFormatting(element: dom.Element, fonts: *font.FontManager, scale: f64,
     const font_size = length.parsePixel(value(styles, "font-size", "16px")) orelse 16;
     const direction = value(styles, "flex-direction", "row");
     const column_direction = flex_format.eq(direction, "column") or flex_format.eq(direction, "column-reverse");
-    const definite_cross_height: ?f64 = if (kind == .flex and !column_direction) blk: {
+    const definite_height: ?f64 = if (kind == .grid or !column_direction) blk: {
         const edges = rootEdges(element, scale);
         const context = sizing.ResolveContext{
             .font_size = font_size,
@@ -394,7 +409,9 @@ fn measureFormatting(element: dom.Element, fonts: *font.FontManager, scale: f64,
         if (!participates(child)) continue;
         const child_scale = scale * box_model.parseCssZoom(value(child.element.style, "zoom", "1"));
         const natural = try measureContent(child, fonts, child_scale);
-        try items.append(fonts.allocator, formattingItem(child, natural, child_scale, definite_cross_height));
+        var item = formattingItem(child, natural, child_scale, if (kind == .flex) definite_height else null);
+        item.source_index = children.cursor - 1;
+        try items.append(fonts.allocator, item);
     }
     try appendAnonymous(&items, fonts.allocator, anonymous, nowrap);
     const gap = (length.resolve(value(styles, "column-gap", "normal"), .{ .font_size = font_size }) orelse 0) * scale;
@@ -418,27 +435,54 @@ fn measureFormatting(element: dom.Element, fonts: *font.FontManager, scale: f64,
             return a.order < b.order;
         }
     }.less);
-    var columns: [grid_format.tracks.max_tracks]grid_format.Track = undefined;
-    var count = grid_format.tracks.parse(value(styles, "grid-template-columns", "none"), .{ .font_size = font_size }, gap / scale, items.items.len, &columns) orelse 0;
-    if (count == 0) {
-        count = 1;
-        columns[0] = grid_format.tracks.parseTrack(value(styles, "grid-auto-columns", "auto"), .{ .font_size = font_size }) orelse .{};
-    }
-    for (columns[0..count]) |*track| {
+    var explicit_columns: [grid_format.tracks.max_tracks]grid_format.Track = undefined;
+    var explicit_rows: [grid_format.tracks.max_tracks]grid_format.Track = undefined;
+    const column_count = grid_format.tracks.parse(value(styles, "grid-template-columns", "none"), .{ .font_size = font_size }, gap / scale, items.items.len, &explicit_columns) orelse 0;
+    const row_context = length.ResolutionContext{ .font_size = font_size, .percentage_base = if (definite_height) |height| height / scale else null };
+    const row_gap = length.resolve(value(styles, "row-gap", "normal"), row_context) orelse 0;
+    const row_count = grid_format.tracks.parse(value(styles, "grid-template-rows", "none"), row_context, row_gap, items.items.len, &explicit_rows) orelse 0;
+    const placements = try fonts.allocator.alloc(grid_placement.Item, items.items.len);
+    defer fonts.allocator.free(placements);
+    for (items.items, placements) |item, *placement| placement.* = item.placement;
+    var plan = try grid_placement.place(fonts.allocator, placements, column_count, row_count, css_grid.parseFlow(value(styles, "grid-auto-flow", "row")) orelse .{});
+    defer plan.deinit(fonts.allocator);
+    const rows = try fonts.allocator.alloc(grid_format.Track, plan.row_count);
+    defer fonts.allocator.free(rows);
+    const auto_row: grid_format.Track = grid_format.tracks.parseTrack(value(styles, "grid-auto-rows", "auto"), row_context) orelse .{};
+    for (rows, 0..) |*track, i| {
+        track.* = if (i >= plan.row_offset and i - plan.row_offset < row_count) explicit_rows[i - plan.row_offset] else auto_row;
         track.min *= scale;
         if (track.max) |maximum| track.max = maximum * scale;
     }
-    var contributions: [grid_format.tracks.max_tracks]grid_format.Contribution = @splat(.{});
-    for (items.items, 0..) |item, i| {
-        const column = i % count;
-        const measured = gridContribution(item, columns[column]);
-        contributions[column].minimum = @max(contributions[column].minimum, measured.minimum);
-        contributions[column].min_content = @max(contributions[column].min_content, measured.min_content);
-        contributions[column].max_content = @max(contributions[column].max_content, measured.max_content);
+    // A fixed row area is known before column sizing. Revisit through scalar
+    // source indices so no DOM borrow is retained in the measurement vector.
+    for (items.items, plan.areas) |*item, area| {
+        const source_index = item.source_index orelse continue;
+        const height = grid_format.fixedAreaSize(rows[area.row_start .. area.row_start + area.row_span], row_gap * scale) orelse continue;
+        const child = if (source_index == 0) element.generated_before.? else if (source_index <= element.children.items.len) &element.children.items[source_index - 1] else element.generated_after.?;
+        const child_scale = scale * box_model.parseCssZoom(value(child.element.style, "zoom", "1"));
+        item.* = formattingItem(child, try measureContent(child, fonts, child_scale), child_scale, height);
+        item.source_index = source_index;
     }
-    var scratch: [grid_format.tracks.max_tracks]f64 = undefined;
-    const minimum = grid_format.intrinsicSize(columns[0..count], contributions[0..count], gap, .min_content, scratch[0..count]);
-    const maximum = grid_format.intrinsicSize(columns[0..count], contributions[0..count], gap, .max_content, scratch[0..count]);
+    const columns = try fonts.allocator.alloc(grid_format.Track, plan.column_count);
+    defer fonts.allocator.free(columns);
+    const auto_column: grid_format.Track = grid_format.tracks.parseTrack(value(styles, "grid-auto-columns", "auto"), .{ .font_size = font_size }) orelse .{};
+    for (columns, 0..) |*track, i| {
+        track.* = if (i >= plan.column_offset and i - plan.column_offset < column_count) explicit_columns[i - plan.column_offset] else auto_column;
+        track.min *= scale;
+        if (track.max) |maximum| track.max = maximum * scale;
+    }
+    const contributions = try fonts.allocator.alloc(grid_format.SpanContribution, items.items.len);
+    defer fonts.allocator.free(contributions);
+    for (plan.areas, contributions) |area, *contribution| contribution.* = .{ .start = area.column_start, .span = area.column_span };
+    grid_format.collapseEmpty(columns, contributions);
+    for (items.items, contributions) |item, *contribution| {
+        contribution.contribution = gridContribution(item, columns[contribution.start .. contribution.start + contribution.span], gap);
+    }
+    const scratch = try fonts.allocator.alloc(f64, columns.len);
+    defer fonts.allocator.free(scratch);
+    const minimum = try grid_format.intrinsicSpans(fonts.allocator, columns, contributions, gap, .min_content, scratch);
+    const maximum = try grid_format.intrinsicSpans(fonts.allocator, columns, contributions, gap, .max_content, scratch);
     return .{ .min = minimum, .max = @max(minimum, maximum) };
 }
 

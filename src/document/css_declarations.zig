@@ -15,6 +15,7 @@ const custom_properties = @import("custom_properties.zig");
 const css_flex = @import("css_flex.zig");
 const css_overflow = @import("css_overflow.zig");
 const grid_tracks = @import("grid_tracks.zig");
+const grid_placement = @import("css_grid_placement.zig");
 
 const cascade = @import("css_cascade.zig");
 
@@ -433,6 +434,8 @@ pub fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
         return grid_tracks.parse(raw_value, .{ .percentage_base = 800 }, 0, 1, &tracks) != null;
     }
     if (std.mem.eql(u8, property, "grid-auto-rows") or std.mem.eql(u8, property, "grid-auto-columns")) return grid_tracks.parseTrack(raw_value, .{ .percentage_base = 600 }) != null;
+    if (grid_placement.isLineProperty(property)) return grid_placement.parseLine(raw_value) != null;
+    if (std.mem.eql(u8, property, "grid-auto-flow")) return grid_placement.parseFlow(raw_value) != null;
     if (std.mem.eql(u8, property, "flex-direction")) return keywordIn(raw_value, &.{ "row", "row-reverse", "column", "column-reverse" });
     if (std.mem.eql(u8, property, "flex-wrap")) return keywordIn(raw_value, &.{ "nowrap", "wrap", "wrap-reverse" });
     if (std.mem.eql(u8, property, "box-sizing")) return keywordIn(raw_value, &.{ "content-box", "border-box" });
@@ -880,7 +883,7 @@ pub fn canonicalDecodedPropertyName(decoded_property: []const u8) ?[]const u8 {
 fn putCanonical(map: anytype, property: []const u8, raw_declaration: Declaration) !void {
     const is_custom = custom_properties.isName(property);
     const pending = value_tokens.hasVariable(raw_declaration.value);
-    if (!pending and (std.mem.eql(u8, property, "z-index") or std.mem.eql(u8, property, "order"))) {
+    if (!pending and (std.mem.eql(u8, property, "z-index") or std.mem.eql(u8, property, "order") or grid_placement.isPlacementProperty(property))) {
         var iterator = value_tokens.Iterator{ .input = raw_declaration.value };
         while (iterator.next()) |token| if (token.kind == .number and token.number_type != .integer) {
             return;
@@ -917,6 +920,18 @@ fn putCanonical(map: anytype, property: []const u8, raw_declaration: Declaration
         const pair = css_overflow.parsePair(declaration.value) orelse return;
         try putLonghand(map, "overflow-x", .{ .value = pair.x.text(), .important = declaration.important });
         try putLonghand(map, "overflow-y", .{ .value = pair.y.text(), .important = declaration.important });
+        return;
+    }
+    if (std.mem.eql(u8, property, "grid-row") or std.mem.eql(u8, property, "grid-column")) {
+        const values = grid_placement.axisValues(declaration.value) orelse return;
+        const names: [2][]const u8 = if (std.mem.eql(u8, property, "grid-row")) .{ "grid-row-start", "grid-row-end" } else .{ "grid-column-start", "grid-column-end" };
+        for (names, values) |name, value| try putLonghand(map, name, .{ .value = value, .important = declaration.important });
+        return;
+    }
+    if (std.mem.eql(u8, property, "grid-area")) {
+        const values = grid_placement.areaValues(declaration.value) orelse return;
+        const names = [_][]const u8{ "grid-row-start", "grid-column-start", "grid-row-end", "grid-column-end" };
+        for (names, values) |name, value| try putLonghand(map, name, .{ .value = value, .important = declaration.important });
         return;
     }
     if (std.mem.eql(u8, property, "overflow-x") or std.mem.eql(u8, property, "overflow-y")) {
