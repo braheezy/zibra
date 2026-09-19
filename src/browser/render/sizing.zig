@@ -6,6 +6,9 @@ const grammar = @import("../../document/css_sizing.zig");
 const length = @import("../../document/length.zig");
 
 pub const Intrinsic = struct { min: f64 = 0, max: f64 = 0 };
+/// Intrinsic expansion needs headroom for later integer offsets, borders and
+/// repeated layout. This also bounds existing ratio-derived contributions.
+pub const max_intrinsic_extent: f64 = 16777216;
 
 pub const Constraints = struct {
     min: f64 = 0,

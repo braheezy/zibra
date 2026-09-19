@@ -213,6 +213,26 @@ test "supports rejects unsupported formatting and animation values through share
     try std.testing.expect(try conditionText(allocator, "not (display:nonsense)", noSelectors));
 }
 
+test "supports admits atomic flex and grid through shared display grammar" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(try property(allocator, "display", "INLINE-FLEX"));
+    try std.testing.expect(try property(allocator, "display", "inline-gr\\69 d"));
+    try std.testing.expect(try matches(allocator, "(display:inline-flex) and (display:inline-grid)", noSelectors));
+    try std.testing.expect(!try property(allocator, "display", "inline flex"));
+    try std.testing.expect(!try matches(allocator, "(display:inline-grid) and (display:inline-table)", noSelectors));
+}
+
+test "supports implicit grid columns expose the implemented single track grammar" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "auto", "25%", "1fr", "min-content", "minmax(0, 1fr)", "fit-content(60px)", "inherit" }) |track| {
+        try std.testing.expect(try property(allocator, "grid-auto-columns", track));
+    }
+    for ([_][]const u8{ "none", "10px 20px", "repeat(2, 20px)", "minmax(1fr, 20px)" }) |invalid| {
+        try std.testing.expect(!try property(allocator, "grid-auto-columns", invalid));
+    }
+    try std.testing.expect(try matches(allocator, "(display:inline-grid) and (grid-auto-columns:minmax(0, 1fr))", noSelectors));
+}
+
 fn allocationQuery(allocator: std.mem.Allocator) !void {
     try std.testing.expect(try conditionText(allocator, "(border:1px solid red) and (--Theme: var(--missing, blue))", noSelectors));
     try std.testing.expect(try conditionText(allocator, "margin:1px 2px", noSelectors));

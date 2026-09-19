@@ -1,0 +1,27 @@
+rect x1=13 y1=18 x2=53 y2=38 color=#008000ff
+rect x1=63 y1=18 x2=123 y2=38 color=#00ff00ff
+rect x1=13 y1=38 x2=53 y2=58 color=#008000ff
+rect x1=63 y1=38 x2=123 y2=58 color=#00ff00ff
+transform x=13 y=58
+  rect x1=0 y1=0 x2=60 y2=20 color=#000000ff
+transform x=13 y=78
+  rect x1=0 y1=0 x2=40 y2=20 color=#008000ff
+  rect x1=50 y1=0 x2=110 y2=20 color=#00ff00ff
+transform x=13 y=98
+  rect x1=0 y1=0 x2=60 y2=20 color=#000000ff
+transform x=73 y=98
+  rect x1=0 y1=0 x2=40 y2=20 color=#008000ff
+  rect x1=50 y1=0 x2=110 y2=20 color=#00ff00ff
+transform x=13 y=128
+  rect x1=0 y1=0 x2=10 y2=10 color=#000000ff
+transform x=23 y=118
+  rect x1=0 y1=0 x2=20 y2=20 color=#008000ff
+  rect x1=0 y1=20 x2=20 y2=60 color=#00ff00ff
+transform x=43 y=128
+  rect x1=0 y1=0 x2=10 y2=10 color=#000000ff
+transform x=53 y=118
+  rect x1=0 y1=0 x2=20 y2=20 color=#008000ff
+  rect x1=0 y1=20 x2=20 y2=60 color=#00ff00ff
+rect x1=13 y1=178 x2=33 y2=198 color=#008000ff
+rect x1=13 y1=198 x2=33 y2=238 color=#00ff00ff
+rect x1=33 y1=228 x2=43 y2=238 color=#000000ff

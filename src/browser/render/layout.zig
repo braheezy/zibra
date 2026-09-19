@@ -29,6 +29,7 @@ const sizing = @import("sizing.zig");
 const box_alignment = @import("box_alignment.zig");
 const css_sizing = @import("../../document/css_sizing.zig");
 const css_alignment = @import("../../document/css_alignment.zig");
+const css_display = @import("../../document/css_display.zig");
 const grid_format = @import("grid_format.zig");
 const intrinsic_measure = @import("intrinsic_width.zig");
 const paint_effects = @import("paint_effects.zig");
@@ -74,11 +75,7 @@ pub fn documentScrollHeight(document_height_css: i32) i32 {
 }
 
 fn isBlockDisplay(value: []const u8) bool {
-    const display = std.mem.trim(u8, value, " \t\r\n");
-    return std.ascii.eqlIgnoreCase(display, "block") or
-        std.ascii.eqlIgnoreCase(display, "flex") or
-        std.ascii.eqlIgnoreCase(display, "grid") or
-        std.ascii.eqlIgnoreCase(display, "list-item");
+    return css_display.isBlock(value);
 }
 
 fn isListItemDisplay(value: []const u8) bool {
@@ -193,7 +190,7 @@ fn isContainerNode(node: Node, dependency_target: ?*ProtectedField(u64)) bool {
                     if (isBlockDisplay(value)) break :blk true;
                     // Its descendants belong to the atomic box's own context,
                     // not to this surrounding block-child classification.
-                    if (flex_format.eq(value, "inline-block")) break :blk false;
+                    if (css_display.isAtomicInline(value)) break :blk false;
                 }
             }
 
@@ -3010,7 +3007,7 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             if (self.collect_hit_test_bounds and e.children.items.len == 0) {
                 if (node_ptr) |ptr| try self.recordFragmentTargets(ptr, self.cursor_y);
             }
-            // Apply CSS styles before processing this element
+            const outer_nowrap = self.nowrap;
             try self.applyNodeStyles(e, line_buffer, true);
 
             // DOM recursion replaces the old opening/closing-tag token stream.
@@ -3028,12 +3025,12 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             if (isPreformattedElement(&e)) self.is_preformatted = true;
             defer self.is_preformatted = previous_preformatted;
 
-            // Inline-blocks are atomic line participants. Their box is
+            // Atomic inline containers are line participants. Their box is
             // painted by the completed line item instead of being flattened
             // into the anonymous inline run (which would otherwise lose an
             // empty element's width, padding, border, and background).
             if (e.style) |*styles| {
-                if (isInlineBlockDisplay(styles) and !elementUsesImageLayout(&e) and
+                if (css_display.isAtomicInline(styleValue(styles, "display") orelse "inline") and !elementUsesImageLayout(&e) and
                     !std.ascii.eqlIgnoreCase(e.tag, "input") and
                     !std.ascii.eqlIgnoreCase(e.tag, "textarea") and
                     !std.ascii.eqlIgnoreCase(e.tag, "audio") and
@@ -3042,7 +3039,7 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
                     !std.ascii.eqlIgnoreCase(e.tag, "svg") and
                     !std.ascii.eqlIgnoreCase(e.tag, "iframe"))
                 {
-                    try appendInlineBlock(self, &e, node_ptr, line_buffer);
+                    try appendAtomicInline(self, &e, node_ptr, line_buffer, outer_nowrap);
                     try self.restoreNodeStyles(line_buffer);
                     return;
                 }
@@ -3198,7 +3195,7 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
     } else null;
     if (style_map) |styles| registerReplacedSizeDependencies(self, styles);
     const vertical_align = if (style_map) |styles|
-        verticalAlignForStyle(styles, self.font_size_css)
+        self.verticalAlignForStyle(styles)
     else
         .baseline;
 
@@ -3411,7 +3408,7 @@ fn styleVisibilityHidden(style_map: *const parser.StyleMap) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "hidden");
 }
 
-fn verticalAlignForStyle(style_map: *const parser.StyleMap, font_size_css: f64) VerticalAlign {
+fn verticalAlignForStyle(self: *const Layout, style_map: *const parser.StyleMap) VerticalAlign {
     const value = std.mem.trim(
         u8,
         styleValue(style_map, "vertical-align") orelse "baseline",
@@ -3419,30 +3416,26 @@ fn verticalAlignForStyle(style_map: *const parser.StyleMap, font_size_css: f64) 
     );
     if (std.ascii.eqlIgnoreCase(value, "bottom")) return .bottom;
     if (std.ascii.eqlIgnoreCase(value, "baseline")) return .baseline;
-    if (box_model.resolveCssLength(value, .{
-        .font_size = font_size_css,
-        .percentage_base = font_size_css,
-    })) |offset| return .{ .offset = offset };
+    if (box_model.resolveSignedCssLength(value, .{
+        .font_size = self.font_size_css,
+        .percentage_base = self.font_size_css,
+    })) |offset| return .{ .offset = self.scaleActiveCssPixel(offset) };
     return .baseline;
 }
 
-fn isInlineBlockDisplay(style_map: *const parser.StyleMap) bool {
-    const value = styleValue(style_map, "display") orelse return false;
-    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "inline-block");
-}
-
-fn appendInlineBlock(
+fn appendAtomicInline(
     self: *Layout,
     element: *const parser.Element,
     node_ptr: ?*Node,
     line_buffer: *std.ArrayList(LineItem),
+    outer_nowrap: bool,
 ) !void {
     const node = node_ptr orelse return;
     const parent = self.inline_block orelse return;
-    var block = try self.measureInlineBlock(node, element, parent);
+    var block = try self.measureAtomicInline(node, element, parent);
     errdefer block.deinit();
     const outer_width = block.margin.horizontal() +| block.width;
-    if (self.cursor_x +| outer_width > self.line_right and self.cursor_x > self.line_left) {
+    if (!outer_nowrap and self.cursor_x +| outer_width > self.line_right and self.cursor_x > self.line_left) {
         try self.flushLine(line_buffer);
         self.cursor_x = self.line_left;
     }
@@ -3456,7 +3449,7 @@ fn appendInlineBlock(
         .width = block.width,
         .height = block.height +| block.margin.vertical(),
         .vertical_align = if (element.style) |*styles|
-            verticalAlignForStyle(styles, self.font_size_css)
+            self.verticalAlignForStyle(styles)
         else
             .baseline,
         .node_ptr = node_ptr,
@@ -3480,8 +3473,7 @@ fn baselineKind(raw: []const u8) ?bool {
 }
 
 fn blockBaseline(block: *const BlockLayout, last: bool) ?i32 {
-    if (block.used_inline_layout) return if (last) block.last_line_baseline else block.first_line_baseline;
-    if (block.used_formatting_context) return null;
+    if (block.used_inline_layout or block.used_formatting_context) return if (last) block.last_baseline else block.first_baseline;
     for (0..block.children.items.len) |index| {
         const child = switch (block.children.items[if (last) block.children.items.len - index - 1 else index]) {
             .block => |value| value,
@@ -3505,7 +3497,7 @@ fn isIntrinsicSize(raw: []const u8) bool {
     };
 }
 
-fn measureInlineBlock(self: *Layout, node: *Node, element: *const parser.Element, parent: *BlockLayout) !InlineBlockLayout {
+fn measureAtomicInline(self: *Layout, node: *Node, element: *const parser.Element, parent: *BlockLayout) !InlineBlockLayout {
     const styles = if (element.style) |*map| map else return error.MissingComputedStyle;
     const containing_width = self.containingBlockCssDimension(false) orelse 0;
     const containing_height = self.containingBlockCssDimension(true);
@@ -3546,7 +3538,7 @@ fn measureInlineBlock(self: *Layout, node: *Node, element: *const parser.Element
     root.allocated_box = .{
         .x = 0,
         .y = 0,
-        .width = @as(i32, @intFromFloat(@round(content_width))) +| insets,
+        .width = BlockLayout.formatCoordinate(content_width) +| insets,
         .containing_width_css = containing_width,
         .containing_height_css = containing_height,
     };
@@ -3568,26 +3560,16 @@ fn measureInlineBlock(self: *Layout, node: *Node, element: *const parser.Element
     }
     result.width = root.width.get().*;
     result.height = root.height.get().*;
-    result.ascent = if (flex_format.eq(styleValue(styles, "overflow") orelse "visible", "visible"))
-        inlineBlockBaseline(root) orelse result.height
+    // Flex/grid export their first set even when scrollable. Ordinary
+    // inline-blocks export their last line only with visible overflow.
+    const baseline = if (root.used_formatting_context)
+        blockBaseline(root, false)
+    else if (flex_format.eq(styleValue(styles, "overflow") orelse "visible", "visible"))
+        blockBaseline(root, true)
     else
-        result.height;
+        null;
+    result.ascent = if (baseline) |value| value - root.y.get().* else result.height;
     return result;
-}
-
-fn inlineBlockBaseline(block: *const BlockLayout) ?i32 {
-    if (block.used_inline_layout) return block.last_line_baseline;
-    var index = block.children.items.len;
-    while (index > 0) {
-        index -= 1;
-        const child = switch (block.children.items[index]) {
-            .block => |value| value,
-            .line => continue,
-        };
-        if (child.floatSide() != .none or isOutOfFlowPosition(child.positionMode())) continue;
-        if (inlineBlockBaseline(child)) |baseline| return baseline;
-    }
-    return null;
 }
 
 fn registerStyleDependencies(
@@ -3614,11 +3596,19 @@ fn registerIntrinsicDependencies(node: *Node, target: *ProtectedField(i32)) void
                 std.mem.startsWith(u8, name, "min-") or std.mem.startsWith(u8, name, "max-") or std.mem.eql(u8, name, "aspect-ratio") or
                 std.mem.eql(u8, name, "white-space") or std.mem.eql(u8, name, "zoom") or
                 std.mem.eql(u8, name, "position") or std.mem.eql(u8, name, "float") or std.mem.eql(u8, name, "clear") or
-                std.mem.eql(u8, name, "overflow") or std.mem.eql(u8, name, "box-sizing"))
+                std.mem.eql(u8, name, "overflow") or std.mem.eql(u8, name, "box-sizing") or
+                std.mem.startsWith(u8, name, "flex-") or std.mem.startsWith(u8, name, "grid-") or
+                std.mem.endsWith(u8, name, "-gap") or std.mem.eql(u8, name, "order") or
+                std.mem.startsWith(u8, name, "align-") or std.mem.startsWith(u8, name, "justify-"))
                 target.addDependency(entry.value_ptr, map.allocator);
         }
     }
-    if (node.* == .element) for (node.element.children.items) |*child| registerIntrinsicDependencies(child, target);
+    if (node.* == .element) {
+        for ([_]pseudo.Kind{ .before, .after }) |kind| if (activeGeneratedNode(&node.element, kind)) |generated| {
+            registerIntrinsicDependencies(generated, target);
+        };
+        for (node.element.children.items) |*child| registerIntrinsicDependencies(child, target);
+    }
 }
 
 // Legacy HTML alignment centers/right-aligns block children as well as lines.
@@ -4194,11 +4184,10 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             max_superscript_descent = @max(max_superscript_descent, item.descent);
         } else {
             has_normal_item = true;
-            if (alignment_offset >= 0) {
-                max_normal_ascent = @max(max_normal_ascent, item.ascent + alignment_offset);
-            } else {
-                max_normal_descent = @max(max_normal_descent, item.descent - alignment_offset);
-            }
+            // A first-baseline atomic box can extend far below its baseline.
+            // Both extents must contribute, including when the offset is zero.
+            max_normal_ascent = @max(max_normal_ascent, item.ascent + alignment_offset);
+            max_normal_descent = @max(max_normal_descent, item.descent - alignment_offset);
         }
     }
 
@@ -4225,8 +4214,8 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     );
     const baseline = self.cursor_y + baseline_ascent;
     if (self.inline_block) |block| {
-        if (block.first_line_baseline == null) block.first_line_baseline = baseline;
-        block.last_line_baseline = baseline;
+        if (block.first_baseline == null) block.first_baseline = baseline;
+        block.last_baseline = baseline;
     }
     const line_top = self.cursor_y;
     const line_box_height = line_height;
@@ -7105,8 +7094,10 @@ const BlockLayout = struct {
     embedded_box: ?EmbeddedBlockBox = null,
     rich_button_root: bool = false,
     inline_formatting_root: bool = false,
-    first_line_baseline: ?i32 = null,
-    last_line_baseline: ?i32 = null,
+    /// Current absolute baseline sets, copied from lines or final format items.
+    /// Consumers convert to local offsets; no line/item pointers are retained.
+    first_baseline: ?i32 = null,
+    last_baseline: ?i32 = null,
     effective_zoom_override: ?f32 = null,
     /// Present only during a formatting parent's synchronous child-layout pass.
     /// Unlike `embedded_box`, this preserves the child element's CSS edges,
@@ -8219,14 +8210,12 @@ const BlockLayout = struct {
         return nodeTableRole(self.node, null);
     }
 
-    fn formattingKind(self: *const BlockLayout) ?enum { flex, grid } {
+    fn formattingKind(self: *const BlockLayout) ?css_display.FormattingKind {
         if (self.inline_nodes != null) return null;
         const element = liveBlockElement(self) orelse return null;
         const styles = if (element.style) |*map| map else return null;
         const display = styleValue(styles, "display") orelse return null;
-        if (flex_format.eq(display, "flex")) return .flex;
-        if (flex_format.eq(display, "grid")) return .grid;
-        return null;
+        return css_display.formattingKind(display);
     }
 
     fn floatSide(self: *const BlockLayout) FloatSide {
@@ -8657,6 +8646,8 @@ const BlockLayout = struct {
         }
 
         self.used_formatting_context = self.formattingKind() != null;
+        self.first_baseline = null;
+        self.last_baseline = null;
 
         // This subtree is rebuilt and destroyed inside one surrounding line
         // layout. Its live DOM styles must invalidate the persistent outer
@@ -8997,9 +8988,15 @@ const BlockLayout = struct {
             self.normal_flow_placement
         else
             null;
+        const formatting_float = float_side != .none and self.formattingKind() != null;
         const shrink_to_fit_width = if (specified_width == null and
             (isOutOfFlowPosition(position_mode) or float_side != .none))
         shrink: {
+            if (formatting_float) {
+                const natural = try self.intrinsicContent(engine, width_scale);
+                const intrinsic = if (self.node_ptr) |node| intrinsic_measure.keywordContent(node, natural, width_scale) else natural;
+                break :shrink constrainDimension(formatCoordinate(sizing.fitContent(.{ .min = intrinsic.min, .max = intrinsic.max }, width_available)), min_width, max_width);
+            }
             const element = switch (self.node) {
                 .element => |*value| value,
                 .text => break :shrink null,
@@ -9094,10 +9091,8 @@ const BlockLayout = struct {
                     }
 
                     if (float_side != .none) {
-                        // A specified float width is enough to place the common CSS
-                        // case precisely. Auto floats use the available line width,
-                        // which keeps them deterministic until shrink-to-fit sizing
-                        // is added to the replaced/content measurement path.
+                        // Formatting floats use shared intrinsic widths. Other
+                        // auto floats retain their bounded content fallback.
                         var candidate_width = if (specified_width) |width|
                             @max(width + horizontal_insets, 0)
                         else if (shrink_to_fit_width) |width|
@@ -9166,7 +9161,7 @@ const BlockLayout = struct {
             // positioned overlays) still permits the positioned child to
             // size itself to its contents. Clamping its preferred width to
             // zero would collapse text such as Acid3's score into a column.
-            if (auto_content_width <= 0) width else @min(width, auto_content_width)
+            if (formatting_float or auto_content_width <= 0) width else @min(width, auto_content_width)
         else
             auto_content_width;
         const used_content_width = specified_width orelse
@@ -10147,6 +10142,23 @@ const BlockLayout = struct {
         return @max(formatCoordinate(height), 0);
     }
 
+    // Final item geometry supplies the scalar export. Selection follows the
+    // physical inline/block start in the supported horizontal LTR context,
+    // independently of the item's DOM position and scroll translation.
+    fn formattingBaseline(items: []const FormatItem, last: bool, reverse: bool, sharing: bool) i32 {
+        std.debug.assert(items.len > 0);
+        if (sharing) {
+            for (items) |item| {
+                if (item.cross_auto_before or item.cross_auto_after) continue;
+                if (baselineKind(item.cross_align)) |is_last| if (is_last == last) {
+                    return blockBaseline(item.block, last) orelse item.block.y.get().* +| item.block.height.get().*;
+                };
+            }
+        }
+        const item = items[if (last != reverse) items.len - 1 else 0];
+        return blockBaseline(item.block, last) orelse item.block.y.get().* +| item.block.height.get().*;
+    }
+
     fn layoutFlexItems(self: *BlockLayout, engine: *Layout, items: []FormatItem, definite_height: ?i32, column: bool, column_gap: f64, row_gap: f64) !f64 {
         if (items.len == 0) return 0;
         const main_gap = if (column) row_gap else column_gap;
@@ -10258,6 +10270,10 @@ const BlockLayout = struct {
             }
             cursor += line_cross + cross_gap + distribution.between;
         }
+        const first_line = lines.items[if (wrap_reverse) lines.items.len - 1 else 0];
+        const last_line = lines.items[if (wrap_reverse) 0 else lines.items.len - 1];
+        self.first_baseline = formattingBaseline(items[first_line.start..first_line.end], false, reverse, !column);
+        self.last_baseline = formattingBaseline(items[last_line.start..last_line.end], true, reverse, !column);
         return if (column) main_size else cross_size orelse total_cross;
     }
 
@@ -10283,7 +10299,7 @@ const BlockLayout = struct {
         var column_count = grid_format.tracks.parse(self.formatStyle("grid-template-columns", "none"), .{ .font_size = self.computedFontSizeCss(), .percentage_base = @as(f64, @floatFromInt(self.content_width)) / scale }, column_gap / scale, items.len, &columns) orelse 0;
         if (column_count == 0) {
             column_count = 1;
-            columns[0] = .{};
+            columns[0] = grid_format.tracks.parseTrack(self.formatStyle("grid-auto-columns", "auto"), .{ .font_size = self.computedFontSizeCss(), .percentage_base = @as(f64, @floatFromInt(self.content_width)) / scale }) orelse .{};
         }
         for (columns[0..column_count]) |*track| {
             track.min *= scale;
@@ -10400,6 +10416,11 @@ const BlockLayout = struct {
             };
             try self.placeFormatItem(engine, item, x + x_offset, y + y_offset, width, height, .{ .area_width = widths[col], .area_height = heights[row], .grid_area = true, .height_definite = stretch or item.height_authored or (item.ratio != null and ((!item.width_auto and !isIntrinsicSize(item.block.formatStyle("width", "auto"))) or flex_format.eq(justify, "stretch"))) });
             x += widths[col] + column_gap + column_distribution.between;
+        }
+        if (items.len > 0) {
+            self.first_baseline = formattingBaseline(items[0..@min(column_count, items.len)], false, false, true);
+            const last_start = (items.len - 1) / column_count * column_count;
+            self.last_baseline = formattingBaseline(items[last_start..], true, false, true);
         }
         return total_height;
     }
@@ -11512,8 +11533,8 @@ test "block focus boxes replace line fragments without hiding descendants" {
 }
 
 fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool) !void {
-    block.first_line_baseline = null;
-    block.last_line_baseline = null;
+    block.first_baseline = null;
+    block.last_baseline = null;
     const snapshot = snapshotInlineState(self);
     const previous_target = self.current_display_target;
     const previous_inline_block = self.inline_block;

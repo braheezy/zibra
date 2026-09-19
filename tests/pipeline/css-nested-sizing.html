@@ -1,0 +1,31 @@
+<!doctype html>
+<html><head><style>
+body { margin:0 }
+main { width:300px }
+.first { width:40px; height:20px; background:green }
+.second { width:60px; height:20px; background:lime }
+#outer-flex { display:flex; width:max-content }
+#inner-grid { display:grid; grid-template-columns:auto auto; gap:10px }
+#outer-grid { display:grid; grid-template-columns:auto; width:max-content }
+#inner-flex { display:flex; gap:10px }
+.line { width:150px; font-size:0; line-height:0 }
+.prefix { display:inline-block; width:60px; height:20px; background:black }
+.badge { display:inline-flex; gap:10px }
+#nowrap { white-space:nowrap }
+#baselines { font-size:0; line-height:0 }
+.marker { display:inline-block; width:10px; height:10px; background:black }
+#baseline-flex { display:inline-flex; flex-direction:column }
+#baseline-grid { display:inline-grid; grid-template-columns:20px; grid-template-rows:20px 40px }
+.top { width:20px; height:20px; background:green }
+.bottom { width:20px; height:40px; background:lime }
+#last-baseline { display:flex; align-items:last baseline }
+#last-column { display:flex; flex-direction:column }
+#last-marker { width:10px; height:10px; background:black }
+</style></head><body><main>
+<div id="outer-flex"><div id="inner-grid"><div class="first"></div><div class="second"></div></div></div>
+<div id="outer-grid"><div id="inner-flex"><div class="first"></div><div class="second"></div></div></div>
+<div class="line"><span class="prefix"></span><span class="badge"><span class="first"></span><span class="second"></span></span></div>
+<div id="nowrap" class="line"><span class="prefix"></span><span class="badge"><span class="first"></span><span class="second"></span></span></div>
+<div id="baselines"><span class="marker"></span><span id="baseline-flex"><span class="top"></span><span class="bottom"></span></span><span class="marker"></span><span id="baseline-grid"><span class="top"></span><span class="bottom"></span></span></div>
+<div id="last-baseline"><div id="last-column"><div class="top"></div><div class="bottom"></div></div><div id="last-marker"></div></div>
+</main></body></html>

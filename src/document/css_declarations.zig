@@ -399,10 +399,7 @@ pub fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     if (isCssWideKeyword(raw_value)) return true;
     // These values select real formatting/paint behavior. Rejecting arbitrary
     // tokens here keeps declarations, CSSOM edits and feature queries aligned.
-    if (std.mem.eql(u8, property, "display")) return keywordIn(raw_value, &.{
-        "none",  "inline",          "block",              "inline-block",       "flex",      "grid",       "list-item",
-        "table", "table-row-group", "table-header-group", "table-footer-group", "table-row", "table-cell",
-    });
+    if (std.mem.eql(u8, property, "display")) return @import("css_display.zig").valid(raw_value);
     if (std.mem.eql(u8, property, "position")) return keywordIn(raw_value, &.{ "static", "relative", "absolute", "fixed", "sticky" });
     if (std.mem.eql(u8, property, "float")) return keywordIn(raw_value, &.{ "none", "left", "right" });
     if (std.mem.eql(u8, property, "clear")) return keywordIn(raw_value, &.{ "none", "left", "right", "both" });
@@ -434,7 +431,7 @@ pub fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
         var tracks: [grid_tracks.max_tracks]grid_tracks.Track = undefined;
         return grid_tracks.parse(raw_value, .{ .percentage_base = 800 }, 0, 1, &tracks) != null;
     }
-    if (std.mem.eql(u8, property, "grid-auto-rows")) return grid_tracks.parseTrack(raw_value, .{ .percentage_base = 600 }) != null;
+    if (std.mem.eql(u8, property, "grid-auto-rows") or std.mem.eql(u8, property, "grid-auto-columns")) return grid_tracks.parseTrack(raw_value, .{ .percentage_base = 600 }) != null;
     if (std.mem.eql(u8, property, "flex-direction")) return keywordIn(raw_value, &.{ "row", "row-reverse", "column", "column-reverse" });
     if (std.mem.eql(u8, property, "flex-wrap")) return keywordIn(raw_value, &.{ "nowrap", "wrap", "wrap-reverse" });
     if (std.mem.eql(u8, property, "box-sizing")) return keywordIn(raw_value, &.{ "content-box", "border-box" });
@@ -1083,6 +1080,39 @@ test "shared sizing declarations preserve multi-token alignment and invalid fall
     try std.testing.expectEqualStrings("min-content", map.get("flex-basis").?.value);
     try putRaw(&map, "flex-basis", "calc(100% - 10px)");
     try std.testing.expectEqualStrings("calc(100% - 10px)", map.get("flex-basis").?.value);
+}
+
+test "atomic formatting display declarations preserve canonical values and cascade priority" {
+    var map = Map.init(std.testing.allocator);
+    defer map.deinit();
+    try putRaw(&map, "display", "block");
+    try putRaw(&map, "display", "INLINE-FLEX");
+    try std.testing.expectEqualStrings("inline-flex", map.get("display").?.value);
+    try putRaw(&map, "display", "inline flex");
+    try std.testing.expectEqualStrings("inline-flex", map.get("display").?.value);
+    try putRaw(&map, "display", "inline-gr\\69 d !important");
+    try putRaw(&map, "display", "grid");
+    try std.testing.expectEqualStrings("inline-grid", map.get("display").?.value);
+    try std.testing.expect(map.get("display").?.important);
+    try putRaw(&map, "display", "inline-table !important");
+    try std.testing.expectEqualStrings("inline-grid", map.get("display").?.value);
+}
+
+test "implicit grid columns share single track admission and retain valid fallback" {
+    try std.testing.expectEqualStrings("auto", @import("css_properties.zig").get("grid-auto-columns").?.default_value);
+    var map = Map.init(std.testing.allocator);
+    defer map.deinit();
+    for ([_][]const u8{ "auto", "40px", "25%", "min-content", "max-content", "1fr", "minmax(0, 1fr)", "fit-content(60px)" }) |track| {
+        try putRaw(&map, "grid-auto-columns", track);
+        try putRaw(&map, "grid-auto-rows", track);
+        try std.testing.expectEqualStrings(map.get("grid-auto-rows").?.value, map.get("grid-auto-columns").?.value);
+    }
+    try putRaw(&map, "grid-auto-columns", "minmax(20px, 1fr) !important");
+    for ([_][]const u8{ "none", "10px 20px", "repeat(2, 20px)", "minmax(1fr, 20px)" }) |invalid| {
+        try putParsed(&map, "grid-auto-columns", invalid, true);
+        try std.testing.expectEqualStrings("minmax(20px, 1fr)", map.get("grid-auto-columns").?.value);
+    }
+    try std.testing.expect(map.get("grid-auto-columns").?.important);
 }
 
 test "parsed declarations use explicit priority without interpreting retained bangs" {

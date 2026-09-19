@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const alignment = @import("box_alignment.zig");
+const sizing = @import("sizing.zig");
 
 pub const Item = struct {
     basis: f64,
@@ -21,6 +22,120 @@ pub const Item = struct {
 
 pub const Used = struct { size: f64 = 0, offset: f64 = 0, frozen: bool = false };
 pub const Distribution = alignment.Distribution;
+
+pub const IntrinsicItem = struct {
+    item: Item,
+    /// Border-box contributions before margins, including preferred-size and
+    /// minimum/maximum contribution policy from the synchronous collector.
+    min_content: f64,
+    max_content: f64,
+    /// The numeric basis was measured from content, including an unresolved
+    /// percentage or intrinsic keyword. It cannot freeze that contribution at
+    /// the measured max-content width merely because flex-shrink is zero.
+    content_basis: bool = false,
+};
+
+/// Intrinsic row widths for the supported single-line compatibility algorithm
+/// and wrapping minimum. Storage is borrowed; no item or DOM pointer survives.
+pub fn intrinsicSize(items: []const IntrinsicItem, gap: f64, wrap: bool) sizing.Intrinsic {
+    var minimum: f64 = 0;
+    if (wrap) {
+        for (items) |entry| {
+            const item = entry.item;
+            var contribution = entry.min_content;
+            if (!entry.content_basis) {
+                if (item.grow == 0) contribution = @min(contribution, item.basis);
+                if (item.shrink == 0) contribution = @max(contribution, item.basis);
+            }
+            minimum = @max(minimum, clamp(item, contribution) + item.before + item.after);
+        }
+    } else minimum = intrinsicLine(items, gap, false);
+    minimum = std.math.clamp(minimum, 0, sizing.max_intrinsic_extent);
+    return .{ .min = minimum, .max = @max(minimum, @min(intrinsicLine(items, gap, true), sizing.max_intrinsic_extent)) };
+}
+
+fn intrinsicLine(items: []const IntrinsicItem, gap: f64, maximum: bool) f64 {
+    if (items.len == 0) return 0;
+    var fraction: f64 = 0;
+    var factors: f64 = 0;
+    for (items) |entry| {
+        const item = entry.item;
+        const contribution = if (maximum) entry.max_content else entry.min_content;
+        const delta = contribution - item.basis;
+        if (delta > 0 and item.grow > 0) {
+            fraction = @max(fraction, if (item.grow >= 1) delta / item.grow else delta * item.grow);
+        }
+        factors = @min(factors + item.grow, 1);
+    }
+    if (fraction > 0 and factors > 0 and factors < 1) fraction /= factors;
+    var total = gap * @as(f64, @floatFromInt(items.len - 1));
+    for (items) |entry| {
+        const item = entry.item;
+        const contribution = if (maximum) entry.max_content else entry.min_content;
+        // Compatibility: independently shrinking intrinsic contributions must
+        // not be expanded to match the least-negative sibling fraction. This
+        // keeps a wrapping float/text item narrow beside an empty flex item.
+        const target = if (fraction > 0)
+            item.basis + fraction * item.grow
+        else if (entry.content_basis or (contribution < item.basis and item.shrink > 0))
+            contribution
+        else
+            item.basis;
+        total = std.math.clamp(total + clamp(item, target) + item.before + item.after, -sizing.max_intrinsic_extent, sizing.max_intrinsic_extent);
+    }
+    return @max(total, 0);
+}
+
+test "flex intrinsic nowrap and wrap distinguish gaps margins and inflexible bases" {
+    const items = [_]IntrinsicItem{
+        .{ .item = .{ .basis = 200, .min = 100, .grow = 1 }, .min_content = 100, .max_content = 300 },
+        .{ .item = .{ .basis = 400, .min = 50, .grow = 1, .before = 20 }, .min_content = 100, .max_content = 400 },
+    };
+    const single = intrinsicSize(&items, 10, false);
+    try std.testing.expectEqual(@as(f64, 230), single.min);
+    try std.testing.expectEqual(@as(f64, 830), single.max);
+    const wrapped = intrinsicSize(&items, 10, true);
+    try std.testing.expectEqual(@as(f64, 120), wrapped.min);
+    try std.testing.expectEqual(single.max, wrapped.max);
+    var frozen = items;
+    frozen[0].item.shrink = 0;
+    try std.testing.expectEqual(@as(f64, 330), intrinsicSize(&frozen, 10, false).min);
+    frozen[0].item.grow = 0;
+    frozen[0].item.basis = 50;
+    try std.testing.expectEqual(@as(f64, 230), intrinsicSize(&frozen, 10, false).min);
+}
+
+test "flex intrinsic compatibility allows independent shrinking and proportional growth" {
+    const shrinking = [_]IntrinsicItem{
+        .{ .item = .{ .basis = 400, .min = 100 }, .min_content = 100, .max_content = 400 },
+        .{ .item = .{ .basis = 0 }, .min_content = 0, .max_content = 0 },
+    };
+    try std.testing.expectEqual(@as(f64, 100), intrinsicSize(&shrinking, 0, false).min);
+    const growing = [_]IntrinsicItem{
+        .{ .item = .{ .basis = 50, .grow = 1, .shrink = 0 }, .min_content = 200, .max_content = 200 },
+        .{ .item = .{ .basis = 100, .grow = 2, .shrink = 0 }, .min_content = 200, .max_content = 200 },
+    };
+    try std.testing.expectEqual(@as(f64, 600), intrinsicSize(&growing, 0, false).min);
+    var huge = growing;
+    huge[0].item.grow = 1e308;
+    huge[1].item.grow = 1e308;
+    try std.testing.expectApproxEqAbs(@as(f64, 450), intrinsicSize(&huge, 0, false).max, 0.0001);
+    huge[0].item.grow = 1;
+    try std.testing.expectEqual(sizing.max_intrinsic_extent, intrinsicSize(&huge, 0, false).max);
+}
+
+test "flex intrinsic content basis does not freeze an unresolved percentage minimum" {
+    var items = [_]IntrinsicItem{
+        .{ .item = .{ .basis = 240, .grow = 1, .shrink = 0, .min = 80 }, .min_content = 80, .max_content = 240, .content_basis = true },
+        .{ .item = .{ .basis = 50 }, .min_content = 50, .max_content = 50 },
+    };
+    try std.testing.expectEqual(@as(f64, 130), intrinsicSize(&items, 0, false).min);
+    try std.testing.expectEqual(@as(f64, 290), intrinsicSize(&items, 0, false).max);
+    try std.testing.expectEqual(@as(f64, 80), intrinsicSize(&items, 10, true).min);
+    items[0].content_basis = false;
+    try std.testing.expectEqual(@as(f64, 290), intrinsicSize(&items, 0, false).min);
+    try std.testing.expectEqual(@as(f64, 240), intrinsicSize(&items, 10, true).min);
+}
 
 pub fn distribute(keyword: []const u8, free_space: f64, count: usize) Distribution {
     return alignment.distribute(keyword, free_space, count, false);

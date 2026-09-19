@@ -27,6 +27,18 @@ pub const Case = struct {
 
 const existing_cases = [_]Case{
     .{
+        .name = "css-nested-sizing-layout",
+        .mode = .layout,
+        .fixture = "tests/pipeline/css-nested-sizing.html",
+        .golden = "tests/golden/pipeline/css-nested-sizing.layout.txt",
+    },
+    .{
+        .name = "css-nested-sizing-display-list",
+        .mode = .display_list,
+        .fixture = "tests/pipeline/css-nested-sizing.html",
+        .golden = "tests/golden/pipeline/css-nested-sizing.display-list.txt",
+    },
+    .{
         .name = "css-shared-sizing-layout",
         .mode = .layout,
         .fixture = "tests/pipeline/css-shared-sizing.html",

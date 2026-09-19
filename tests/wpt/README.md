@@ -969,8 +969,9 @@ Run it with an already built browser:
 python3 tests/wpt/run.py tests/wpt/manifest-css-shared-sizing.yaml --mode all --jobs 1 --browser ./zig-out/bin/zibra --report /tmp/zibra-shared-sizing.json
 ```
 
-Keep unsupported vertical writing and inline flex/grid cases separate from
-horizontal geometry failures when interpreting mixed upstream files. Grid
+The first-pass checkpoint below predates inline flex/grid support. Keep
+unsupported vertical writing separate from horizontal geometry failures when
+interpreting mixed upstream files. Grid
 alignment helpers require `parentElement`; track-sizing assertions require
 used track sizes from CSSOM, and later cases require grid spans. The
 shrink-after-removal case also has a script error before removing its child.
@@ -991,6 +992,60 @@ axes described above. These numbers measure this focused selection, not the
 entire CSS suite. See the
 [implementation record](../../docs/plans/shared-sizing-alignment.md#focused-upstream-result-and-remaining-work)
 for validation and remaining limitations.
+
+## Nested sizing and inline formatting
+
+[`manifest-css-shared-sizing-phase2.yaml`](manifest-css-shared-sizing-phase2.yaml)
+selects 37 unchanged upstream files: 16 testharness, 18 reftests and three
+crashtests. It covers nested flex/grid intrinsic contributions, inline flex/grid
+admission and geometry, percentage-size relayout, image-load invalidation, and
+first/last container baselines. The implicit-column parsing/computed cases
+exercise `grid-auto-columns`, retaining unsupported multiple-track lists and
+computed expression simplification. Keep the original 49-file shared-sizing
+selection and its reports as a separate regression set. Both selections are
+already included by the default manifest's CSS directory; expectations remain
+PASS.
+
+```sh
+python3 tests/wpt/run.py tests/wpt/manifest-css-shared-sizing-phase2.yaml --mode all --jobs 1 --browser ./zig-out/bin/zibra --report /tmp/zibra-nested-sizing.json
+```
+
+Interpret the mixed files by prerequisite. The baseline-flex harness uses
+unsupported `inline-size`/`block-size` in its wrapping groups; grid baseline
+and fraction cases use unsupported grid shorthands. The four horizontal
+multi-item/multiline flex baseline reftests require `vertical-align: top` in
+their references, which declaration admission does not yet support. The
+general inline-grid reftest also uses that alignment and a table reference;
+the empty inline-grid reftest has an XHTML/CDATA reference. The max-content
+grid-item square depends on Ahem's fixed glyph advances, while the engine
+currently falls back to its proportional system font. A synthesized-baseline
+reftest passing with empty vertical/sideways items does not establish writing
+mode or Ahem support.
+
+The implicit-column valid tests retain unsupported `ex`/`vmin` lengths and
+multiple-track lists. Their computed tests also expect simplification of
+`calc()` expressions, including expressions inside track functions. The Gmail
+table case in `row-compat-001.html` requires `table-layout: fixed`. Two further
+reftest failures remain unisolated: `flexbox_nested-flex.html` compares against
+a generated `::after` block, and `grid-inline-margins-no-collapse-001.html`
+compares a body inline grid against a floated paragraph. Their persistent
+failures do not justify classifying them as either corrected geometry or
+missing prerequisites. Keep these tests and all upstream expectations
+intact.
+
+Additional grid intrinsic candidates require
+`document.fonts.ready`, used track-size CSSOM, or grid spans, so they are not
+part of this focused selection. Independent overflow axes remain in the
+original regression selection and are outside this follow-up's scope.
+
+The text-free [pipeline fixture](../pipeline/css-nested-sizing.html) isolates
+the supported nested widths, atomic lines and baseline geometry in layout and
+display-list goldens, including content below an exported first baseline. The
+[manual fixture](../manual/css-nested-sizing.html) runs initial, changed and
+reset dimensions through the local WPT gate, and exposes inline link/control
+interaction checks. See the
+[reviewed design](../../docs/plans/shared-sizing-alignment-followup.md) for
+ownership, supported topology and validation boundaries.
 
 ## Ordinary block aspect ratios
 

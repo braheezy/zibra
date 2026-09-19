@@ -66,17 +66,24 @@ boundaries.
   Row groups retain real boxes but share their table's columns, including
   `tbody` inserted by the live parser; do not flatten them out of the DOM.
 - `flex_format.zig` and `grid_format.zig` own pointer-free item and track
-  sizing. Flex inner bases determine shrink weights; border boxes consume
-  space. Grid track kinds and minimum/min-content/max-content contributions
-  remain distinct. `layout.zig` owns item boxes, subscriptions, allocation
-  provenance and final hit-test collection.
+  sizing, including intrinsic constraints. Flex inner bases determine shrink
+  weights; border boxes consume space. Grid track kinds and minimum/min-content/
+  max-content contributions remain distinct, as do min-content and max-content
+  constraints. Intrinsic expansion uses `sizing.max_intrinsic_extent` to retain
+  integer-layout headroom. `layout.zig` owns item boxes, subscriptions, allocation
+  provenance, final baseline scalars and hit-test collection. Use
+  `document/css_display.zig` to distinguish the inner format from an atomic
+  inline outer box; inline flex/grid reuse the existing atomic snapshot owner.
 - `intrinsic_width.zig` synchronously borrows DOM and FontManager for bounded
   measurement. `measureContent` returns raw root content; `keywordContent`
   separately transfers definite height through a nonreplaced ratio for width
   keywords. `measure` applies that transfer and root constraints to content,
   and `measureOuter` adds root edges and margins.
-  Keep their replaced-element policy explicit; none retains DOM/layout/glyph
-  pointers. Register descendant reads through the persistent formatting owner.
+  Keep their replaced-element policy explicit; temporary vectors contain scalar
+  records, never retained DOM/layout/glyph pointers. Match final direct-item
+  topology, including private generated children and anonymous text boundaries
+  around nonparticipating elements. Register descendant reads through the
+  persistent formatting owner, including gaps, tracks, factors and ordering.
   Native input natural widths must agree between intrinsic and final layout;
   table measurements subscribe through persistent owners, not temporary cells.
   Image min/max constraints share `replaced_sizing.zig` across intrinsic and

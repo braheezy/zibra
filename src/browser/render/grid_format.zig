@@ -1,6 +1,7 @@
 //! Scalar grid track sizing for fixed, intrinsic, fractional and minmax tracks.
 //! Receives no DOM, retained layout object or dependency-bearing field.
 const std = @import("std");
+const sizing = @import("sizing.zig");
 pub const tracks = @import("../../document/grid_tracks.zig");
 pub const Track = tracks.Track;
 
@@ -9,6 +10,30 @@ pub const Contribution = struct {
     min_content: f64 = 0,
     max_content: f64 = 0,
 };
+
+pub const IntrinsicConstraint = enum { min_content, max_content };
+
+/// Intrinsic extent of the existing single-span track topology. Scratch holds
+/// scalar track sizes and remains caller-owned. There is no percentage basis.
+pub fn intrinsicSize(input: []const Track, intrinsic: []const Contribution, gap: f64, constraint: IntrinsicConstraint, scratch: []f64) f64 {
+    std.debug.assert(input.len == intrinsic.len and input.len == scratch.len);
+    if (input.len == 0) return 0;
+    for (input, intrinsic, scratch) |track, contribution, *used| {
+        used.* = if (track.min_kind == .auto) @max(contribution.minimum, if (track.max_kind == .fixed)
+            @min(contribution.min_content, track.max orelse track.min)
+        else
+            contribution.min_content) else baseSize(track, contribution);
+        used.* = @max(used.*, 0);
+    }
+    // Min-content leaves no free space for track maximization or fr expansion.
+    if (constraint == .max_content) resolveIndefinite(input, intrinsic, scratch);
+    var total = gap * @as(f64, @floatFromInt(input.len - 1));
+    for (scratch) |*used| {
+        used.* = @min(used.*, sizing.max_intrinsic_extent);
+        total = @min(total + used.*, sizing.max_intrinsic_extent);
+    }
+    return std.math.clamp(total, 0, sizing.max_intrinsic_extent);
+}
 
 fn baseSize(track: Track, intrinsic: Contribution) f64 {
     return @max(0, switch (track.min_kind) {
@@ -30,6 +55,45 @@ fn growthLimit(track: Track, intrinsic: Contribution, base: f64) f64 {
     });
 }
 
+fn resolveIndefinite(input: []const Track, intrinsic: []const Contribution, output: []f64) void {
+    var unit: f64 = 0;
+    for (input, intrinsic, output) |track, contribution, *used| {
+        if (track.max_kind == .fraction) {
+            if (track.fraction > 0) unit = @max(unit, @max(used.*, contribution.max_content) / @max(track.fraction, 1));
+        } else used.* = growthLimit(track, contribution, used.*);
+    }
+    for (input, output) |track, *used| if (track.fraction > 0) {
+        used.* = @max(used.*, unit * track.fraction);
+    };
+}
+
+test "grid intrinsic constraints separate auto minima from zero fractional minima" {
+    var parsed: [tracks.max_tracks]Track = undefined;
+    const count = tracks.parse("auto minmax(0,1fr) 1fr 30px", .{}, 10, 4, &parsed).?;
+    const contributions = [_]Contribution{
+        .{ .minimum = 0, .min_content = 40, .max_content = 100 },
+        .{ .minimum = 0, .min_content = 50, .max_content = 80 },
+        .{ .minimum = 20, .min_content = 60, .max_content = 120 },
+        .{},
+    };
+    var scratch: [4]f64 = undefined;
+    try std.testing.expectEqual(@as(f64, 160), intrinsicSize(parsed[0..count], &contributions, 10, .min_content, &scratch));
+    try std.testing.expectEqual(@as(f64, 400), intrinsicSize(parsed[0..count], &contributions, 10, .max_content, &scratch));
+    try std.testing.expectEqual(@as(f64, 120), scratch[1]);
+    try std.testing.expectEqual(@as(f64, 120), scratch[2]);
+}
+
+test "grid intrinsic fixed maxima limit auto contributions but preserve explicit minima" {
+    var parsed: [tracks.max_tracks]Track = undefined;
+    const count = tracks.parse("minmax(auto,50px) fit-content(60px) max-content", .{}, 0, 3, &parsed).?;
+    var contributions = [_]Contribution{.{ .minimum = 0, .min_content = 80, .max_content = 120 }} ** 3;
+    var scratch: [3]f64 = undefined;
+    try std.testing.expectEqual(@as(f64, 250), intrinsicSize(parsed[0..count], &contributions, 0, .min_content, &scratch));
+    try std.testing.expectEqual(@as(f64, 250), intrinsicSize(parsed[0..count], &contributions, 0, .max_content, &scratch));
+    contributions[0].minimum = 90;
+    try std.testing.expectEqual(@as(f64, 290), intrinsicSize(parsed[0..count], &contributions, 0, .min_content, &scratch));
+}
+
 /// Resolve current single-span track contributions. Definite space grows
 /// intrinsic tracks to their limits before flexible tracks absorb the rest;
 /// only auto maximums receive alignment stretch. Storage remains caller-owned.
@@ -38,15 +102,7 @@ pub fn resolve(input: []const Track, intrinsic: []const Contribution, available:
     if (input.len == 0) return;
     for (input, intrinsic, output) |track, contribution, *used| used.* = baseSize(track, contribution);
     const extent = available orelse {
-        var unit: f64 = 0;
-        for (input, intrinsic, output) |track, contribution, *used| {
-            if (track.max_kind == .fraction) {
-                if (track.fraction > 0) unit = @max(unit, @max(used.*, contribution.max_content) / @max(track.fraction, 1));
-            } else used.* = growthLimit(track, contribution, used.*);
-        }
-        for (input, output) |track, *used| if (track.fraction > 0) {
-            used.* = @max(used.*, unit * track.fraction);
-        };
+        resolveIndefinite(input, intrinsic, output);
         return;
     };
 

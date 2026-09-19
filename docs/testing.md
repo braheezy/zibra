@@ -195,6 +195,17 @@ retains failing cases and all three runnable categories. See the
 [WPT notes](../tests/wpt/README.md#shared-sizing-and-alignment) for prerequisite
 limitations and the existing default CSS coverage.
 
+The follow-up [`css-nested-sizing` pipeline fixture](../tests/pipeline/css-nested-sizing.html)
+adds nested flex/grid intrinsic widths, atomic inline wrapping/nowrap and
+first/last container baselines without font-dependent text. Both layout and
+display-list goldens check container extent and positioned atomic paint. Its
+[manual counterpart](../tests/manual/css-nested-sizing.html) checks immediate
+geometry after gap, child width, flex basis, track and display changes, then
+provides link/button interactions inside an inline badge. It also runs in
+`test-wpt`. Preserve the original upstream selection and use the separate
+[phase-two manifest](../tests/wpt/manifest-css-shared-sizing-phase2.yaml) for
+before/after comparisons; see the [coverage notes](../tests/wpt/README.md#nested-sizing-and-inline-formatting).
+
 Dump and screenshot modes accept `--viewport WIDTHxHEIGHT` (default 800x600,
 each dimension 1–8192). Dumps use the entire size for document geometry and
 width/height media queries. Screenshots use that presentation size, with the

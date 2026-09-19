@@ -81,6 +81,9 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
 
 ## CSS rules
 
+- `css_display.zig` shares the supported display vocabulary and distinguishes
+  inner flex/grid formatting from outer atomic-inline participation. Keep
+  admission, intrinsic measurement and final layout dispatch consistent.
 - `css_aspect_ratio.zig` owns ratio admission and serialization for both ordinary
   and replaced boxes. Degenerate ratios are valid syntax with no used ratio.
 - `css_sizing.zig` owns preferred/minimum/maximum sizing value admission;

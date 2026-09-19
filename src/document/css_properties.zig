@@ -135,6 +135,7 @@ pub const computed = svgProperties() ++ [_]Property{
     .{ .name = "grid-template-columns", .default_value = "none" },
     .{ .name = "grid-template-rows", .default_value = "none" },
     .{ .name = "grid-auto-rows", .default_value = "auto" },
+    .{ .name = "grid-auto-columns", .default_value = "auto" },
     .{ .name = "position", .default_value = "static" },
     .{ .name = "top", .default_value = "auto", .serialization = .length },
     .{ .name = "right", .default_value = "auto", .serialization = .length },

@@ -1,0 +1,106 @@
+<!doctype html>
+<!-- How to verify: status must say PASS. Each nested panel initially spans
+     110px. The narrow row wraps its badge as one box; the nowrap row keeps it
+     beside the prefix. Small baseline markers align with the first row of
+     each tall badge. Toggle repeatedly, then click Link and Count; the counts
+     must update, including after resizing the window. -->
+<html><head><meta charset="utf-8"><title>Nested sizing and inline badges</title>
+<style>
+body { margin:24px; font:16px sans-serif; color:#17202a; background:white }
+h1 { font-size:24px }
+.demo { margin:12px 0; outline:1px solid #94a3b8 }
+.tile { height:20px; background:#15803d }
+.first { width:40px }
+.second { width:60px; background:#86efac }
+#flex-panel { display:flex; width:max-content }
+#grid-in-flex { display:grid; grid-template-columns:auto auto; gap:10px }
+#grid-panel { display:grid; grid-template-columns:auto; width:max-content }
+#flex-in-grid { display:flex; gap:10px }
+#flex-in-grid > div { flex:0 0 auto }
+#track-badge { display:inline-grid; grid-template-columns:40px 60px; gap:10px }
+#display-panel { display:flex; width:max-content }
+#display-inner { display:flex; gap:10px }
+.line { width:150px; font-size:0; line-height:0; background:#f0fdf4 }
+.prefix { display:inline-block; width:60px; height:20px; background:#334155 }
+.badge { display:inline-flex; gap:10px }
+#nowrap { white-space:nowrap }
+#first-baselines { font-size:0; line-height:0 }
+.marker { display:inline-block; width:10px; height:10px; background:#334155 }
+.tall-flex { display:inline-flex; flex-direction:column }
+.tall-grid { display:inline-grid; grid-template-columns:20px; grid-template-rows:20px 40px }
+.top { width:20px; height:20px; background:#15803d }
+.bottom { width:20px; height:40px; background:#86efac }
+#last-baseline { display:flex; align-items:last baseline; width:100px }
+#last-column { display:flex; flex-direction:column }
+#last-marker { width:10px; height:10px; background:#334155 }
+#actions { display:inline-flex; gap:8px; padding:8px; background:#dcfce7 }
+#action { display:block; width:40px }
+</style></head><body>
+<h1 id="status">Checking nested sizing</h1>
+<button id="toggle">Toggle dimensions</button><p id="details"></p>
+<p>Grid inside a shrink-wrapped flex panel</p>
+<div id="flex-panel" class="demo"><div id="grid-in-flex"><div id="changing-child" class="tile first"></div><div class="tile second"></div></div></div>
+<p>Flex inside a shrink-wrapped grid panel</p>
+<div id="grid-panel" class="demo"><div id="flex-in-grid"><div class="tile first"></div><div id="changing-basis" class="tile second"></div></div></div>
+<p>Inline grid with explicit tracks</p>
+<div><div id="track-badge" class="demo"><div class="tile"></div><div class="tile second" style="width:auto"></div></div></div>
+<p>Switch the inner panel between flex and grid</p>
+<div id="display-panel" class="demo"><div id="display-inner"><div class="tile first"></div><div class="tile second"></div></div></div>
+<p>Atomic wrapping and nowrap</p>
+<div id="wrap" class="line demo"><span id="wrap-prefix" class="prefix"></span><span id="wrap-badge" class="badge"><span class="tile first"></span><span class="tile second"></span></span></div>
+<div id="nowrap" class="line demo"><span class="prefix"></span><span id="nowrap-badge" class="badge"><span class="tile first"></span><span class="tile second"></span></span></div>
+<p>First and last exported baselines</p>
+<div id="first-baselines" class="demo"><span id="first-marker" class="marker"></span><span id="baseline-flex" class="tall-flex"><span class="top"></span><span class="bottom"></span></span><span id="grid-marker" class="marker"></span><span id="baseline-grid" class="tall-grid"><span class="top"></span><span class="bottom"></span></span></div>
+<div id="last-baseline" class="demo"><div id="last-column"><div class="top"></div><div class="bottom"></div></div><div id="last-marker"></div></div>
+<p>Interaction inside an inline badge</p>
+<div id="actions"><a id="action" href="#actions">Link</a><button id="action-button">Count</button></div>
+<p id="interaction">Link: 0, Count: 0</p>
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+  var alternate=false,links=0,counts=0;
+  function element(id){return document.getElementById(id);}
+  function rect(id){return element(id).getBoundingClientRect();}
+  function equal(actual,expected){if(actual!==expected)throw Error(String(actual)+' != '+String(expected));}
+  function offset(id,parent,x,y){var a=rect(id),b=rect(parent);equal(a.x-b.x,x);equal(a.y-b.y,y);}
+  function dimensions(changed){
+    alternate=changed;
+    element('changing-child').style.width=changed?'80px':'40px';
+    element('grid-in-flex').style.gap=changed?'20px':'10px';
+    element('flex-in-grid').style.gap=changed?'20px':'10px';
+    element('changing-basis').style.flexBasis=changed?'80px':'auto';
+    element('track-badge').style.gridTemplateColumns=changed?'70px 90px':'40px 60px';
+    element('display-inner').style.display=changed?'grid':'flex';
+    element('wrap-prefix').style.width=changed?'20px':'60px';
+  }
+  function inspect(){
+    var results=[];
+    function check(name,fn){try{fn();results.push({name:name,status:0});}catch(error){results.push({name:name,status:1,message:String(error)});}}
+    check('nested grid contributes columns and gap to its flex parent',function(){equal(rect('flex-panel').width,alternate?160:110);equal(rect('flex-panel').height,20);});
+    check('nested flex contributes items and gap to its grid parent',function(){equal(rect('grid-panel').width,alternate?140:110);equal(rect('grid-panel').height,20);});
+    check('inline grid includes both explicit tracks',function(){equal(rect('track-badge').width,alternate?170:110);equal(rect('track-badge').height,20);});
+    check('display edits replace inner formatting without stale sizing',function(){equal(rect('display-panel').width,alternate?60:110);equal(rect('display-panel').height,alternate?50:20);});
+    check('inline flex wraps atomically',function(){equal(rect('wrap-badge').width,110);offset('wrap-badge','wrap',alternate?20:0,alternate?0:20);equal(rect('wrap').height,alternate?20:40);});
+    check('nowrap preserves adjacent atomic boxes',function(){equal(rect('nowrap-badge').width,110);offset('nowrap-badge','nowrap',60,0);equal(rect('nowrap').height,20);});
+    check('inline flex exports its first container baseline',function(){offset('baseline-flex','first-baselines',10,0);offset('first-marker','first-baselines',0,10);equal(rect('baseline-flex').height,60);equal(rect('first-baselines').height,60);});
+    check('inline grid exports its first row baseline',function(){offset('baseline-grid','first-baselines',40,0);offset('grid-marker','first-baselines',30,10);equal(rect('baseline-grid').height,60);});
+    check('nested flex exports its last container baseline',function(){offset('last-marker','last-baseline',20,50);equal(rect('last-baseline').height,60);});
+    check('inline interaction bounds are placed inside the badge',function(){var a=rect('actions'),l=rect('action'),b=rect('action-button');equal(l.x-a.x,8);equal(b.x-l.right,8);if(b.right>a.right||l.y<a.y||b.y<a.y)throw Error('interaction outside badge');});
+    return results;
+  }
+  function present(results){
+    var failures=results.filter(function(result){return result.status!==0;});
+    element('status').textContent=failures.length?'FAIL: '+failures[0].name:'PASS: nested sizing and inline badges';
+    element('status').style.color=failures.length?'red':'green';
+    element('details').textContent=failures.map(function(result){return result.message;}).join('; ');
+  }
+  function interaction(){element('interaction').textContent='Link: '+links+', Count: '+counts;}
+  element('action').addEventListener('click',function(event){event.preventDefault();links++;interaction();});
+  element('action-button').addEventListener('click',function(){counts++;interaction();});
+  var results=inspect();
+  dimensions(true);results=results.concat(inspect());
+  dimensions(false);results=results.concat(inspect());
+  present(results);
+  element('toggle').addEventListener('click',function(){dimensions(!alternate);present(inspect());});
+  if(typeof completion_callback==='function')completion_callback(results,{status:0});
+});
+</script></body></html>

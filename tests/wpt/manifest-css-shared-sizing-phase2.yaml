@@ -1,0 +1,46 @@
+# Nested horizontal sizing, atomic inline flex/grid boxes, and container
+# baseline export. These unchanged upstream cases are already enabled by the
+# default manifest's css directory; all expectations remain PASS.
+# Preserve manifest-css-shared-sizing.yaml and its phase-one reports separately.
+# Mixed cases stay whole: logical sizes, grid shorthand/placement, tables,
+# canvas, and XHTML reference parsing can remain independent prerequisites.
+tests:
+  - css/css-flexbox/inline-flex.html
+  - css/css-flexbox/getcomputedstyle/flexbox_computedstyle_display-inline.html
+  - css/css-sizing/percentage-height-in-flexbox.html
+  - css/css-flexbox/intrinsic-size/row-005.html
+  - css/css-flexbox/intrinsic-size/row-008.html
+  - css/css-flexbox/intrinsic-size/row-wrap-001.html
+  - css/css-flexbox/intrinsic-size/row-compat-001.html
+  - css/css-flexbox/alignment/flex-align-baseline-flex-001.html
+  - css/css-flexbox/alignment/flex-align-baseline-grid-001.html
+  - css/css-grid/grid-model/grid-support-display-001.html
+  - css/css-grid/parsing/grid-auto-columns-valid.html
+  - css/css-grid/parsing/grid-auto-columns-invalid.html
+  - css/css-grid/parsing/grid-auto-columns-computed.html
+  - css/css-grid/grid-items/grid-item-flex-container-001.html
+  - css/css-grid/layout-algorithm/flex-sizing-columns-min-max-width-001.html
+  - css/css-grid/chrome-crash-001.html
+reftests:
+  - css/css-flexbox/inline-flex-min-content-height.html
+  - css/css-flexbox/inline-flex-column-image-load.html
+  - css/css-flexbox/nested-flex-image-loading-invalidates-intrinsic-sizes.html
+  - css/css-flexbox/flexbox_nested-flex.html
+  - css/css-flexbox/flexbox-baseline-empty-001a.html
+  - css/css-flexbox/flexbox-baseline-empty-001b.html
+  - css/css-flexbox/flexbox-baseline-single-item-001a.html
+  - css/css-flexbox/flexbox-baseline-single-item-001b.html
+  - css/css-flexbox/flexbox-baseline-multi-item-horiz-001a.html
+  - css/css-flexbox/flexbox-baseline-multi-item-horiz-001b.html
+  - css/css-flexbox/flexbox-baseline-multi-line-horiz-001.html
+  - css/css-flexbox/flexbox-baseline-multi-line-horiz-002.html
+  - css/css-flexbox/flex-order-last-baseline.html
+  - css/css-grid/grid-model/display-inline-grid.html
+  - css/css-grid/grid-model/grid-display-inline-grid-001.html
+  - css/css-grid/grid-model/grid-inline-margins-no-collapse-001.html
+  - css/css-grid/grid-model/grid-max-content-size-with-max-content-item.html
+  - css/css-grid/grid-container-baseline-synthesized-001.html
+crashtests:
+  - css/css-flexbox/inline-flex-frameset-main-axis-crash.html
+  - css/css-grid/chrome-521184744-crash.html
+  - css/css-grid/layout-algorithm/flexible-column-track-intrinsic-sizing-001-crash.html
