@@ -4,7 +4,7 @@ vars:
   WPT_MANIFEST: tests/wpt/manifest.yaml
   WPT_RESULTS: tests/wpt/results
   DASHBOARD_COMPOSE: tests/wpt/dashboard/docker-compose.yml
-  WPT_JOBS: 8re
+  WPT_JOBS: 8
   GIT_SHA:
     sh: git rev-parse --short HEAD 2>/dev/null || printf working-tree
 

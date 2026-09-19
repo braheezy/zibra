@@ -8,6 +8,9 @@ comptime {
     // host exports reachable even when no JavaScript test is selected.
     _ = @import("kiesel").builtins.reg_exp;
     _ = @import("tests/responsive_layout.zig");
+    _ = @import("tests/intrinsic_sizing.zig");
+    _ = @import("tests/sizing_allocation.zig");
+    _ = @import("tests/shared_sizing_alignment.zig");
     _ = @import("tests/replaced_image_layout.zig");
     _ = @import("tests/element_geometry.zig");
     _ = @import("tests/css_inspection_render.zig");

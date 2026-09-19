@@ -132,6 +132,36 @@ def collect(directory):
     return finished == len(plan['batches'])
 
 
+class BatchProgress:
+    """Tail worker progress on the coordinator's stdout without a controlling tty."""
+    def __init__(self, directory, stream=None):
+        self.directory = directory / 'results' / '1'
+        self.stream = stream if stream is not None else sys.stdout
+        # A resumed run must not replay all previously completed output.
+        self.offsets = {p: p.stat().st_size for p in self.directory.glob('*/stderr')}
+        self.pending = {}
+
+    def update(self):
+        for path in sorted(self.directory.glob('*/stderr')):
+            offset = self.offsets.get(path, 0)
+            size = path.stat().st_size
+            if size < offset:
+                offset = 0
+                self.pending.pop(path, None)
+            if size == offset:
+                continue
+            with path.open('rb') as source:
+                source.seek(offset)
+                data = source.read(65536)
+                self.offsets[path] = source.tell()
+            lines = (self.pending.get(path, b'') + data).split(b'\n')
+            self.pending[path] = lines.pop()
+            for line in lines:
+                text = line.decode('utf-8', errors='replace').rstrip('\r')
+                if text.startswith(('[', 'WPT ', 'done ')):
+                    print(f"[batch {int(path.parent.name) + 1}] {text}", file=self.stream, flush=True)
+
+
 def execute(args):
     if not shutil.which('parallel'):
         raise ValueError('GNU Parallel is required (macOS: brew install parallel)')
@@ -166,11 +196,18 @@ def execute(args):
 
     previous = {sig: signal.signal(sig, pause) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
+        progress = BatchProgress(args.directory_path)
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL, start_new_session=True)
         if paused:
             process.send_signal(signal.SIGHUP)
         print('Running WPT. Press Ctrl+C to pause.', flush=True)
-        code = process.wait()
+        while True:
+            try:
+                code = process.wait(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                progress.update()
+        progress.update()
         complete = collect(args.directory_path)
         return 0 if paused else code or (0 if complete else 1)
     finally:
@@ -241,6 +278,14 @@ def automatic(args):
             return execute(options)
 
 
+def positive_jobs(value):
+    """Reject invalid concurrency before building or creating a run."""
+    if not value.isascii() or not value.isdecimal() or int(value) < 1:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive whole-number worker count, got {value!r} (example: --jobs 8)")
+    return int(value)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
@@ -248,7 +293,7 @@ def main(argv=None):
     start_parser.add_argument('--results', type=Path, default=Path('tests/wpt/results'))
     start_parser.add_argument('--manifest', type=Path, default=runner.DEFAULT_MANIFEST)
     start_parser.add_argument('--browser', default='./zig-out/bin/zibra')
-    start_parser.add_argument('--jobs', default='8')
+    start_parser.add_argument('--jobs', type=positive_jobs, default=8)
     start_parser.add_argument('--fresh', action='store_true')
     start_parser.add_argument('--build', action='store_true')
     start_parser.add_argument('--sshlogin')
@@ -264,7 +309,7 @@ def main(argv=None):
     prepare_parser.add_argument('--browser', default='./zig-out/bin/zibra')
     execute_parser = sub.add_parser('run')
     execute_parser.add_argument('directory_path', type=Path)
-    execute_parser.add_argument('--jobs', default='8')
+    execute_parser.add_argument('--jobs', type=positive_jobs, default=8)
     execute_parser.add_argument('--resume', action='store_true')
     execute_parser.add_argument('--sshlogin')
     execute_parser.add_argument('--workdir')

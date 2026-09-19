@@ -25,6 +25,77 @@ class BatchTests(unittest.TestCase):
         self.cases = [batch.runner.Case(path=f'css/{i}.html', mode='testharness', reason='fixture')
                       for i in range(5)]
 
+    def test_invalid_jobs_fail_before_build_or_run_creation(self):
+        for action in (['start', '--build', '--fresh', '--results', str(self.run)],
+                       ['run', str(self.run)]):
+            for value in ('8re', '0', '-1', '1.5', '100%', '1_000', ''):
+                with self.subTest(action=action[0], jobs=value), \
+                     patch.object(batch, 'automatic') as automatic, \
+                     patch.object(batch, 'execute') as execute, \
+                     contextlib.redirect_stderr(io.StringIO()) as error:
+                    with self.assertRaises(SystemExit) as stopped:
+                        batch.main([*action, '--jobs', value])
+                    self.assertEqual(2, stopped.exception.code)
+                    self.assertIn('positive whole-number worker count', error.getvalue())
+                    automatic.assert_not_called()
+                    execute.assert_not_called()
+                    self.assertFalse(self.run.exists())
+
+    def test_start_accepts_default_and_explicit_worker_counts(self):
+        for options, expected in (([], 8), (['--jobs', '12'], 12)):
+            with patch.object(batch, 'automatic', return_value=0) as automatic:
+                self.assertEqual(0, batch.main(['start', *options]))
+                self.assertEqual(expected, automatic.call_args.args[0].jobs)
+
+    def test_progress_tails_new_lines_without_replaying_saved_output(self):
+        log = self.run / 'results/1/0/stderr'
+        log.parent.mkdir(parents=True)
+        log.write_text('[1/25] old progress\n')
+        output = io.StringIO()
+        progress = batch.BatchProgress(self.run, output)
+        progress.update()
+        self.assertEqual('', output.getvalue())
+        with log.open('ab') as f:
+            f.write('[2/25] PASS caf'.encode() + b'\xc3')
+        progress.update()
+        self.assertEqual('', output.getvalue())
+        with log.open('ab') as f:
+            f.write(b'\xa9.html\n')
+        progress.update()
+        self.assertEqual('[batch 1] [2/25] PASS café.html\n', output.getvalue())
+        progress.update()
+        self.assertEqual(1, len(output.getvalue().splitlines()))
+        log.write_text('WPT all: 25 cases\n')
+        progress.update()
+        self.assertIn('[batch 1] WPT all: 25 cases', output.getvalue())
+
+    @unittest.skipUnless(shutil.which('parallel'), 'GNU Parallel is not installed')
+    def test_detached_parallel_progress_arrives_before_job_finishes(self):
+        import subprocess
+        import time
+        gate = self.root / 'release'
+        script = self.root / 'worker.py'
+        script.write_text("import sys,time,pathlib\n"
+                          "print('[1/25] PASS live', file=sys.stderr, flush=True)\n"
+                          "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(.01)\n")
+        output = io.StringIO()
+        progress = batch.BatchProgress(self.run, output)
+        process = subprocess.Popen(['parallel', '--plain', '--jobs', '1', '--results',
+                                    str(self.run / 'results'), sys.executable, str(script), str(gate), ':::', '0'],
+                                   start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            while not output.getvalue() and time.monotonic() < deadline:
+                progress.update()
+                time.sleep(.01)
+            self.assertIn('[batch 1] [1/25] PASS live', output.getvalue())
+            self.assertIsNone(process.poll())
+        finally:
+            gate.touch()
+            _, stderr = process.communicate(timeout=5)
+        self.assertEqual(0, process.returncode)
+        self.assertNotIn(b'/dev/tty', stderr)
+
     def prepare(self):
         with patch.object(batch.runner, 'discover_wpt_inventory', return_value=[]), \
              patch.object(batch.runner, 'load_cases', return_value=list(reversed(self.cases))):
@@ -187,7 +258,7 @@ class BatchTests(unittest.TestCase):
                 return None
             def send_signal(self, sig):
                 observed['signal'] = sig
-            def wait(self):
+            def wait(self, timeout=None):
                 signal.raise_signal(signal.SIGINT)
                 signal.raise_signal(signal.SIGINT)
                 return 0

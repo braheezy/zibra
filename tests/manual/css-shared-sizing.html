@@ -1,0 +1,93 @@
+<!doctype html>
+<!-- How to verify: the status must say PASS. The padded panel wraps its two
+     colored tiles, the short baseline tile touches the same bottom as the tall
+     one, and the grid tile is centered. Toggle dimensions repeatedly; status
+     stays PASS and panels update. Resize the window and confirm no stale boxes. -->
+<html><head><meta charset="utf-8"><title>Shared sizing and alignment</title>
+<style>
+body { margin:24px; font:16px sans-serif; color:#17202a; background:white }
+h1 { font-size:24px }
+.demo { margin:12px 0; outline:1px solid #94a3b8 }
+.tile { background:#15803d }
+#container { width:400px }
+#fit { display:block;overflow:hidden; width:fit-content; padding-left:20%; background:#dcfce7 }
+#fit > div { float:left; width:50px; height:30px }
+#first-float { background:#15803d }
+#second-float { background:#4ade80 }
+#shrink { display:flex; width:150px }
+#padded { flex:0 1 100px; min-width:0; padding:0 20px; height:20px; background:#15803d }
+#plain { flex:0 1 100px; min-width:0; height:20px; background:#86efac }
+#unsafe, #safe { display:flex; width:50px; height:25px; margin-left:30px; justify-content:center }
+#safe { justify-content:safe center }
+.overflow { flex:0 0 100px; height:20px; background:#86efac }
+#cross { display:flex; width:100px; height:100px; background:#f0fdf4 }
+#cross-item { width:20px; height:20px; margin:auto; background:#15803d }
+#percentages { display:flex; width:200px; height:80px; align-items:flex-start }
+#natural, #stretch { width:100px }
+#stretch { align-self:stretch }
+.percent-child { height:50%; background:#86efac }
+.fixed-child { width:20px; height:40px; background:#15803d }
+#grid { display:grid; width:300px; height:100px; grid-template-columns:100px 200px; grid-template-rows:100px }
+#half { width:50%; height:20px; background:#86efac }
+#center { justify-self:center; align-self:center; background:#15803d }
+#grid-child { width:40px; height:20px }
+#baseline { display:flex; width:200px; align-items:baseline; background:#f0fdf4 }
+#short { width:50px; height:20px; background:#15803d }
+#tall { width:50px; height:40px; background:#4ade80 }
+</style></head><body>
+<h1 id="status">Checking shared sizing</h1>
+<button id="toggle">Toggle dimensions</button><p id="details"></p>
+<p>Fit-content with percentage padding</p>
+<div id="container" class="demo"><div id="fit"><div id="first-float"></div><div id="second-float"></div></div></div>
+<p>Flex shrink excludes padding from its weight</p>
+<div id="shrink" class="demo"><div id="padded"></div><div id="plain"></div></div>
+<p>Center overflow and safe center</p>
+<div id="unsafe" class="demo"><div id="unsafe-item" class="overflow"></div></div>
+<div id="safe" class="demo"><div id="safe-item" class="overflow"></div></div>
+<p>Auto margins center the small tile</p>
+<div id="cross" class="demo"><div id="cross-item"></div></div>
+<p>Percentage heights use a stretched parent's definite height</p>
+<div id="percentages" class="demo"><div id="natural"><div id="natural-percent" class="percent-child"><div class="fixed-child"></div></div></div><div id="stretch"><div id="stretch-percent" class="percent-child"><div class="fixed-child"></div></div></div></div>
+<p>Grid percentages and centered intrinsic width</p>
+<div id="grid" class="demo"><div id="half"></div><div id="center"><div id="grid-child"></div></div></div>
+<p>Synthesized baselines</p>
+<div id="baseline" class="demo"><div id="short"></div><div id="tall"></div></div>
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+  var alternate=false;
+  function element(id){return document.getElementById(id);}
+  function rect(id){return element(id).getBoundingClientRect();}
+  function equal(actual,expected){if(actual!==expected)throw Error(String(actual)+' != '+String(expected));}
+  function offset(id,parent,x,y){var a=rect(id),b=rect(parent);equal(a.x-b.x,x);equal(a.y-b.y,y);}
+  function dimensions(changed){
+    alternate=changed;
+    element('container').style.width=changed?'300px':'400px';
+    element('grid-child').style.width=changed?'80px':'40px';
+    element('tall').style.height=changed?'60px':'40px';
+  }
+  function inspect(){
+    var results=[];
+    function check(name,fn){try{fn();results.push({name:name,status:0});}catch(error){results.push({name:name,status:1,message:String(error)});}}
+    check('fit-content keeps the original percentage padding basis',function(){equal(rect('fit').width,alternate?160:180);equal(rect('fit').height,30);});
+    check('scaled shrink weights omit padding',function(){equal(rect('padded').width,95);equal(rect('plain').width,55);});
+    check('unsafe center permits negative offsets and safe center falls back',function(){offset('unsafe-item','unsafe',-25,0);offset('safe-item','safe',0,0);});
+    check('cross axis auto margins override stretch',function(){offset('cross-item','cross',40,40);equal(rect('cross-item').height,20);});
+    check('nonstretch percentage height stays indefinite',function(){equal(rect('natural-percent').height,40);equal(rect('stretch').height,80);equal(rect('stretch-percent').height,40);});
+    check('grid item width percentages use the area and auto width shrinks',function(){equal(rect('half').width,50);equal(rect('center').width,alternate?80:40);offset('center','grid',alternate?160:180,40);});
+    check('empty items synthesize bottom border baselines',function(){offset('short','baseline',0,alternate?40:20);equal(rect('short').bottom,rect('tall').bottom);});
+    return results;
+  }
+  function present(results){
+    var failures=results.filter(function(result){return result.status!==0;});
+    element('status').textContent=failures.length?'FAIL: '+failures[0].name:'PASS: shared sizing and alignment';
+    element('status').style.color=failures.length?'red':'green';
+    element('details').textContent=failures.map(function(result){return result.message;}).join('; ');
+  }
+  var results=inspect();
+  dimensions(true);results=results.concat(inspect());
+  dimensions(false);results=results.concat(inspect());
+  present(results);
+  element('toggle').addEventListener('click',function(){dimensions(!alternate);present(inspect());});
+  if(typeof completion_callback==='function')completion_callback(results,{status:0});
+});
+</script></body></html>

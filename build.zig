@@ -202,6 +202,12 @@ const WptFixture = struct {
 
 const wpt_fixtures = [_]WptFixture{
     .{
+        .fixture = "tests/manual/css-shared-sizing.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-css-shared-sizing.jsonl",
+    },
+    .{
         .fixture = "tests/manual/css-cascade-layers.html",
         .status = "PASS",
         .timeout_ms = 10_000,

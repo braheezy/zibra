@@ -147,7 +147,7 @@ pub const computed = svgProperties() ++ [_]Property{
     .{ .name = "scroll-behavior", .default_value = "auto" },
     .{ .name = "zoom", .default_value = "1" },
     .{ .name = "width", .default_value = "auto", .serialization = .length },
-    .{ .name = "min-width", .default_value = "0px", .serialization = .length },
+    .{ .name = "min-width", .default_value = "auto", .serialization = .length },
     .{ .name = "max-width", .default_value = "none", .serialization = .length },
     .{ .name = "height", .default_value = "auto", .serialization = .length },
     .{ .name = "min-height", .default_value = "auto", .serialization = .length },

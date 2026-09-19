@@ -754,14 +754,16 @@ Important geometry contracts:
   this context.
 - Block `flex` and `grid` containers keep DOM-backed item boxes and anonymous
   text runs. Flex sizing supports grow/shrink with min/max freezing, wrapping,
-  direction/order, gaps, main-axis auto margins, and basic axis alignment.
-  Grid sizing supports fixed, fractional, `minmax`, integer `repeat`, and
+  direction/order, gaps, automatic minima, both axes' auto margins, and
+  positional/distribution alignment. Grid sizing supports fixed, intrinsic,
+  fractional, `minmax`, `fit-content()`, integer `repeat`, and
   bounded definite-minimum `auto-fill`/`auto-fit` tracks, row-major placement,
-  gaps, and basic item alignment. Measurement passes do not publish hit-test
+  gaps, and item/track alignment. Measurement passes do not publish hit-test
   bounds; only final allocated boxes do. Child topology changes rebuild these
   contexts conservatively. Inline flex/grid, explicit grid placement/spans,
-  subgrid, baseline alignment, and complete intrinsic track sizing remain
-  outside this bounded implementation.
+  subgrid, general writing modes/RTL, and complete nested flex/grid intrinsic
+  algorithms remain outside this bounded implementation. The shared sizing
+  contract below defines the supported row baseline groups and percentage bases.
 - A `display: list-item` reserves the browser's bounded marker indent and
   paints its square marker unless the inherited `list-style-type` is `none`.
   The supported `list-style` shorthand currently maps the bounded `disc` and
@@ -844,8 +846,9 @@ The ratio respects `box-sizing`; `auto <ratio>` uses the content box. Explicit
 axes and min/max constraints remain authoritative. `min-height` defaults to
 `auto`: visible content can enlarge the ratio-dependent height, while an explicit
 minimum or scroll container disables that automatic content minimum.
-Intrinsic-width content minimums, cross-axis min/max transfer, non-horizontal
-writing modes, positioned and flex/grid ratio sizing remain outside this slice.
+Ordinary-flow intrinsic-width content minimums, cross-axis min/max transfer,
+non-horizontal writing modes and positioned ratio sizing remain outside this
+slice. The shared sizing contract below covers supported flex/grid transfers.
 
 Images and iframes share `render/replaced_sizing.zig` for unscaled CSS used
 size. CSS dimensions override matching HTML attributes, a usable aspect ratio
@@ -888,6 +891,11 @@ Pure layout leaves are intentionally separated from retained object state:
 - `render/flex_format.zig` and `render/grid_format.zig` solve scalar item and
   track sizing without DOM/layout pointers; `document/css_flex.zig` and
   `document/grid_tracks.zig` own their borrowed CSS grammar;
+- `render/sizing.zig` owns scalar content/border-box conversion, intrinsic
+  fit-content clamping, constraints and automatic-minimum suggestions;
+  `render/box_alignment.zig` owns positional/distribution offsets, automatic
+  margins and local baseline groups. `document/css_sizing.zig` and
+  `document/css_alignment.zig` provide shared declaration/layout grammar;
 - `render/intrinsic_width.zig` synchronously borrows DOM and FontManager to
   estimate intrinsic content widths; it retains no DOM or glyph pointers.
   Native input label/size measurement is shared with final control layout.
@@ -922,6 +930,123 @@ These modules must not register ProtectedField dependencies or acquire
 Browser/Frame ownership. Methods that mutate parent/previous links, dirty
 state, DOM callbacks, retained caches, or owned child arrays stay beside their
 layout objects.
+
+### Shared sizing and alignment
+
+The [reviewed implementation design](../plans/shared-sizing-alignment.md)
+records the bounded capability and its verification plan. This section is the
+authoritative lifetime and used-value contract.
+
+Intrinsic measurements borrow the styled DOM and FontManager synchronously.
+`intrinsic_width.measureContent` returns root natural content widths, excluding
+that root's preferred/min/max sizing and edges; descendants contribute their
+constrained outer widths. `keywordContent` transfers a definite nonreplaced
+height through its preferred ratio for intrinsic width keywords, respecting
+height constraints and the selected sizing box. Keep this pair separate from
+the raw root content suggestion used by automatic minima. `measure` applies
+that transfer and root preferred/min/max sizing and returns content widths;
+`measureOuter` adds root padding, borders and margins exactly once. Their scale
+already includes the root's authored zoom. Descendant zoom is applied when
+traversing that descendant. Intrinsic height percentages remain unresolved.
+Images retain the replaced resolver's ratio-aware constrained contribution;
+flex automatic minima must distinguish that contribution from the raw
+natural-image content suggestion. Native control natural widths remain shared
+with final layout.
+
+Before intrinsic traversal, layout subscribes its persistent owner to descendant
+metric styles. A temporary atomic tree routes those subscriptions through its
+persistent dependency target. Flex/grid containers also subscribe to item
+inputs because one item's contribution changes sibling allocation. Style
+subscriptions use the publishing StyleMap allocator; scalar solvers never
+register dependencies. Structural mutation retires all these borrows through
+the existing layout boundary.
+
+Every direct flex/grid item establishes an independent float context. Its
+existing float buffer belongs to the retained item and resets for each
+measurement or final layout pass; floated descendants contribute to that
+item's natural height without affecting a sibling. Determine this boundary
+from the persistent parent formatting kind, including during paint queries,
+not from the temporary presence of an allocated box.
+
+Preferred/min/max inline sizes preserve `min-content`, `max-content` and
+`fit-content` until layout. Intrinsic keywords denote content widths regardless
+of box-sizing; numeric border-box values subtract their own padding/borders.
+Percentage padding uses the original containing block, before fit-content
+available space is calculated. Minimum wins a conflicting maximum, and a
+border box never becomes smaller than its padding/borders. `min-width:auto`
+is the initial value: ordinary blocks use zero, while flex/grid select their
+format-specific automatic minimum. Margin is outside every sizing box.
+Scalar arithmetic uses page-layout units; allocation rounds shared edges and
+accessibility zoom remains outside layout.
+
+An `AllocatedBox` separates a forced border-box height from `height_definite`.
+The former is geometry; the latter authorizes percentage-height descendants.
+Original containing dimensions separately resolve the allocated item's own
+percentages. Publish definite content height, including zero, before descendant
+layout; an earlier child's dirty height publisher does not revoke that base
+during the serialized traversal. A nested formatting context must preserve the
+same distinction between available numeric space and a definite percentage
+basis. Authored heights and resolvable percentages are definite; content-derived
+nonstretched flex heights remain indefinite. Flex post-flex main sizes become
+definite when the container main size or item basis is definite. Final stretched
+cross sizes become definite for descendant relayout even in auto-height lines.
+Final grid-area dimensions are definite for item layout; unresolved row
+measurement uses no substitute container-height basis. The nonstretched item's
+own auto height can still be indefinite. Table allocation retains its existing
+separate row/cell policy.
+
+Flex targets include border/padding, but scaled shrink weights use the inner
+flex base. Content and specified-size suggestions are separate: `flex-basis:
+content` ignores the preferred main size, and automatic minima use the relevant
+content, specified and ratio-transfer suggestions before the main maximum cap.
+An explicit zero minimum or supported scrollable overflow permits shrinking
+below the automatic content floor. Grid automatic minima require a track with
+an auto minimum; fixed minima and `minmax(0,1fr)` do not inherit a flex content
+floor. Grid solvers receive separate minimum, min-content and max-content
+contributions and distinguish intrinsic growth from stretching auto maxima.
+A fixed grid-track maximum also caps the item's automatic content minimum;
+explicit item minima and tracks with a min-content minimum retain their floors.
+
+Simple flex/grid ratio transfer preserves the same content-box versus border-box
+policy. A definite cross size can supply an automatic flex basis; cross-axis
+min/max constraints bound the content and transferred automatic-minimum
+suggestions. An intrinsic width keyword alone does not make that cross size
+definite. Row flex items derive an automatic cross height from the allocated
+main width, apply cross min/max constraints and preserve the nonreplaced
+automatic content floor. The resulting definite height is published before
+percentage descendants are laid out. Grid ratio items derive an automatic width
+from a definite height and an automatic height from their resolved width. Row
+measurement includes the ratio height before track allocation, and a height
+derived from definite width
+provides a percentage-height basis to descendants. Grid `normal` preserves these
+preferred dimensions while explicit stretch follows the area allocation policy.
+
+Alignment consumes remaining margin-box space after sizing. Safe/unsafe values
+and multi-token baseline/place-* grammar remain distinct through declaration
+admission. Positive auto-margin space takes precedence over alignment. Flex
+cross-axis auto margins also suppress self-alignment when overflowing; grid
+overflow auto margins become zero and self-alignment still applies. Auto margins
+suppress stretch. Nonstretch auto grid widths use fit-content sizing, specified
+widths may overflow their area, and grid `normal` treats replaced/ratio boxes
+separately from explicit `stretch`. Track distribution moves grid lines without
+changing authored gap values.
+
+Row flex and grid-row first/last baseline groups consume scalar offsets from
+the item border-box origin. Retained first/last line metrics are recomputed on
+relayout; exporting them subtracts the item's current origin. Ordinary block
+export ignores out-of-flow and float descendants and synthesizes a bottom-edge
+baseline when none applies. Baseline groups include margins and can enlarge
+natural line/row heights. No group retains a line pointer, and measurement
+passes publish no interaction bounds. Paint-only work reuses clean metrics.
+
+This remains horizontal layout with existing row/column reverse and wrapping.
+Intrinsic block-axis keywords, width `fit-content(<length-percentage>)`, full
+column/orthogonal baseline sharing and nested flex/grid baseline export,
+independent overflow axes, and complete cyclic intrinsic track sizing remain
+separate capabilities. Complete nested flex/grid intrinsic ratio contributions,
+orthogonal ratio transfer and general cyclic ratio/percentage resolution also
+remain limited. Table-specific content floors and replaced ratio resolution
+remain separate policies over the common measurements.
 
 A canvas Element lazily owns a heap-stable backing because z2d Context points
 to the embedded Surface. Canvas drawing runs on the serialized tab worker.

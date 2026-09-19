@@ -1,0 +1,22 @@
+<!doctype html>
+<html><head><style>
+body { margin:0 }
+main { width:400px }
+#fit { display:block;overflow:hidden; width:fit-content; padding-left:20%; background:#dcfce7 }
+#fit > div { float:left; width:50px; height:20px; background:green }
+#shrink { display:flex; width:150px }
+#padded { flex:0 1 100px; min-width:0; padding:0 20px; height:20px; background:green }
+#plain { flex:0 1 100px; min-width:0; height:20px; background:lime }
+#grid { display:grid; width:400px; height:100px; grid-template-columns:100px 300px; grid-template-rows:100px }
+#half { width:50%; height:20px; background:green }
+#center { justify-self:center; align-self:center; background:lime }
+#center > div { width:40px; height:20px }
+#baseline { display:flex; align-items:baseline }
+#short { width:50px; height:20px; background:green }
+#tall { width:50px; height:40px; background:lime }
+</style></head><body><main>
+<div id="fit"><div></div><div></div></div>
+<div id="shrink"><div id="padded"></div><div id="plain"></div></div>
+<div id="grid"><div id="half"></div><div id="center"><div></div></div></div>
+<div id="baseline"><div id="short"></div><div id="tall"></div></div>
+</main></body></html>

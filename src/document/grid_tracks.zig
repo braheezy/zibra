@@ -6,12 +6,13 @@ const syntax = @import("css_syntax.zig");
 const tokens = @import("css_value_tokens.zig");
 
 pub const max_tracks = 256;
+pub const Kind = enum { fixed, auto, min_content, max_content, fraction, fit_content };
 pub const Track = struct {
     min: f64 = 0,
     max: ?f64 = null,
     fraction: f64 = 0,
-    auto_min: bool = true,
-    auto_max: bool = true,
+    min_kind: Kind = .auto,
+    max_kind: Kind = .auto,
 };
 
 pub const Components = struct {
@@ -43,9 +44,18 @@ fn fraction(raw: []const u8) ?f64 {
 
 pub fn parseTrack(raw: []const u8, context: length.ResolutionContext) ?Track {
     const text = std.mem.trim(u8, raw, " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(text, "auto") or std.ascii.eqlIgnoreCase(text, "min-content") or std.ascii.eqlIgnoreCase(text, "max-content")) return .{};
-    if (length.resolve(text, context)) |size| return .{ .min = size, .max = size, .auto_min = false, .auto_max = false };
-    if (fraction(text)) |fr| return .{ .fraction = fr, .auto_max = false };
+    if (std.ascii.eqlIgnoreCase(text, "auto")) return .{};
+    if (std.ascii.eqlIgnoreCase(text, "min-content")) return .{ .min_kind = .min_content, .max_kind = .min_content };
+    if (std.ascii.eqlIgnoreCase(text, "max-content")) return .{ .min_kind = .max_content, .max_kind = .max_content };
+    if (length.resolve(text, context)) |size| return .{ .min = size, .max = size, .min_kind = .fixed, .max_kind = .fixed };
+    if (unresolvedPercentage(text, context)) return .{};
+    if (fraction(text)) |fr| return .{ .fraction = fr, .max_kind = .fraction };
+    if (text.len > 13 and std.ascii.startsWithIgnoreCase(text, "fit-content(") and text[text.len - 1] == ')') {
+        const limit = std.mem.trim(u8, text[12 .. text.len - 1], " \t\r\n");
+        if (length.resolve(limit, context)) |size| return .{ .max = size, .max_kind = .fit_content };
+        if (unresolvedPercentage(limit, context)) return .{};
+        return null;
+    }
     if (text.len > 8 and std.ascii.startsWithIgnoreCase(text, "minmax(") and text[text.len - 1] == ')') {
         const inner = text[7 .. text.len - 1];
         const comma = syntax.scanToTopLevel(inner, 0, ",");
@@ -55,18 +65,33 @@ pub fn parseTrack(raw: []const u8, context: length.ResolutionContext) ?Track {
         var result: Track = .{};
         if (length.resolve(low, context)) |size| {
             result.min = size;
-            result.auto_min = false;
-        } else if (!std.ascii.eqlIgnoreCase(low, "auto") and !std.ascii.eqlIgnoreCase(low, "min-content") and !std.ascii.eqlIgnoreCase(low, "max-content")) return null;
+            result.min_kind = .fixed;
+        } else if (std.ascii.eqlIgnoreCase(low, "min-content")) {
+            result.min_kind = .min_content;
+        } else if (std.ascii.eqlIgnoreCase(low, "max-content")) {
+            result.min_kind = .max_content;
+        } else if (!std.ascii.eqlIgnoreCase(low, "auto") and !unresolvedPercentage(low, context)) return null;
         if (length.resolve(high, context)) |size| {
             result.max = @max(size, result.min);
-            result.auto_max = false;
+            result.max_kind = .fixed;
         } else if (fraction(high)) |fr| {
             result.fraction = fr;
-            result.auto_max = false;
-        } else if (!std.ascii.eqlIgnoreCase(high, "auto") and !std.ascii.eqlIgnoreCase(high, "max-content") and !std.ascii.eqlIgnoreCase(high, "min-content")) return null;
+            result.max_kind = .fraction;
+        } else if (std.ascii.eqlIgnoreCase(high, "min-content")) {
+            result.max_kind = .min_content;
+        } else if (std.ascii.eqlIgnoreCase(high, "max-content")) {
+            result.max_kind = .max_content;
+        } else if (!std.ascii.eqlIgnoreCase(high, "auto") and !unresolvedPercentage(high, context)) return null;
         return result;
     }
     return null;
+}
+
+fn unresolvedPercentage(raw: []const u8, context: length.ResolutionContext) bool {
+    if (context.percentage_base != null) return false;
+    var definite = context;
+    definite.percentage_base = 100;
+    return length.resolve(raw, definite) != null;
 }
 
 /// Fills caller storage; null means unsupported/invalid grammar. Auto-repeat
@@ -91,7 +116,7 @@ pub fn parse(raw: []const u8, context: length.ResolutionContext, gap: f64, item_
             }
             if (pattern_count == 0) return null;
             const repetitions = if (std.ascii.eqlIgnoreCase(repeat, "auto-fill") or std.ascii.eqlIgnoreCase(repeat, "auto-fit")) blk: {
-                if (pattern_count != 1 or pattern[0].auto_min) return null;
+                if (pattern_count != 1 or pattern[0].min_kind != .fixed) return null;
                 const breadth = @max(pattern[0].max orelse pattern[0].min, 1);
                 const available = context.percentage_base orelse breadth;
                 var n: usize = @intFromFloat(std.math.clamp(@floor((available + gap) / (breadth + gap)), 1, max_tracks));
@@ -110,4 +135,19 @@ pub fn parse(raw: []const u8, context: length.ResolutionContext, gap: f64, item_
         }
     }
     return if (count > 0) count else null;
+}
+
+test "grid tracks preserve intrinsic functions zero fractions and fit content caps" {
+    try std.testing.expectEqual(Kind.auto, parseTrack("auto", .{}).?.min_kind);
+    try std.testing.expectEqual(Kind.min_content, parseTrack("min-content", .{}).?.max_kind);
+    try std.testing.expectEqual(Kind.max_content, parseTrack("max-content", .{}).?.min_kind);
+    const fractional = parseTrack("minmax(0, 0fr)", .{}).?;
+    try std.testing.expectEqual(Kind.fixed, fractional.min_kind);
+    try std.testing.expectEqual(Kind.fraction, fractional.max_kind);
+    try std.testing.expectEqual(@as(f64, 0), fractional.fraction);
+    try std.testing.expectEqual(Kind.fit_content, parseTrack("fit-content(80px)", .{}).?.max_kind);
+    try std.testing.expectEqual(@as(?f64, 80), parseTrack("fit-content(80px)", .{}).?.max);
+    try std.testing.expectEqual(Kind.auto, parseTrack("50%", .{}).?.min_kind);
+    try std.testing.expectEqual(@as(f64, 0), parseTrack("50%", .{ .percentage_base = 0 }).?.min);
+    try std.testing.expect(parseTrack("minmax(1fr, 20px)", .{}) == null);
 }

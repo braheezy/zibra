@@ -36,6 +36,14 @@ boundaries.
   keywords, radii, and authored-zoom used values. It does not subscribe to
   style fields; `layout.zig` performs dependency-tracked reads before calling
   it.
+- `sizing.zig` owns scalar content/border-box conversion, intrinsic keyword
+  resolution, min/max constraints and automatic-minimum suggestions. Callers
+  provide authored-zoom page units and a separate CSS percentage context;
+  retain allocation definiteness in `layout.zig`, independently of used size.
+- `box_alignment.zig` owns scalar positional/distributed alignment, automatic
+  margins and baseline groups over `document/css_alignment.zig` values. Pass
+  local border-box baseline offsets, never absolute page coordinates. Reversed
+  flex axes require explicit margin and logical-edge mapping.
 - `sticky_position.zig` computes pointer-free sticky-axis constraints. Layout
   retains visual offsets and refreshes them only after style/layout are clean,
   before paint, hits, or script geometry consumes a new scroll position.
@@ -58,9 +66,17 @@ boundaries.
   Row groups retain real boxes but share their table's columns, including
   `tbody` inserted by the live parser; do not flatten them out of the DOM.
 - `flex_format.zig` and `grid_format.zig` own pointer-free item and track
-  sizing. `intrinsic_width.zig` synchronously borrows DOM and FontManager for
-  bounded intrinsic measurement. None retains DOM/layout/glyph pointers;
-  `layout.zig` owns item boxes, subscriptions, and final hit-test collection.
+  sizing. Flex inner bases determine shrink weights; border boxes consume
+  space. Grid track kinds and minimum/min-content/max-content contributions
+  remain distinct. `layout.zig` owns item boxes, subscriptions, allocation
+  provenance and final hit-test collection.
+- `intrinsic_width.zig` synchronously borrows DOM and FontManager for bounded
+  measurement. `measureContent` returns raw root content; `keywordContent`
+  separately transfers definite height through a nonreplaced ratio for width
+  keywords. `measure` applies that transfer and root constraints to content,
+  and `measureOuter` adds root edges and margins.
+  Keep their replaced-element policy explicit; none retains DOM/layout/glyph
+  pointers. Register descendant reads through the persistent formatting owner.
   Native input natural widths must agree between intrinsic and final layout;
   table measurements subscribe through persistent owners, not temporary cells.
   Image min/max constraints share `replaced_sizing.zig` across intrinsic and

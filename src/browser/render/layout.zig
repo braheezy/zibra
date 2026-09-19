@@ -25,6 +25,10 @@ const layout_hit = @import("layout_hit.zig");
 const paint_order = @import("paint_order.zig");
 const table_format = @import("table_format.zig");
 const flex_format = @import("flex_format.zig");
+const sizing = @import("sizing.zig");
+const box_alignment = @import("box_alignment.zig");
+const css_sizing = @import("../../document/css_sizing.zig");
+const css_alignment = @import("../../document/css_alignment.zig");
 const grid_format = @import("grid_format.zig");
 const intrinsic_measure = @import("intrinsic_width.zig");
 const paint_effects = @import("paint_effects.zig");
@@ -3462,6 +3466,45 @@ fn appendInlineBlock(
     self.last_was_collapsible_space = false;
 }
 
+fn stretchesAlignment(raw: []const u8) bool {
+    return flex_format.eq(raw, "normal") or flex_format.eq(raw, "stretch");
+}
+
+fn baselineKind(raw: []const u8) ?bool {
+    const value = css_alignment.parse(raw) orelse return null;
+    return switch (value.keyword) {
+        .baseline => false,
+        .last_baseline => true,
+        else => null,
+    };
+}
+
+fn blockBaseline(block: *const BlockLayout, last: bool) ?i32 {
+    if (block.used_inline_layout) return if (last) block.last_line_baseline else block.first_line_baseline;
+    if (block.used_formatting_context) return null;
+    for (0..block.children.items.len) |index| {
+        const child = switch (block.children.items[if (last) block.children.items.len - index - 1 else index]) {
+            .block => |value| value,
+            .line => continue,
+        };
+        if (child.floatSide() != .none or isOutOfFlowPosition(child.positionMode())) continue;
+        if (blockBaseline(child, last)) |baseline| return baseline;
+    }
+    return null;
+}
+
+fn blockBaselineOffset(block: *const BlockLayout, last: bool) f64 {
+    return @floatFromInt(if (blockBaseline(block, last)) |baseline| baseline - block.y.get().* else block.height.get().*);
+}
+
+fn isIntrinsicSize(raw: []const u8) bool {
+    const value = css_sizing.parse(raw) orelse return false;
+    return switch (value) {
+        .min_content, .max_content, .fit_content => true,
+        else => false,
+    };
+}
+
 fn measureInlineBlock(self: *Layout, node: *Node, element: *const parser.Element, parent: *BlockLayout) !InlineBlockLayout {
     const styles = if (element.style) |*map| map else return error.MissingComputedStyle;
     const containing_width = self.containingBlockCssDimension(false) orelse 0;
@@ -3471,17 +3514,25 @@ fn measureInlineBlock(self: *Layout, node: *Node, element: *const parser.Element
     const context = parser.CssLengthResolutionContext{ .font_size = self.font_size_css, .percentage_base = containing_width };
     const insets = edges.padding.horizontal() +| edges.border.horizontal();
     const border_box = flex_format.eq(styleValue(styles, "box-sizing") orelse "content-box", "border-box");
-    const adjustment: f64 = if (border_box) @floatFromInt(insets) else 0;
     const available: f64 = @floatFromInt(@max(parent.content_width -| insets -| edges.margin.horizontal(), 0));
-    const intrinsic = try intrinsic_measure.measure(node, &self.font_manager, @as(f64, effective_zoom) / self.zoom());
-    var content_width = if (parser.resolveCssLength(styleValue(styles, "width") orelse "auto", context)) |css|
-        @max(self.scaleActiveCssFloat(css) - adjustment, 0)
-    else
-        @min(@max(intrinsic.min, available), intrinsic.max);
-    if (parser.resolveCssLength(styleValue(styles, "max-width") orelse "none", context)) |css|
-        content_width = @min(content_width, @max(self.scaleActiveCssFloat(css) - adjustment, 0));
-    if (parser.resolveCssLength(styleValue(styles, "min-width") orelse "0px", context)) |css|
-        content_width = @max(content_width, @max(self.scaleActiveCssFloat(css) - adjustment, 0));
+    const target = if (parent.persistent_dependencies) &parent.height else parent.temporary_dependency_target.?;
+    registerIntrinsicDependencies(node, target);
+    const intrinsic_scale = @as(f64, effective_zoom) / self.zoom();
+    const intrinsic = intrinsic_measure.keywordContent(node, try intrinsic_measure.measureContent(node, &self.font_manager, intrinsic_scale), intrinsic_scale);
+    const resolution = sizing.ResolveContext{
+        .font_size = context.font_size,
+        .percentage_base = context.percentage_base,
+        .scale = @as(f64, effective_zoom) / self.zoom(),
+        .insets = @floatFromInt(insets),
+        .border_box = border_box,
+        .intrinsic = .{ .min = intrinsic.min, .max = intrinsic.max },
+        .available = available,
+    };
+    const constraints = sizing.Constraints{
+        .min = sizing.resolve(styleValue(styles, "min-width") orelse "auto", resolution) orelse 0,
+        .max = sizing.resolve(styleValue(styles, "max-width") orelse "none", resolution) orelse std.math.inf(f64),
+    };
+    const content_width = constraints.clamp(sizing.resolve(styleValue(styles, "width") orelse "auto", resolution) orelse sizing.fitContent(resolution.intrinsic, available));
 
     const root = try BlockLayout.initWithDependencyTracking(self.allocator, node.*, node, parent.document, parent, null, false);
     defer {
@@ -3562,7 +3613,8 @@ fn registerIntrinsicDependencies(node: *Node, target: *ProtectedField(i32)) void
                 std.mem.eql(u8, name, "display") or std.mem.eql(u8, name, "width") or std.mem.eql(u8, name, "height") or
                 std.mem.startsWith(u8, name, "min-") or std.mem.startsWith(u8, name, "max-") or std.mem.eql(u8, name, "aspect-ratio") or
                 std.mem.eql(u8, name, "white-space") or std.mem.eql(u8, name, "zoom") or
-                std.mem.eql(u8, name, "position") or std.mem.eql(u8, name, "box-sizing"))
+                std.mem.eql(u8, name, "position") or std.mem.eql(u8, name, "float") or std.mem.eql(u8, name, "clear") or
+                std.mem.eql(u8, name, "overflow") or std.mem.eql(u8, name, "box-sizing"))
                 target.addDependency(entry.value_ptr, map.allocator);
         }
     }
@@ -4172,7 +4224,10 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
         max_item_line_height,
     );
     const baseline = self.cursor_y + baseline_ascent;
-    if (self.inline_block) |block| block.last_line_baseline = baseline;
+    if (self.inline_block) |block| {
+        if (block.first_line_baseline == null) block.first_line_baseline = baseline;
+        block.last_line_baseline = baseline;
+    }
     const line_top = self.cursor_y;
     const line_box_height = line_height;
 
@@ -6966,6 +7021,10 @@ const AllocatedBox = struct {
     /// percentages must not become relative to the allocated box itself.
     containing_width_css: ?f64 = null,
     containing_height_css: ?f64 = null,
+    /// Geometry alone is not proof of a definite percentage basis. Null keeps
+    /// the existing table policy; flex/grid callers supply provenance explicitly.
+    height_definite: ?bool = null,
+    measure_auto_height: bool = false,
 };
 
 /// A parent supplies this synchronous, scalar-only cursor immediately before
@@ -7046,6 +7105,7 @@ const BlockLayout = struct {
     embedded_box: ?EmbeddedBlockBox = null,
     rich_button_root: bool = false,
     inline_formatting_root: bool = false,
+    first_line_baseline: ?i32 = null,
     last_line_baseline: ?i32 = null,
     effective_zoom_override: ?f32 = null,
     /// Present only during a formatting parent's synchronous child-layout pass.
@@ -7088,6 +7148,7 @@ const BlockLayout = struct {
     content_width: i32 = 0,
     content_height: i32 = 0,
     content_height_definite: bool = false,
+    natural_content_height: i32 = 0,
     /// Visual movement applied after normal-flow geometry. Keeping this
     /// separate from x/y prevents relative positioning from moving the slot
     /// used by a following sibling.
@@ -8350,6 +8411,9 @@ const BlockLayout = struct {
 
     fn establishesFloatContext(self: *const BlockLayout) bool {
         if (self.parent_block == null or self.embedded_box != null or self.inline_formatting_root) return true;
+        // Item contents form an independent formatting context across both
+        // measuring allocations and retained layout/paint queries.
+        if (self.parent_block.?.formattingKind() != null) return true;
         if (self.floatSide() != .none or isOutOfFlowPosition(self.positionMode())) return true;
         return blockAvoidsExternalFloats(self);
     }
@@ -8764,7 +8828,6 @@ const BlockLayout = struct {
             .percentage_base = containing_width_css,
         };
         const sizing_border_box = flex_format.eq(self.formatStyle("box-sizing", "content-box"), "border-box");
-        const sizing_width_edges = if (sizing_border_box) self.padding.horizontal() + self.border.horizontal() else 0;
         const sizing_height_edges = if (sizing_border_box) self.padding.vertical() + self.border.vertical() else 0;
         const image_box: ?replaced_sizing.Size = if (self.inline_nodes == null and self.node == .element and elementUsesImageLayout(&self.node.element)) blk: {
             const element = &self.node.element;
@@ -8812,27 +8875,27 @@ const BlockLayout = struct {
             });
             break :blk .{ .width = scaleCssPixel(used.width, zoom_value, engine.zoom()), .height = scaleCssPixel(used.height, zoom_value, engine.zoom()) };
         } else null;
-        const unconstrained_width: ?i32 = if (self.embedded_box == null)
-            if (self.specifiedPixelDimension("width", &self.width, width_context)) |width|
-                @max(scaleCssPixel(width, zoom_value, engine.zoom()) -| sizing_width_edges, 0)
-            else
-                null
+        const width_scale = @as(f64, zoom_value) / engine.zoom();
+        const width_insets: f64 = @floatFromInt(self.padding.horizontal() + self.border.horizontal());
+        const width_available = @max(containing_width_css * width_scale - width_insets - @as(f64, @floatFromInt(self.margin.horizontal())), 0);
+        var width_intrinsic = if (self.inline_nodes == null and self.embedded_box == null and
+            (isIntrinsicSize(self.formatStyle("width", "auto")) or isIntrinsicSize(self.formatStyle("min-width", "auto")) or isIntrinsicSize(self.formatStyle("max-width", "none"))))
+            try self.intrinsicContent(engine, width_scale)
         else
-            null;
-        const min_width: ?i32 = if (self.embedded_box == null)
-            if (self.specifiedPixelDimension("min-width", &self.width, width_context)) |width|
-                @max(scaleCssPixel(width, zoom_value, engine.zoom()) -| sizing_width_edges, 0)
-            else
-                null
-        else
-            null;
-        const max_width: ?i32 = if (self.embedded_box == null)
-            if (self.specifiedPixelDimension("max-width", &self.width, width_context)) |width|
-                @max(scaleCssPixel(width, zoom_value, engine.zoom()) -| sizing_width_edges, 0)
-            else
-                null
-        else
-            null;
+            intrinsic_measure.Width{};
+        if (self.node_ptr) |node| width_intrinsic = intrinsic_measure.keywordContent(node, width_intrinsic, width_scale);
+        const width_resolution = sizing.ResolveContext{
+            .font_size = self.computedFontSizeCss(),
+            .percentage_base = containing_width_css,
+            .scale = width_scale,
+            .insets = width_insets,
+            .border_box = sizing_border_box,
+            .intrinsic = .{ .min = width_intrinsic.min, .max = width_intrinsic.max },
+            .available = width_available,
+        };
+        const unconstrained_width = self.resolvedInlineDimension("width", width_context, width_resolution, zoom_value, engine.zoom());
+        const min_width = self.resolvedInlineDimension("min-width", width_context, width_resolution, zoom_value, engine.zoom());
+        const max_width = self.resolvedInlineDimension("max-width", width_context, width_resolution, zoom_value, engine.zoom());
         const style_specified_width = if (unconstrained_width) |width|
             constrainDimension(width, min_width, max_width)
         else
@@ -8901,6 +8964,9 @@ const BlockLayout = struct {
                 style_specified_height
         else
             style_specified_height;
+        if (allocated_box) |box| if (box.measure_auto_height) {
+            specified_height = null;
+        };
         // Ordinary in-flow blocks share ratio grammar with replaced elements,
         // but retain their own auto sizing and content minimum rules.
         const preferred_ratio = if (self.inline_nodes == null and self.embedded_box == null and
@@ -9165,13 +9231,18 @@ const BlockLayout = struct {
             }
         }
 
+        const height_is_definite = if (allocated_box) |box|
+            box.height_definite orelse (specified_height != null)
+        else
+            specified_height != null;
+
         // Publish a definite block height before laying out descendants so a
         // percentage height can resolve against this containing block. Auto
         // heights remain unavailable until children have been measured.
         if (image_box) |box| {
             self.content_height = box.height;
         } else {
-            self.content_height_definite = specified_height != null;
+            self.content_height_definite = height_is_definite;
             if (specified_height) |height| {
                 self.content_height = height;
                 self.height.set(@max(height + self.padding.vertical() + self.border.vertical(), 0));
@@ -9359,7 +9430,7 @@ const BlockLayout = struct {
             // Inline layout mode - use the old approach for now
             // TODO: Refactor to populate LineLayout and TextLayout objects
             self.height.frozen_dependencies = false;
-            self.content_height_definite = specified_height != null;
+            self.content_height_definite = height_is_definite;
             try engine.layoutInlineBlock(self, true);
             self.used_inline_layout = true;
             self.inline_paint_dirty = false;
@@ -9383,7 +9454,7 @@ const BlockLayout = struct {
             natural_height = self.content_height;
             if (specified_height) |height| {
                 self.content_height = height;
-                self.content_height_definite = true;
+                self.content_height_definite = height_is_definite;
             } else {
                 self.content_height = constrainDimension(
                     self.content_height,
@@ -9470,6 +9541,7 @@ const BlockLayout = struct {
 
         try recordElementFocusBounds(engine, self);
 
+        self.natural_content_height = natural_height;
         self.updateScrollGeometry(specified_height, natural_height + self.padding.vertical() + self.border.vertical());
 
         // Clear descendant flags after layout pass
@@ -9660,7 +9732,8 @@ const BlockLayout = struct {
         var measured = intrinsic_measure.Width{};
         if (self.inline_nodes) |nodes| {
             for (nodes) |node| {
-                const part = try intrinsic_measure.measure(node, &engine.font_manager, scale);
+                const node_scale = if (node.* == .element) if (node.element.style) |node_styles| scale * parseCssZoom(styleValue(&node_styles, "zoom") orelse "1") else scale else scale;
+                const part = try intrinsic_measure.measureOuter(node, &engine.font_manager, node_scale);
                 measured.min = @max(measured.min, part.min);
                 measured.max += part.max;
             }
@@ -9775,7 +9848,47 @@ const BlockLayout = struct {
             self.width.addDependency(field, styles.allocator);
             return field.read(&self.width, styles.allocator).*;
         }
+        if (self.temporary_dependency_target) |target| {
+            target.addDependency(field, styles.allocator);
+            return field.read(target, styles.allocator).*;
+        }
         return field.get().*;
+    }
+
+    /// Synchronous intrinsic borrow; all descendants notify a persistent owner.
+    fn intrinsicContent(self: *BlockLayout, engine: *Layout, scale: f64) !intrinsic_measure.Width {
+        const target = if (self.persistent_dependencies) &self.width else self.temporary_dependency_target;
+        var result = intrinsic_measure.Width{};
+        if (self.inline_nodes) |nodes| {
+            var pending_space: f64 = 0;
+            for (nodes) |node| {
+                if (target) |field| registerIntrinsicDependencies(node, field);
+                const node_scale = if (node.* == .element) if (node.element.style) |node_styles| scale * parseCssZoom(styleValue(&node_styles, "zoom") orelse "1") else scale else scale;
+                const part = try intrinsic_measure.measureOuter(node, &engine.font_manager, node_scale);
+                result.min = @max(result.min, part.min);
+                if (part.max > 0) {
+                    if (result.max > 0) result.max += @max(pending_space, part.leading_space);
+                    result.max += part.max;
+                    pending_space = part.trailing_space;
+                } else pending_space = @max(pending_space, part.trailing_space);
+            }
+        } else if (self.node_ptr) |node| {
+            if (target) |field| registerIntrinsicDependencies(node, field);
+            result = try intrinsic_measure.measureContent(node, &engine.font_manager, scale);
+        }
+        return result;
+    }
+
+    fn resolvedInlineDimension(self: *BlockLayout, property: []const u8, context: parser.CssLengthResolutionContext, resolution: sizing.ResolveContext, effective_zoom: f32, page_zoom: f32) ?i32 {
+        if (self.inline_nodes != null or self.embedded_box != null) return null;
+        const raw = self.formatStyle(property, "auto");
+        if (isIntrinsicSize(raw)) {
+            const used = sizing.resolve(raw, resolution) orelse return null;
+            return @max(formatCoordinate(used), 0);
+        }
+        const pixels = self.specifiedPixelDimension(property, &self.width, context) orelse return null;
+        const insets: i32 = if (resolution.border_box) formatCoordinate(resolution.insets) else 0;
+        return @max(scaleCssPixel(pixels, effective_zoom, page_zoom) -| insets, 0);
     }
 
     fn formatLength(self: *BlockLayout, property: []const u8, base: ?f64, scale: f64) ?f64 {
@@ -9788,78 +9901,204 @@ const BlockLayout = struct {
     const FormatItem = struct {
         block: *BlockLayout,
         main: flex_format.Item,
+        intrinsic: sizing.Intrinsic,
         width: f64,
-        height: f64 = 0,
-        min_cross: f64 = 0,
-        max_cross: f64 = std.math.inf(f64),
-        cross_before: f64 = 0,
-        cross_after: f64 = 0,
-        cross_auto: bool = true,
-        cross_align: []const u8 = "stretch",
+        height: f64,
+        x_edges: f64,
+        y_edges: f64,
+        main_edges: f64,
+        min_cross: f64,
+        max_cross: f64,
+        cross_before: f64,
+        cross_after: f64,
+        cross_auto_before: bool,
+        cross_auto_after: bool,
+        cross_auto: bool,
+        cross_align: []const u8,
+        width_auto: bool,
+        height_authored: bool,
+        basis_definite: bool,
+        automatic_main: bool,
+        specified_main: ?f64,
+        transferred_main: ?f64,
+        content_main_min: f64,
+        content_main_max: f64,
+        natural_replaced_main: ?f64,
+        scrollable: bool,
+        replaced: bool,
+        ratio: ?f64,
+        ratio_border_box: bool,
         scale: f64,
+
+        fn ratioHeight(self: FormatItem, width: f64) ?f64 {
+            const ratio = self.ratio orelse return null;
+            return if (self.ratio_border_box) @max(self.y_edges, width / ratio) else @max(self.y_edges, (width - self.x_edges) / ratio + self.y_edges);
+        }
+
+        fn mainMinimum(self: FormatItem, content: f64) f64 {
+            return @max(self.main_edges, sizing.automaticMinimum(.{
+                .content = (sizing.Constraints{ .min = self.content_main_min, .max = self.content_main_max }).clamp(content),
+                .specified = self.specified_main,
+                .transferred = self.transferred_main,
+                .maximum = self.main.max,
+                .scrollable = self.scrollable,
+                .replaced = self.replaced,
+            }));
+        }
     };
 
-    fn formatItem(self: *BlockLayout, child: *BlockLayout, engine: *Layout, column: bool, definite_height: ?i32) !FormatItem {
+    fn formatItem(self: *BlockLayout, child: *BlockLayout, engine: *Layout, column: bool, width_base: ?f64, height_base: ?f64) !FormatItem {
         const effective = child.effectiveZoomFromParent(self.zoom.get().*);
         const scale = @as(f64, effective) / self.document.page_zoom;
-        const width_base: f64 = @floatFromInt(self.content_width);
-        const height_base: ?f64 = if (definite_height) |h| @floatFromInt(h) else null;
-        const edges = child.resolvedBoxEdges(width_base / scale, effective, engine.zoom());
+        const edges = child.resolvedBoxEdges((width_base orelse 0) / scale, effective, engine.zoom());
         const x_edges: f64 = @floatFromInt(edges.padding.horizontal() + edges.border.horizontal());
         const y_edges: f64 = @floatFromInt(edges.padding.vertical() + edges.border.vertical());
         const border_box = flex_format.eq(child.formatStyle("box-sizing", "content-box"), "border-box");
-        var intrinsic: intrinsic_measure.Width = .{};
-        if (child.inline_nodes) |nodes| {
-            for (nodes) |node| {
-                const measured = try intrinsic_measure.measure(node, &engine.font_manager, scale);
-                intrinsic.min = @max(intrinsic.min, measured.min);
-                intrinsic.max += measured.max;
-            }
-        } else if (child.node_ptr) |node| intrinsic = try intrinsic_measure.measure(node, &engine.font_manager, scale);
-        const authored_width = child.formatLength("width", width_base, scale);
-        const authored_height = child.formatLength("height", height_base, scale);
-        const width = if (authored_width) |w| @max(w + if (border_box) @as(f64, 0) else x_edges, x_edges) else intrinsic.max + x_edges;
-        const height = if (authored_height) |h| @max(h + if (border_box) @as(f64, 0) else y_edges, y_edges) else y_edges;
+        const measured = try child.intrinsicContent(engine, scale);
+        // The container chooses sibling allocations from these inputs, so a
+        // descendant edit must invalidate the container as well as the item.
+        const target = if (self.persistent_dependencies) &self.width else self.temporary_dependency_target;
+        if (target) |field| {
+            if (child.inline_nodes) |nodes| {
+                for (nodes) |node| registerIntrinsicDependencies(node, field);
+            } else if (child.node_ptr) |node| registerIntrinsicDependencies(node, field);
+        }
+        const natural_image = if (child.node == .element) if (child.node.element.image_data) |*data| data else null else null;
+        const raw_image_width = if (natural_image) |data| @as(f64, @floatFromInt(data.image.width)) * scale else null;
+        var intrinsic = sizing.Intrinsic{ .min = raw_image_width orelse measured.min, .max = raw_image_width orelse measured.max };
+        const keyword_width = if (child.node_ptr) |node| intrinsic_measure.keywordContent(node, .{ .min = intrinsic.min, .max = intrinsic.max }, scale) else measured;
+        const width_context = sizing.ResolveContext{
+            .font_size = child.computedFontSizeCss(),
+            .percentage_base = if (width_base) |w| w / scale else null,
+            .scale = scale,
+            .insets = x_edges,
+            .border_box = border_box,
+            .intrinsic = .{ .min = keyword_width.min, .max = keyword_width.max },
+            .available = if (width_base) |w| @max(w - x_edges - @as(f64, @floatFromInt(edges.margin.horizontal())), 0) else null,
+        };
+        const authored_width = sizing.resolve(child.formatStyle("width", "auto"), width_context);
+        const authored_height = if (child.formatLength("height", height_base, scale)) |h| sizing.toContent(h, y_edges, border_box) else null;
+        const minimum_width = sizing.resolve(child.formatStyle("min-width", "auto"), width_context);
+        const maximum_width = sizing.resolve(child.formatStyle("max-width", "none"), width_context);
+        const minimum_height = if (child.formatLength("min-height", height_base, scale)) |h| sizing.toContent(h, y_edges, border_box) else null;
+        const maximum_height = if (child.formatLength("max-height", height_base, scale)) |h| sizing.toContent(h, y_edges, border_box) else null;
+        var width = (authored_width orelse intrinsic.max) + x_edges;
+        const height = (authored_height orelse 0) + y_edges;
         const main_edges = if (column) y_edges else x_edges;
         const cross_edges = if (column) x_edges else y_edges;
-        const main_base = if (column) height_base else width_base;
-        const cross_base = if (column) width_base else height_base;
-        const main_min = child.formatLength(if (column) "min-height" else "min-width", main_base, scale);
-        const main_max = child.formatLength(if (column) "max-height" else "max-width", main_base, scale);
-        const cross_min = child.formatLength(if (column) "min-width" else "min-height", cross_base, scale);
-        const cross_max = child.formatLength(if (column) "max-width" else "max-height", cross_base, scale);
-        const basis = child.formatLength("flex-basis", main_base, scale);
+        const main_min = if (column) minimum_height else minimum_width;
+        const main_max = if (column) maximum_height else maximum_width;
+        const cross_min = if (column) minimum_width else minimum_height;
+        const cross_max = if (column) maximum_width else maximum_height;
+        const raw_basis = child.formatStyle("flex-basis", "auto");
+        const basis_length = child.formatLength("flex-basis", if (column) height_base else width_base, scale);
+        const basis_content = if (!column and isIntrinsicSize(raw_basis)) sizing.resolve(raw_basis, width_context) else null;
+        const content_basis = flex_format.eq(raw_basis, "content") or
+            (!flex_format.eq(raw_basis, "auto") and basis_length == null and basis_content == null);
+        var basis = if (basis_length) |b| b + if (border_box) @as(f64, 0) else main_edges else if (basis_content) |b| b + main_edges else if (content_basis) if (column) y_edges else intrinsic.max + x_edges else if (column) height else width;
+        const authored_main = if (column) authored_height else authored_width;
         const alignment = child.formatStyle("align-self", "auto");
-        return .{
+        const overflow = child.formatStyle("overflow", "visible");
+        const replaced = child.node == .element and (child.node.element.image_data != null or flex_format.eq(child.node.element.tag, "img"));
+        var ratio: ?f64 = null;
+        const aspect = replaced_sizing.parseAspectRatio(child.formatStyle("aspect-ratio", "auto")) orelse replaced_sizing.AspectRatio.auto;
+        if (aspect.ratio) |r| ratio = r;
+        if (replaced and (aspect.use_intrinsic or ratio == null)) {
+            if (child.node.element.image_data) |data| if (data.image.height > 0) {
+                ratio = @as(f64, @floatFromInt(data.image.width)) / @as(f64, @floatFromInt(data.image.height));
+            };
+        }
+        const cross_authored = if (column) authored_width else authored_height;
+        const definite_cross = if (column and isIntrinsicSize(child.formatStyle("width", "auto"))) null else cross_authored;
+        const transferred = if (ratio) |r| if (definite_cross) |c| blk: {
+            const bounded = (sizing.Constraints{ .min = cross_min orelse 0, .max = cross_max orelse std.math.inf(f64) }).clamp(c);
+            const use_border = border_box and !replaced and !aspect.use_intrinsic;
+            const suggestion = if (column) (bounded + if (use_border) cross_edges else @as(f64, 0)) / r else (bounded + if (use_border) cross_edges else @as(f64, 0)) * r;
+            break :blk @max(main_edges, suggestion + if (use_border) @as(f64, 0) else main_edges);
+        } else null else null;
+        const ratio_basis = basis_length == null and basis_content == null and transferred != null and (content_basis or authored_main == null);
+        if (ratio_basis) basis = transferred.?;
+        var content_main_min = main_edges;
+        var content_main_max: f64 = std.math.inf(f64);
+        if (ratio) |r| {
+            const use_border = border_box and !replaced and !aspect.use_intrinsic;
+            const ratio_factor = if (column) 1 / r else r;
+            if (cross_min) |minimum| content_main_min = @max(main_edges, (minimum + if (use_border) cross_edges else @as(f64, 0)) * ratio_factor + if (use_border) @as(f64, 0) else main_edges);
+            if (cross_max) |maximum| content_main_max = @max(main_edges, (maximum + if (use_border) cross_edges else @as(f64, 0)) * ratio_factor + if (use_border) @as(f64, 0) else main_edges);
+        }
+        // A definite height supplies the preferred auto width through ratio;
+        // normal grid alignment then preserves this width instead of stretching.
+        if (!replaced and authored_width == null and authored_height != null and ratio != null) {
+            const use_border = border_box and !replaced and !aspect.use_intrinsic;
+            width = @max(x_edges, (authored_height.? + if (use_border) y_edges else @as(f64, 0)) * ratio.? + if (use_border) @as(f64, 0) else x_edges);
+        }
+        if (!column and raw_image_width != null) {
+            intrinsic.min = (sizing.Constraints{ .min = content_main_min, .max = content_main_max }).clamp(intrinsic.min + x_edges) - x_edges;
+            intrinsic.max = intrinsic.min;
+            if (authored_width == null) width = intrinsic.max + x_edges;
+            if (basis_length == null and basis_content == null and !ratio_basis and (content_basis or authored_main == null)) basis = intrinsic.max + x_edges;
+        }
+        const natural_replaced_main = if (natural_image) |data| (if (column) @as(f64, @floatFromInt(data.image.height)) else @as(f64, @floatFromInt(data.image.width))) * scale + main_edges else null;
+        var result = FormatItem{
             .block = child,
             .scale = scale,
+            .intrinsic = if (replaced) intrinsic else .{ .min = keyword_width.min, .max = keyword_width.max },
             .width = width,
             .height = height,
+            .x_edges = x_edges,
+            .y_edges = y_edges,
+            .main_edges = main_edges,
             .main = .{
-                .basis = if (basis) |size| @max(size + if (border_box) @as(f64, 0) else main_edges, main_edges) else if (column) height else width,
-                .min = @max(main_edges, if (main_min) |m| m + if (border_box) @as(f64, 0) else main_edges else if (!column and flex_format.eq(child.formatStyle("overflow", "visible"), "visible")) @min(intrinsic.min + x_edges, width) else 0),
-                .max = if (main_max) |m| @max(main_edges, m + if (border_box) @as(f64, 0) else main_edges) else std.math.inf(f64),
-                .grow = @import("../../document/css_flex.zig").factor(child.formatStyle("flex-grow", "0")) orelse 0,
-                .shrink = @import("../../document/css_flex.zig").factor(child.formatStyle("flex-shrink", "1")) orelse 1,
+                .basis = basis,
+                .inner_basis = basis - main_edges,
+                .min = (main_min orelse 0) + main_edges,
+                .max = if (main_max) |m| m + main_edges else std.math.inf(f64),
+                .grow = std.fmt.parseFloat(f64, child.formatStyle("flex-grow", "0")) catch 0,
+                .shrink = std.fmt.parseFloat(f64, child.formatStyle("flex-shrink", "1")) catch 1,
                 .before = @floatFromInt(if (column) edges.margin.top else edges.margin.left),
                 .after = @floatFromInt(if (column) edges.margin.bottom else edges.margin.right),
                 .auto_before = flex_format.eq(child.formatStyle(if (column) "margin-top" else "margin-left", "0px"), "auto"),
                 .auto_after = flex_format.eq(child.formatStyle(if (column) "margin-bottom" else "margin-right", "0px"), "auto"),
             },
-            .min_cross = @max(cross_edges, if (cross_min) |m| m + if (border_box) @as(f64, 0) else cross_edges else 0),
-            .max_cross = if (cross_max) |m| @max(cross_edges, m + if (border_box) @as(f64, 0) else cross_edges) else std.math.inf(f64),
+            .min_cross = (cross_min orelse 0) + cross_edges,
+            .max_cross = if (cross_max) |m| m + cross_edges else std.math.inf(f64),
             .cross_before = @floatFromInt(if (column) edges.margin.left else edges.margin.top),
             .cross_after = @floatFromInt(if (column) edges.margin.right else edges.margin.bottom),
-            .cross_auto = if (column) authored_width == null else authored_height == null,
+            .cross_auto_before = flex_format.eq(child.formatStyle(if (column) "margin-left" else "margin-top", "0px"), "auto"),
+            .cross_auto_after = flex_format.eq(child.formatStyle(if (column) "margin-right" else "margin-bottom", "0px"), "auto"),
+            .cross_auto = cross_authored == null,
             .cross_align = if (flex_format.eq(alignment, "auto")) self.formatStyle("align-items", "normal") else alignment,
+            .width_auto = authored_width == null,
+            .height_authored = authored_height != null,
+            .basis_definite = ratio_basis or basis_length != null or (flex_format.eq(raw_basis, "auto") and authored_main != null and !isIntrinsicSize(child.formatStyle(if (column) "height" else "width", "auto"))),
+            .automatic_main = main_min == null and flex_format.eq(child.formatStyle(if (column) "min-height" else "min-width", "auto"), "auto"),
+            .specified_main = if (authored_main) |m| m + main_edges else null,
+            .transferred_main = transferred,
+            .content_main_min = content_main_min,
+            .content_main_max = content_main_max,
+            .natural_replaced_main = natural_replaced_main,
+            .scrollable = flex_format.eq(overflow, "hidden") or flex_format.eq(overflow, "scroll") or flex_format.eq(overflow, "auto"),
+            .replaced = replaced,
+            .ratio = ratio,
+            .ratio_border_box = border_box and !replaced and !aspect.use_intrinsic,
         };
+        if (!column and result.automatic_main) result.main.min = result.mainMinimum(intrinsic.min + x_edges);
+        return result;
     }
 
     fn formatCoordinate(value: f64) i32 {
         return @intFromFloat(std.math.clamp(@round(value), std.math.minInt(i32), std.math.maxInt(i32)));
     }
 
-    fn placeFormatItem(self: *BlockLayout, engine: *Layout, item: *FormatItem, x: f64, y: f64, width: f64, height: ?f64) !void {
+    const Placement = struct {
+        height_definite: ?bool = null,
+        area_width: ?f64 = null,
+        area_height: ?f64 = null,
+        measure_auto_height: bool = false,
+        grid_area: bool = false,
+    };
+
+    fn placeFormatItem(self: *BlockLayout, engine: *Layout, item: *FormatItem, x: f64, y: f64, width: f64, height: ?f64, placement: Placement) !void {
         const origin_x = self.x.get().* + self.padding.left + self.border.left;
         const origin_y = self.y.get().* + self.padding.top + self.border.top;
         try item.block.layoutWithAllocatedBox(engine, .{
@@ -9867,8 +10106,10 @@ const BlockLayout = struct {
             .y = origin_y +| formatCoordinate(y),
             .width = @max(formatCoordinate(x + width) -| formatCoordinate(x), 0),
             .height = if (height) |h| @max(formatCoordinate(y + h) -| formatCoordinate(y), 0) else null,
-            .containing_width_css = @as(f64, @floatFromInt(self.content_width)) / item.scale,
-            .containing_height_css = if (self.content_height_definite) @as(f64, @floatFromInt(self.content_height)) / item.scale else null,
+            .containing_width_css = (placement.area_width orelse @as(f64, @floatFromInt(self.content_width))) / item.scale,
+            .containing_height_css = if (placement.area_height) |h| h / item.scale else if (!placement.grid_area and self.content_height_definite) @as(f64, @floatFromInt(self.content_height)) / item.scale else null,
+            .height_definite = placement.height_definite,
+            .measure_auto_height = placement.measure_auto_height,
         });
         item.width = @floatFromInt(item.block.width.get().*);
         item.height = @floatFromInt(item.block.height.get().*);
@@ -9882,7 +10123,7 @@ const BlockLayout = struct {
         for (self.children.items) |child| {
             const block = child.block;
             if (isOutOfFlowPosition(block.positionMode())) continue;
-            try items.append(self.allocator, try self.formatItem(block, engine, if (grid) false else column, definite_height));
+            try items.append(self.allocator, try self.formatItem(block, engine, if (grid) false else column, if (grid) null else @as(f64, @floatFromInt(self.content_width)), if (!grid and self.content_height_definite) if (definite_height) |h| @as(f64, @floatFromInt(h)) else null else null));
         }
         // CSS order is a visual ordering only; never reorder the DOM children.
         std.mem.sort(FormatItem, items.items, {}, struct {
@@ -9894,7 +10135,7 @@ const BlockLayout = struct {
         }.less);
         const scale = @as(f64, self.zoom.get().*) / self.document.page_zoom;
         const column_gap = self.formatLength("column-gap", @floatFromInt(self.content_width), scale) orelse 0;
-        const row_gap = self.formatLength("row-gap", if (definite_height) |h| @as(f64, @floatFromInt(h)) else null, scale) orelse 0;
+        const row_gap = self.formatLength("row-gap", if (self.content_height_definite) if (definite_height) |h| @as(f64, @floatFromInt(h)) else null else null, scale) orelse 0;
         const height = if (grid)
             try self.layoutGridItems(engine, items.items, definite_height, column_gap, row_gap)
         else
@@ -9915,64 +10156,128 @@ const BlockLayout = struct {
         engine.collect_hit_test_bounds = false;
         if (column) {
             for (items) |*item| {
-                const width = if (item.cross_auto) @as(f64, @floatFromInt(self.content_width)) - item.cross_before - item.cross_after else item.width;
-                try self.placeFormatItem(engine, item, 0, 0, @max(item.min_cross, @min(width, item.max_cross)), null);
-                if (item.block.formatLength("flex-basis", if (definite_height) |h| @as(f64, @floatFromInt(h)) else null, item.scale) == null) item.main.basis = item.height;
+                const available = @as(f64, @floatFromInt(self.content_width)) - item.cross_before - item.cross_after;
+                const stretches = flex_format.eq(self.formatStyle("flex-wrap", "nowrap"), "nowrap") and item.cross_auto and !item.cross_auto_before and !item.cross_auto_after and stretchesAlignment(item.cross_align);
+                const width = (sizing.Constraints{ .min = item.min_cross, .max = item.max_cross }).clamp(if (stretches) available else if (item.width_auto and !(item.height_authored and item.ratio != null)) sizing.fitContent(item.intrinsic, available - item.x_edges) + item.x_edges else item.width);
+                try self.placeFormatItem(engine, item, 0, 0, width, null, .{ .measure_auto_height = true, .height_definite = false });
+                const natural = if (item.natural_replaced_main) |image_height| (sizing.Constraints{ .min = item.content_main_min, .max = item.content_main_max }).clamp(image_height) else @as(f64, @floatFromInt(item.block.natural_content_height)) + item.y_edges;
+                if (!item.basis_definite) {
+                    item.main.basis = natural;
+                    item.main.inner_basis = natural - item.y_edges;
+                }
+                if (item.automatic_main) item.main.min = item.mainMinimum(natural);
             }
         }
         const main_items = try self.allocator.alloc(flex_format.Item, items.len);
         defer self.allocator.free(main_items);
+        const reverse = std.mem.endsWith(u8, self.formatStyle("flex-direction", "row"), "reverse");
+        const wrap_reverse = flex_format.eq(self.formatStyle("flex-wrap", "nowrap"), "wrap-reverse");
         var natural_main = main_gap * @as(f64, @floatFromInt(items.len - 1));
         for (items, main_items) |item, *main| {
             main.* = item.main;
+            if (reverse) {
+                std.mem.swap(f64, &main.before, &main.after);
+                std.mem.swap(bool, &main.auto_before, &main.auto_after);
+            }
             natural_main += flex_format.clamp(item.main, item.main.basis) + item.main.before + item.main.after;
         }
         const main_size = if (column) if (definite_height) |h| @as(f64, @floatFromInt(h)) else natural_main else @as(f64, @floatFromInt(self.content_width));
         const cross_size: ?f64 = if (column) @floatFromInt(self.content_width) else if (definite_height) |h| @floatFromInt(h) else null;
         const used = try self.allocator.alloc(flex_format.Used, items.len);
         defer self.allocator.free(used);
-        const Line = struct { start: usize, end: usize, cross: f64 };
+        const Line = struct { start: usize, end: usize, cross: f64, first: box_alignment.BaselineGroup, last: box_alignment.BaselineGroup };
         var lines: std.ArrayList(Line) = .empty;
         defer lines.deinit(self.allocator);
         const wrap = !flex_format.eq(self.formatStyle("flex-wrap", "nowrap"), "nowrap");
-        const reverse = std.mem.endsWith(u8, self.formatStyle("flex-direction", "row"), "reverse");
         var start: usize = 0;
         var total_cross: f64 = 0;
         while (start < items.len) {
             const end = start + flex_format.lineEnd(main_items[start..], main_size, main_gap, wrap);
-            flex_format.resolve(main_items[start..end], main_size, main_gap, self.formatStyle("justify-content", "normal"), reverse, used[start..end]);
+            flex_format.resolve(main_items[start..end], main_size, main_gap, box_alignment.physicalToLogical(self.formatStyle("justify-content", "normal"), column), reverse, used[start..end]);
             var cross: f64 = 0;
+            var first = box_alignment.BaselineGroup{};
+            var last = box_alignment.BaselineGroup{};
             for (items[start..end], used[start..end]) |*item, placement| {
-                if (!column) try self.placeFormatItem(engine, item, 0, 0, placement.size, null);
+                if (!column) {
+                    const constraints = sizing.Constraints{ .min = item.min_cross, .max = item.max_cross };
+                    const ratio_height = if (!item.height_authored) item.ratioHeight(placement.size) else null;
+                    try self.placeFormatItem(engine, item, 0, 0, placement.size, if (ratio_height) |height| constraints.clamp(height) else null, .{ .height_definite = item.height_authored or ratio_height != null });
+                    if (ratio_height != null and !item.replaced and !item.scrollable and flex_format.eq(item.block.formatStyle("min-height", "auto"), "auto")) {
+                        const height = constraints.clamp(@max(item.height, @as(f64, @floatFromInt(item.block.natural_content_height)) + item.y_edges));
+                        if (height != item.height) try self.placeFormatItem(engine, item, 0, 0, placement.size, height, .{ .height_definite = true });
+                    }
+                }
                 cross = @max(cross, (if (column) item.width else item.height) + item.cross_before + item.cross_after);
+                if (!column and !item.cross_auto_before and !item.cross_auto_after) {
+                    if (baselineKind(item.cross_align)) |is_last| {
+                        const baseline = blockBaselineOffset(item.block, is_last);
+                        if (is_last) last.add(item.height, baseline, item.cross_before, item.cross_after) else first.add(item.height, baseline, item.cross_before, item.cross_after);
+                    }
+                }
             }
-            try lines.append(self.allocator, .{ .start = start, .end = end, .cross = cross });
+            cross = @max(cross, @max(first.size(), last.size()));
+            if (!wrap) if (cross_size) |size| {
+                cross = size;
+            };
+            try lines.append(self.allocator, .{ .start = start, .end = end, .cross = cross, .first = first, .last = last });
             total_cross += cross + if (start > 0) cross_gap else @as(f64, 0);
             start = end;
         }
-        const free_cross = @max((cross_size orelse total_cross) - total_cross, 0);
+        const free_cross = (cross_size orelse total_cross) - total_cross;
         const align_content = self.formatStyle("align-content", "normal");
-        const stretch_lines = (!wrap or flex_format.eq(align_content, "normal") or flex_format.eq(align_content, "stretch"));
-        const distribution = flex_format.distribute(align_content, if (stretch_lines) 0 else free_cross, lines.items.len);
+        const stretch_lines = wrap and stretchesAlignment(align_content) and free_cross > 0;
+        const distribution = if (wrap) box_alignment.distribute(align_content, if (stretch_lines) 0 else free_cross, lines.items.len, wrap_reverse) else box_alignment.Distribution{};
         var cursor = distribution.offset;
         engine.collect_hit_test_bounds = collect;
         for (lines.items) |line| {
             const line_cross = line.cross + if (stretch_lines) free_cross / @as(f64, @floatFromInt(lines.items.len)) else @as(f64, 0);
             for (items[line.start..line.end], used[line.start..line.end]) |*item, placement| {
-                const available = @max(line_cross - item.cross_before - item.cross_after, 0);
-                const stretch = item.cross_auto and (flex_format.eq(item.cross_align, "normal") or flex_format.eq(item.cross_align, "stretch"));
-                const cross = @max(item.min_cross, @min(if (stretch) available else if (column) item.width else item.height, item.max_cross));
-                var cross_offset = cursor + item.cross_before + flex_format.distribute(item.cross_align, available - cross, 1).offset;
-                if (flex_format.eq(self.formatStyle("flex-wrap", "nowrap"), "wrap-reverse")) cross_offset = (cross_size orelse total_cross) - cross_offset - cross;
-                try self.placeFormatItem(engine, item, if (column) cross_offset else placement.offset, if (column) placement.offset else cross_offset, if (column) cross else placement.size, if (column) placement.size else cross);
+                const auto_margins = box_alignment.AutoMargins{
+                    .before = if (wrap_reverse) item.cross_after else item.cross_before,
+                    .after = if (wrap_reverse) item.cross_before else item.cross_after,
+                    .auto_before = if (wrap_reverse) item.cross_auto_after else item.cross_auto_before,
+                    .auto_after = if (wrap_reverse) item.cross_auto_before else item.cross_auto_after,
+                };
+                const available = @max(line_cross - auto_margins.before - auto_margins.after, 0);
+                const stretch = item.cross_auto and !auto_margins.auto_before and !auto_margins.auto_after and stretchesAlignment(item.cross_align);
+                const cross = (sizing.Constraints{ .min = item.min_cross, .max = item.max_cross }).clamp(if (stretch) available else if (column) item.width else item.height);
+                const margins = box_alignment.resolveAutoMarginsReversed(line_cross, cross, auto_margins, .flex_cross, wrap_reverse);
+                var cross_offset = cursor + margins.before;
+                if (!margins.suppressed) cross_offset += box_alignment.position(item.cross_align, line_cross - cross - margins.before - margins.after, wrap_reverse);
+                if (!column and !auto_margins.auto_before and !auto_margins.auto_after) {
+                    if (baselineKind(item.cross_align)) |is_last| {
+                        const baseline = blockBaselineOffset(item.block, is_last);
+                        // Baseline sharing uses physical block-start coordinates.
+                        const physical = (if (is_last) line_cross - line.last.size() + line.last.offset(baseline) else line.first.offset(baseline));
+                        cross_offset = cursor + if (wrap_reverse) line_cross - physical - cross else physical;
+                    }
+                }
+                if (wrap_reverse) cross_offset = (cross_size orelse total_cross) - cross_offset - cross;
+                const height_definite = if (column) self.content_height_definite or item.basis_definite else stretch or item.height_authored or item.ratio != null;
+                try self.placeFormatItem(engine, item, if (column) cross_offset else placement.offset, if (column) placement.offset else cross_offset, if (column) cross else placement.size, if (column) placement.size else cross, .{ .height_definite = height_definite });
             }
             cursor += line_cross + cross_gap + distribution.between;
         }
         return if (column) main_size else cross_size orelse total_cross;
     }
 
+    fn gridItemMinimum(item: FormatItem, track: grid_format.Track) f64 {
+        if (!item.automatic_main) return item.main.min;
+        const minimum = if (track.min_kind == .auto and !item.scrollable) item.main.min else item.x_edges;
+        return if (track.max_kind == .fixed) @max(item.x_edges, @min(minimum, (track.max orelse track.min) - item.main.before - item.main.after)) else minimum;
+    }
+
+    fn gridItemWidth(self: *BlockLayout, item: FormatItem, track: grid_format.Track, available: f64) f64 {
+        const align_self = item.block.formatStyle("justify-self", "auto");
+        const alignment = if (flex_format.eq(align_self, "auto")) self.formatStyle("justify-items", "normal") else align_self;
+        const normal_exception = flex_format.eq(alignment, "normal") and (item.replaced or item.ratio != null);
+        const stretch = item.width_auto and !normal_exception and !item.main.auto_before and !item.main.auto_after and stretchesAlignment(alignment);
+        const inner = @max(available - item.main.before - item.main.after, 0);
+        const auto_width = if (item.height_authored and item.transferred_main != null) item.transferred_main.? else sizing.fitContent(item.intrinsic, inner - item.x_edges) + item.x_edges;
+        return (sizing.Constraints{ .min = gridItemMinimum(item, track), .max = item.main.max }).clamp(if (stretch) inner else if (item.width_auto) auto_width else item.width);
+    }
+
     fn layoutGridItems(self: *BlockLayout, engine: *Layout, items: []FormatItem, definite_height: ?i32, column_gap: f64, row_gap: f64) !f64 {
-        if (items.len == 0) return 0;
         const scale = @as(f64, self.zoom.get().*) / self.document.page_zoom;
         var columns: [grid_format.tracks.max_tracks]grid_format.Track = undefined;
         var column_count = grid_format.tracks.parse(self.formatStyle("grid-template-columns", "none"), .{ .font_size = self.computedFontSizeCss(), .percentage_base = @as(f64, @floatFromInt(self.content_width)) / scale }, column_gap / scale, items.len, &columns) orelse 0;
@@ -9984,21 +10289,42 @@ const BlockLayout = struct {
             track.min *= scale;
             if (track.max) |max| track.max = max * scale;
         }
-        var intrinsic: [grid_format.tracks.max_tracks]f64 = @splat(0);
-        for (items, 0..) |item, i| intrinsic[i % column_count] = @max(intrinsic[i % column_count], item.main.min + item.main.before + item.main.after);
+        var contributions: [grid_format.tracks.max_tracks]grid_format.Contribution = @splat(.{});
+        for (items, 0..) |item, i| {
+            const column = i % column_count;
+            const min = gridItemMinimum(item, columns[column]);
+            const constraints = sizing.Constraints{ .min = min, .max = item.main.max };
+            const outer = item.main.before + item.main.after;
+            const min_content = constraints.clamp(if (item.width_auto) item.intrinsic.min + item.x_edges else item.width) + outer;
+            const max_content = constraints.clamp(if (item.width_auto) item.intrinsic.max + item.x_edges else item.width) + outer;
+            var minimum = if (item.width_auto) min else constraints.clamp(item.width);
+            if (item.automatic_main and columns[column].max_kind == .fixed) minimum = @max(item.x_edges, @min(minimum, (columns[column].max orelse columns[column].min) - outer));
+            contributions[column].minimum = @max(contributions[column].minimum, minimum + outer);
+            contributions[column].min_content = @max(contributions[column].min_content, min_content);
+            contributions[column].max_content = @max(contributions[column].max_content, max_content);
+        }
+        const justify_content = self.formatStyle("justify-content", "normal");
+        const align_content = self.formatStyle("align-content", "normal");
         var widths: [grid_format.tracks.max_tracks]f64 = undefined;
-        grid_format.resolve(columns[0..column_count], intrinsic[0..column_count], @floatFromInt(self.content_width), column_gap, true, widths[0..column_count]);
-        const row_count = (items.len + column_count - 1) / column_count;
+        grid_format.resolve(columns[0..column_count], contributions[0..column_count], @floatFromInt(self.content_width), column_gap, stretchesAlignment(justify_content), widths[0..column_count]);
+        const height_context = parser.CssLengthResolutionContext{ .font_size = self.computedFontSizeCss(), .percentage_base = if (self.content_height_definite) if (definite_height) |h| @as(f64, @floatFromInt(h)) / scale else null else null };
+        var explicit: [grid_format.tracks.max_tracks]grid_format.Track = undefined;
+        const explicit_count = grid_format.tracks.parse(self.formatStyle("grid-template-rows", "none"), height_context, row_gap / scale, (items.len + column_count - 1) / column_count, &explicit) orelse 0;
+        const row_count = @max(explicit_count, (items.len + column_count - 1) / column_count);
+        if (row_count == 0) return 0;
         const rows = try self.allocator.alloc(grid_format.Track, row_count);
         defer self.allocator.free(rows);
         const heights = try self.allocator.alloc(f64, row_count);
         defer self.allocator.free(heights);
-        const natural = try self.allocator.alloc(f64, row_count);
+        const natural = try self.allocator.alloc(grid_format.Contribution, row_count);
         defer self.allocator.free(natural);
-        @memset(natural, 0);
-        const height_context = parser.CssLengthResolutionContext{ .font_size = self.computedFontSizeCss(), .percentage_base = if (definite_height) |h| @as(f64, @floatFromInt(h)) / scale else null };
-        var explicit: [grid_format.tracks.max_tracks]grid_format.Track = undefined;
-        const explicit_count = grid_format.tracks.parse(self.formatStyle("grid-template-rows", "none"), height_context, row_gap / scale, row_count, &explicit) orelse 0;
+        @memset(natural, .{});
+        const first_baselines = try self.allocator.alloc(box_alignment.BaselineGroup, row_count);
+        defer self.allocator.free(first_baselines);
+        const last_baselines = try self.allocator.alloc(box_alignment.BaselineGroup, row_count);
+        defer self.allocator.free(last_baselines);
+        @memset(first_baselines, .{});
+        @memset(last_baselines, .{});
         const auto_row = grid_format.tracks.parseTrack(self.formatStyle("grid-auto-rows", "auto"), height_context) orelse grid_format.Track{};
         for (rows, 0..) |*track, i| {
             track.* = if (i < explicit_count) explicit[i] else auto_row;
@@ -10009,39 +10335,73 @@ const BlockLayout = struct {
         defer engine.collect_hit_test_bounds = collect;
         engine.collect_hit_test_bounds = false;
         for (items, 0..) |*item, i| {
-            const available = @max(widths[i % column_count] - item.main.before - item.main.after, 0);
-            const width = if (flex_format.eq(item.block.formatStyle("width", "auto"), "auto")) available else @min(item.width, available);
-            try self.placeFormatItem(engine, item, 0, 0, flex_format.clamp(item.main, width), null);
-            natural[i / column_count] = @max(natural[i / column_count], item.height + item.cross_before + item.cross_after);
+            const col = i % column_count;
+            const row = i / column_count;
+            item.* = try self.formatItem(item.block, engine, false, widths[col], null);
+            const width = self.gridItemWidth(item.*, columns[col], widths[col]);
+            const ratio_height = if (!item.height_authored) item.ratioHeight(width) else null;
+            try self.placeFormatItem(engine, item, 0, 0, width, ratio_height, .{ .area_width = widths[col], .grid_area = true, .height_definite = item.height_authored or ratio_height != null });
+            const outer = item.cross_before + item.cross_after;
+            const auto_min = flex_format.eq(item.block.formatStyle("min-height", "auto"), "auto");
+            if (ratio_height != null and auto_min and !item.scrollable) item.height = @max(item.height, @as(f64, @floatFromInt(item.block.natural_content_height)) + item.y_edges);
+            var minimum = if (item.height_authored or (auto_min and rows[row].min_kind == .auto and !item.scrollable)) @max(item.min_cross, @min(item.height, item.max_cross)) else item.min_cross;
+            if (auto_min and rows[row].max_kind == .fixed) minimum = @max(item.y_edges, @min(minimum, (rows[row].max orelse rows[row].min) - outer));
+            natural[row].minimum = @max(natural[row].minimum, minimum + outer);
+            natural[row].min_content = @max(natural[row].min_content, item.height + outer);
+            natural[row].max_content = @max(natural[row].max_content, item.height + outer);
+            if (!item.cross_auto_before and !item.cross_auto_after) if (baselineKind(item.cross_align)) |last| {
+                const baseline = blockBaselineOffset(item.block, last);
+                if (last) last_baselines[row].add(item.height, baseline, item.cross_before, item.cross_after) else first_baselines[row].add(item.height, baseline, item.cross_before, item.cross_after);
+            };
         }
-        // Resolve rows in bounded batches only for the scalar solver's scratch;
-        // the DOM may have arbitrarily many implicit auto rows.
-        if (row_count <= grid_format.tracks.max_tracks) {
-            grid_format.resolve(rows, natural, if (definite_height) |h| @as(f64, @floatFromInt(h)) else null, row_gap, true, heights);
-        } else {
-            for (rows, natural, heights) |track, measured, *height| height.* = @max(track.min, measured);
+        for (natural, first_baselines, last_baselines) |*contribution, first, last| {
+            const extent = @max(first.size(), last.size());
+            contribution.minimum = @max(contribution.minimum, extent);
+            contribution.min_content = @max(contribution.min_content, extent);
+            contribution.max_content = @max(contribution.max_content, extent);
         }
+        grid_format.resolve(rows, natural, if (definite_height) |h| @as(f64, @floatFromInt(h)) else null, row_gap, stretchesAlignment(align_content), heights);
+        var total_width = column_gap * @as(f64, @floatFromInt(column_count - 1));
+        for (widths[0..column_count]) |width| total_width += width;
+        var total_height = row_gap * @as(f64, @floatFromInt(row_count - 1));
+        for (heights) |height| total_height += height;
+        const column_distribution = box_alignment.distribute(justify_content, @as(f64, @floatFromInt(self.content_width)) - total_width, column_count, false);
+        const row_distribution = box_alignment.distribute(align_content, (if (definite_height) |h| @as(f64, @floatFromInt(h)) else total_height) - total_height, row_count, false);
         engine.collect_hit_test_bounds = collect;
-        var x: f64 = 0;
-        var y: f64 = 0;
+        var x = column_distribution.offset;
+        var y = row_distribution.offset;
         for (items, 0..) |*item, i| {
             const col = i % column_count;
             const row = i / column_count;
             if (col == 0) {
-                x = 0;
-                if (row > 0) y += heights[row - 1] + row_gap;
+                x = column_distribution.offset;
+                if (row > 0) y += heights[row - 1] + row_gap + row_distribution.between;
             }
+            const natural_height = item.height;
+            const first = blockBaselineOffset(item.block, false);
+            const last = blockBaselineOffset(item.block, true);
+            item.* = try self.formatItem(item.block, engine, false, widths[col], heights[row]);
+            const width = self.gridItemWidth(item.*, columns[col], widths[col]);
             const available = @max(heights[row] - item.cross_before - item.cross_after, 0);
-            const stretch = item.cross_auto and (flex_format.eq(item.cross_align, "normal") or flex_format.eq(item.cross_align, "stretch"));
-            const height = @max(item.min_cross, @min(if (stretch) available else item.height, item.max_cross));
+            const normal_exception = flex_format.eq(item.cross_align, "normal") and (item.replaced or item.ratio != null);
+            const stretch = item.cross_auto and !normal_exception and !item.cross_auto_before and !item.cross_auto_after and stretchesAlignment(item.cross_align);
+            const ratio_height = item.ratioHeight(width) orelse natural_height;
+            const ratio_minimum = flex_format.eq(item.block.formatStyle("min-height", "auto"), "auto") and !item.scrollable;
+            const preferred_height = if (item.ratio != null) if (ratio_minimum) @max(natural_height, ratio_height) else ratio_height else natural_height;
+            const height = (sizing.Constraints{ .min = item.min_cross, .max = item.max_cross }).clamp(if (stretch) available else if (item.height_authored) item.height else preferred_height);
             const alignment = item.block.formatStyle("justify-self", "auto");
             const justify = if (flex_format.eq(alignment, "auto")) self.formatStyle("justify-items", "normal") else alignment;
-            const x_offset = item.main.before + flex_format.distribute(justify, widths[col] - item.width - item.main.before - item.main.after, 1).offset;
-            const y_offset = item.cross_before + flex_format.distribute(item.cross_align, available - height, 1).offset;
-            try self.placeFormatItem(engine, item, x + x_offset, y + y_offset, item.width, height);
-            x += widths[col] + column_gap;
+            const horizontal = box_alignment.resolveAutoMargins(widths[col], width, .{ .before = item.main.before, .after = item.main.after, .auto_before = item.main.auto_before, .auto_after = item.main.auto_after }, .grid);
+            const vertical = box_alignment.resolveAutoMargins(heights[row], height, .{ .before = item.cross_before, .after = item.cross_after, .auto_before = item.cross_auto_before, .auto_after = item.cross_auto_after }, .grid);
+            const x_offset = horizontal.before + if (horizontal.suppressed) @as(f64, 0) else box_alignment.position(justify, widths[col] - width - horizontal.before - horizontal.after, false);
+            var y_offset = vertical.before + if (vertical.suppressed) @as(f64, 0) else box_alignment.position(item.cross_align, heights[row] - height - vertical.before - vertical.after, false);
+            if (!item.cross_auto_before and !item.cross_auto_after) if (baselineKind(item.cross_align)) |is_last| {
+                y_offset = if (is_last) heights[row] - last_baselines[row].size() + last_baselines[row].offset(last) else first_baselines[row].offset(first);
+            };
+            try self.placeFormatItem(engine, item, x + x_offset, y + y_offset, width, height, .{ .area_width = widths[col], .area_height = heights[row], .grid_area = true, .height_definite = stretch or item.height_authored or (item.ratio != null and ((!item.width_auto and !isIntrinsicSize(item.block.formatStyle("width", "auto"))) or flex_format.eq(justify, "stretch"))) });
+            x += widths[col] + column_gap + column_distribution.between;
         }
-        return y + heights[row_count - 1];
+        return total_height;
     }
 
     fn layoutWithAllocatedBox(self: *BlockLayout, engine: *Layout, box: AllocatedBox) !void {
@@ -11152,6 +11512,7 @@ test "block focus boxes replace line fragments without hiding descendants" {
 }
 
 fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool) !void {
+    block.first_line_baseline = null;
     block.last_line_baseline = null;
     const snapshot = snapshotInlineState(self);
     const previous_target = self.current_display_target;

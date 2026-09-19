@@ -873,6 +873,16 @@ task wpt        # Continue where you stopped.
 task wpt-fresh  # Start over, preserving previous results.
 ```
 
+The coordinator streams per-test progress to stdout with a batch number while
+GNU Parallel retains worker reports and logs. It tails new log lines once per
+second, works without `/dev/tty`, and does not replay old logs on resume. During
+pause it continues showing progress until the active batches finish. Wait for
+the collection message before restarting; repeated Ctrl+C does not accelerate
+the graceful drain.
+
+Worker counts must be positive whole numbers, for example `task wpt WPT_JOBS=8`.
+Invalid counts are rejected before building or preparing a run.
+
 GNU Parallel must be installed (`brew install parallel` on macOS). The task
 builds Zibra, discovers the existing manifest selection, and generates batches
 automatically. There is no extra test list, preparation command, run-directory
@@ -942,6 +952,45 @@ collection, corruption handling, and build identity; when GNU Parallel is on
 PATH it also executes local scheduling and resume integration tests. These tests
 use fixture results and do not launch the browser. Remote execution needs an
 explicit SSH-host integration check before relying on a new worker setup.
+
+## Shared sizing and alignment
+
+[`manifest-css-shared-sizing.yaml`](manifest-css-shared-sizing.yaml) isolates
+intrinsic width/min/max grammar and geometry, percentage padding, flex basis and
+automatic minima, height definiteness, safe overflow, automatic margins,
+baseline alignment, and bounded grid track/item sizing. The unchanged upstream
+selection includes testharness, reftest and crashtest cases with PASS
+expectations. The default manifest already enables all runnable CSS tests, so
+this focused selection needs no additional default entries.
+
+Run it with an already built browser:
+
+```sh
+python3 tests/wpt/run.py tests/wpt/manifest-css-shared-sizing.yaml --mode all --jobs 1 --browser ./zig-out/bin/zibra --report /tmp/zibra-shared-sizing.json
+```
+
+Keep unsupported vertical writing and inline flex/grid cases separate from
+horizontal geometry failures when interpreting mixed upstream files. Grid
+alignment helpers require `parentElement`; track-sizing assertions require
+used track sizes from CSSOM, and later cases require grid spans. The
+shrink-after-removal case also has a script error before removing its child.
+XHTML references with CDATA-wrapped CSS have a separate stylesheet prerequisite.
+Independent `overflow-x`/`overflow-y` behavior remains unsupported; an assertion
+that previously passed through a missing automatic minimum can start failing
+when the content minimum is corrected. The native
+`shared` render tests and text-free `css-shared-sizing` pipeline golden
+isolate the supported geometry. The
+[interactive fixture](../manual/css-shared-sizing.html) also runs in the local
+WPT gate and checks synchronous geometry after dimension changes.
+
+The matching before/after run passes 7/49 then 26/49 complete files, and
+147/329 then 221/329 testharness assertions. This includes reftest improvement
+from 1/16 to 9/16 and unchanged 3/3 crashtests. No previously passing file
+regressed; six assertions now expose the unsupported independent overflow
+axes described above. These numbers measure this focused selection, not the
+entire CSS suite. See the
+[implementation record](../../docs/plans/shared-sizing-alignment.md#focused-upstream-result-and-remaining-work)
+for validation and remaining limitations.
 
 ## Ordinary block aspect ratios
 

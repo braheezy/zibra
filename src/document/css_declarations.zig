@@ -310,11 +310,6 @@ fn isSignedLength(raw_value: []const u8) bool {
     return css_length.parse(trimmed[1..]) != null;
 }
 
-fn isAutomaticOrNonnegativeLength(raw_value: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw_value, " \t\r\n\x0c"), "auto") or
-        isNonnegativeLength(raw_value);
-}
-
 fn isAutomaticOrSignedLength(raw_value: []const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw_value, " \t\r\n\x0c"), "auto") or
         isSignedLength(raw_value);
@@ -443,17 +438,13 @@ pub fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     if (std.mem.eql(u8, property, "flex-direction")) return keywordIn(raw_value, &.{ "row", "row-reverse", "column", "column-reverse" });
     if (std.mem.eql(u8, property, "flex-wrap")) return keywordIn(raw_value, &.{ "nowrap", "wrap", "wrap-reverse" });
     if (std.mem.eql(u8, property, "box-sizing")) return keywordIn(raw_value, &.{ "content-box", "border-box" });
-    if (std.mem.startsWith(u8, property, "align-") or std.mem.startsWith(u8, property, "justify-")) return keywordIn(raw_value, &.{ "normal", "auto", "start", "end", "flex-start", "flex-end", "center", "stretch", "space-between", "space-around", "space-evenly" });
+    if (std.mem.startsWith(u8, property, "align-") or std.mem.startsWith(u8, property, "justify-")) return @import("css_alignment.zig").validForProperty(property, raw_value);
 
-    if (std.mem.eql(u8, property, "width") or std.mem.eql(u8, property, "height")) {
-        return isAutomaticOrNonnegativeLength(raw_value);
-    }
-    if (std.mem.eql(u8, property, "min-width") or std.mem.eql(u8, property, "min-height")) {
-        return isAutomaticOrNonnegativeLength(raw_value);
-    }
-    if (std.mem.eql(u8, property, "max-width") or std.mem.eql(u8, property, "max-height")) {
-        return std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw_value, " \t\r\n\x0c"), "none") or
-            isNonnegativeLength(raw_value);
+    if (std.mem.eql(u8, property, "width") or std.mem.eql(u8, property, "height") or
+        std.mem.eql(u8, property, "min-width") or std.mem.eql(u8, property, "min-height") or
+        std.mem.eql(u8, property, "max-width") or std.mem.eql(u8, property, "max-height"))
+    {
+        return @import("css_sizing.zig").validForProperty(property, raw_value);
     }
     if (std.mem.eql(u8, property, "top") or std.mem.eql(u8, property, "right") or
         std.mem.eql(u8, property, "bottom") or std.mem.eql(u8, property, "left"))
@@ -937,12 +928,19 @@ fn putCanonical(map: anytype, property: []const u8, raw_declaration: Declaration
         try putLonghand(map, "flex-basis", .{ .value = flex.basis, .important = declaration.important });
         return;
     }
-    if (std.mem.eql(u8, property, "gap") or std.mem.eql(u8, property, "place-items") or std.mem.eql(u8, property, "place-content")) {
+    if (std.mem.eql(u8, property, "place-items") or std.mem.eql(u8, property, "place-content")) {
+        const names: [2][]const u8 = if (std.mem.eql(u8, property, "place-items")) .{ "align-items", "justify-items" } else .{ "align-content", "justify-content" };
+        const pair = @import("css_alignment.zig").parsePair(names[0], names[1], declaration.value) orelse return;
+        try putLonghand(map, names[0], .{ .value = pair.first, .important = declaration.important });
+        try putLonghand(map, names[1], .{ .value = pair.second, .important = declaration.important });
+        return;
+    }
+    if (std.mem.eql(u8, property, "gap")) {
         var parts = grid_tracks.Components{ .input = declaration.value };
         const first = parts.next() orelse return;
         const second = parts.next() orelse first;
         if (parts.next() != null) return;
-        const names: [2][]const u8 = if (std.mem.eql(u8, property, "gap")) .{ "row-gap", "column-gap" } else if (std.mem.eql(u8, property, "place-items")) .{ "align-items", "justify-items" } else .{ "align-content", "justify-content" };
+        const names: [2][]const u8 = .{ "row-gap", "column-gap" };
         if (!isValidLonghandValue(names[0], first) or !isValidLonghandValue(names[1], second)) return;
         try putLonghand(map, names[0], .{ .value = first, .important = declaration.important });
         try putLonghand(map, names[1], .{ .value = second, .important = declaration.important });
@@ -1062,6 +1060,29 @@ test "shared declaration frontends retain duplicate fallback and shorthand prece
     try std.testing.expectEqualStrings("4px", parsed.get("padding-right").?.value);
     try std.testing.expectEqualStrings("9px", parsed.get("padding-left").?.value);
     try std.testing.expectEqualStrings("gap", parsed.get("row-gap").?.pending_shorthand.?);
+}
+
+test "shared sizing declarations preserve multi-token alignment and invalid fallbacks" {
+    var map = Map.init(std.testing.allocator);
+    defer map.deinit();
+    try putRaw(&map, "width", "max-content");
+    try putRaw(&map, "width", "fit-content(20px)");
+    try std.testing.expectEqualStrings("max-content", map.get("width").?.value);
+    try putRaw(&map, "min-width", "min-content");
+    try putRaw(&map, "max-width", "fit-content");
+    try putRaw(&map, "place-items", "safe center last baseline !important");
+    try std.testing.expectEqualStrings("safe center", map.get("align-items").?.value);
+    try std.testing.expectEqualStrings("last baseline", map.get("justify-items").?.value);
+    try std.testing.expect(map.get("align-items").?.important);
+    try putRaw(&map, "align-items", "space-between !important");
+    try std.testing.expectEqualStrings("safe center", map.get("align-items").?.value);
+    try putRaw(&map, "place-content", "first baseline");
+    try std.testing.expectEqualStrings("baseline", map.get("align-content").?.value);
+    try std.testing.expectEqualStrings("start", map.get("justify-content").?.value);
+    try putRaw(&map, "flex", "1 2 min-content");
+    try std.testing.expectEqualStrings("min-content", map.get("flex-basis").?.value);
+    try putRaw(&map, "flex-basis", "calc(100% - 10px)");
+    try std.testing.expectEqualStrings("calc(100% - 10px)", map.get("flex-basis").?.value);
 }
 
 test "parsed declarations use explicit priority without interpreting retained bangs" {

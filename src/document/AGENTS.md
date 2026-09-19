@@ -83,6 +83,11 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
 
 - `css_aspect_ratio.zig` owns ratio admission and serialization for both ordinary
   and replaced boxes. Degenerate ratios are valid syntax with no used ratio.
+- `css_sizing.zig` owns preferred/minimum/maximum sizing value admission;
+  intrinsic width keywords retain their identity through used layout.
+  `css_alignment.zig` owns property-specific box-alignment grammar and the
+  multi-token `place-items`/`place-content` split. These helpers retain no DOM
+  data; intrinsic block-axis sizing and fit-content functions remain deferred.
 
 - `css_math.zig` evaluates bounded typed calculations with explicit unit and
   percentage contexts. Lengths and colors share it; layout-dependent units

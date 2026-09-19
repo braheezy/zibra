@@ -43,6 +43,43 @@ test "value normalization shares typed primitives escapes and invalid declaratio
     try std.testing.expectEqualStrings("\"EOF\"", block.get("content").?.value);
 }
 
+test "alignment declarations canonicalize first baseline after shorthand expansion" {
+    const allocator = std.testing.allocator;
+    const block = try create(allocator, "align-items:first baseline;align-self:first baseline;justify-items:first baseline;justify-self:first baseline;align-content:first baseline;--alignment:first baseline");
+    defer block.destroy();
+    for ([_][]const u8{ "align-items", "align-self", "justify-items", "justify-self", "align-content" }) |name| {
+        try std.testing.expectEqualStrings("baseline", block.get(name).?.value);
+        const text = try block.propertyValue(allocator, name);
+        defer allocator.free(text);
+        try std.testing.expectEqualStrings("baseline", text);
+    }
+    try std.testing.expectEqualStrings("first baseline", block.get("--alignment").?.value);
+    try std.testing.expect(!try block.setProperty("align-items", "FIRST  BASELINE", ""));
+    try std.testing.expect(try block.setProperty("align-self", "last baseline", ""));
+    try std.testing.expect(!try block.setProperty("align-self", "safe first baseline", ""));
+    try std.testing.expectEqualStrings("last baseline", block.get("align-self").?.value);
+
+    try std.testing.expect(try block.setProperty("place-items", "first baseline", "important"));
+    const pair = try block.propertyValue(allocator, "place-items");
+    defer allocator.free(pair);
+    try std.testing.expectEqualStrings("baseline", pair);
+    try std.testing.expect(block.get("align-items").?.important);
+    try std.testing.expect(block.get("justify-items").?.important);
+    try std.testing.expect(try block.setProperty("place-items", "first baseline last baseline", "important"));
+    const mixed = try block.propertyValue(allocator, "place-items");
+    defer allocator.free(mixed);
+    try std.testing.expectEqualStrings("baseline last baseline", mixed);
+
+    try std.testing.expect(try block.setProperty("place-content", "first baseline", ""));
+    const content = try block.propertyValue(allocator, "place-content");
+    defer allocator.free(content);
+    try std.testing.expectEqualStrings("baseline start", content);
+    try std.testing.expect(try block.setProperty("place-items", "var(--alignment)", ""));
+    const pending = try block.propertyValue(allocator, "place-items");
+    defer allocator.free(pending);
+    try std.testing.expectEqualStrings("var(--alignment)", pending);
+}
+
 test "normalized declaration owners clone and retire independently including allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(allocator: std.mem.Allocator) !void {

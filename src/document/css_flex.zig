@@ -1,6 +1,5 @@
 //! Source-borrowing flex shorthand grammar and scalar factor validation.
 const std = @import("std");
-const length = @import("length.zig");
 const Components = @import("grid_tracks.zig").Components;
 
 pub const Flex = struct { grow: []const u8 = "1", shrink: []const u8 = "1", basis: []const u8 = "0%" };
@@ -9,7 +8,7 @@ pub fn factor(input: []const u8) ?f64 {
     return if (std.math.isFinite(n) and n >= 0) n else null;
 }
 pub fn basis(input: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(input, "auto") or std.ascii.eqlIgnoreCase(input, "content") or length.parse(input) != null;
+    return std.ascii.eqlIgnoreCase(input, "content") or @import("css_sizing.zig").validForProperty("flex-basis", input);
 }
 pub fn parse(input: []const u8) ?Flex {
     if (std.ascii.eqlIgnoreCase(input, "none")) return .{ .grow = "0", .shrink = "0", .basis = "auto" };

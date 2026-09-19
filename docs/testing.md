@@ -180,6 +180,21 @@ For document-pipeline changes, run `test-pipeline`; use
 represented by the box-model or nested-zoom goldens. The inspection stages
 deliberately stop before Browser construction; preserve that isolation.
 
+Shared sizing/alignment regressions live in
+[`shared_sizing_alignment.zig`](../src/tests/shared_sizing_alignment.zig),
+[`intrinsic_sizing.zig`](../src/tests/intrinsic_sizing.zig), and
+[`sizing_allocation.zig`](../src/tests/sizing_allocation.zig).
+Use `zig build test-render -Dtest-filter='shared'` while iterating, then
+the unfiltered render suite and pipeline checks. The text-free
+[`css-shared-sizing` fixture](../tests/pipeline/css-shared-sizing.html) covers
+intrinsic widths, flex shrink, grid area alignment and synthesized baselines.
+The [manual page](../tests/manual/css-shared-sizing.html) exercises live geometry
+changes in `test-wpt`; the
+[focused upstream selection](../tests/wpt/manifest-css-shared-sizing.yaml)
+retains failing cases and all three runnable categories. See the
+[WPT notes](../tests/wpt/README.md#shared-sizing-and-alignment) for prerequisite
+limitations and the existing default CSS coverage.
+
 Dump and screenshot modes accept `--viewport WIDTHxHEIGHT` (default 800x600,
 each dimension 1–8192). Dumps use the entire size for document geometry and
 width/height media queries. Screenshots use that presentation size, with the

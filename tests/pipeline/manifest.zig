@@ -27,6 +27,12 @@ pub const Case = struct {
 
 const existing_cases = [_]Case{
     .{
+        .name = "css-shared-sizing-layout",
+        .mode = .layout,
+        .fixture = "tests/pipeline/css-shared-sizing.html",
+        .golden = "tests/golden/pipeline/css-shared-sizing.layout.txt",
+    },
+    .{
         .name = "css-block-aspect-ratio-layout",
         .mode = .layout,
         .fixture = "tests/pipeline/css-block-aspect-ratio.html",

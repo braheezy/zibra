@@ -19,6 +19,11 @@ pub fn primitive(allocator: std.mem.Allocator, property: []const u8, input: []co
     if (std.mem.eql(u8, property, "aspect-ratio")) {
         if (@import("css_aspect_ratio.zig").parse(input)) |ratio| return ratio.serialize(allocator);
     }
+    if (std.mem.startsWith(u8, property, "align-") or std.mem.startsWith(u8, property, "justify-")) {
+        if (@import("css_alignment.zig").parse(input)) |alignment| {
+            if (alignment.keyword == .baseline) return "baseline";
+        }
+    }
     for (@import("css_properties.zig").computed) |entry| {
         if (!std.mem.eql(u8, entry.name, property)) continue;
         switch (entry.serialization) {

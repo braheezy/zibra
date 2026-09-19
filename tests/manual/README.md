@@ -20,6 +20,7 @@ tiers and baseline policy.
 | [`css-stylesheet-media.html`](css-stylesheet-media.html) | Retained style/link media, live computed reads, inherited color, relative linked images and resize |
 | [`css-background-origin.html`](css-background-origin.html) | Border/padding/content positioning areas and live paint-only origin changes |
 | [`css-block-aspect-ratio.html`](css-block-aspect-ratio.html) | Responsive ordinary blocks, content/border boxes, content minimums, scrolling and live ratio edits |
+| [`css-shared-sizing.html`](css-shared-sizing.html) | Intrinsic panel sizing, padding-aware flex shrink, safe overflow, automatic margins, percentage height definiteness, grid area sizing and synthesized baselines |
 | [`css-cascade-layers.html`](css-cascade-layers.html) | Named/nested layer precedence, important reversal, paused keyframes and live media/order edits |
 | [`css-linear-gradients.html`](css-linear-gradients.html) | Linear/repeating backgrounds, color-space interpolation, hard stops/hints, alpha, tiles, inherited currentcolor/font changes and CSSOM mutation |
 | [`dump-dom.html`](dump-dom.html) | Isolated HTML parser/DOM dump input |
